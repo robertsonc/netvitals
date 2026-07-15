@@ -76,7 +76,16 @@ and the loss chart. (The lifetime totals always show the true raw counts.)
 - **Start order doesn't matter.** On Windows, probing a peer whose app isn't
   running yet used to kill the UDP receive thread (ICMP Port Unreachable
   surfaces as a socket error); this is now suppressed and either side can be
-  started, stopped or rebooted at any time.
+  started, stopped or rebooted at any time. (1.3.0 note: the suppression is
+  now done via `WSAIoctl` directly — Python's `socket.ioctl()` silently
+  rejects `SIO_UDP_CONNRESET`, so in 1.1.0–1.2.0 only the error-catching
+  half of this fix was active and a stream of ICMP could still eat probes.)
+- **"UDP silent" warning.** TCP streams flowing while *all* UDP streams are
+  down is never a healthy path — it means UDP is blocked in the middle
+  (firewall/ACL on ports 30201–30202) or the peer is running an outdated
+  version whose UDP receive thread died (the pre-1.1.0 race above). Both UIs
+  now call this out in the status bar instead of letting it read as loss;
+  the remedy is opening the UDP ports and updating **both** ends.
 - **Peer-only traffic.** Both the UDP and TCP listeners only answer the
   configured `--peer` address. Other hosts on the LAN can't skew the stats or
   use the tool as a packet reflector. (Run `--mtu-sweep` from the paired
@@ -94,17 +103,57 @@ and the loss chart. (The lifetime totals always show the true raw counts.)
   instance now fails to bind instead of silently splitting packets with the
   first one (which used to read as huge random loss on both).
 
+## Installing (Windows)
+
+The easiest way onto a fresh workstation is the installer — it needs **no
+admin rights** and takes care of Python too:
+
+- **From a checkout / downloaded copy of this repo:** double-click
+  **`install.bat`**.
+- **From nothing** (PowerShell one-liner — downloads the installer and runs
+  it; the first statement enables TLS 1.2, which Windows PowerShell 5.1
+  doesn't use by default and GitHub requires):
+
+  ```powershell
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; iwr -useb https://raw.githubusercontent.com/robertsonc/netvitals/main/install.ps1 -OutFile "$env:TEMP\nv-install.ps1"; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\nv-install.ps1"
+  ```
+
+A setup window opens (install folder, shortcut choices, live log) and then:
+
+1. **Python**: finds an existing Python 3.8+ with Tkinter; if there is none
+   (or it lacks Tkinter), the official python.org **3.12** installer is
+   downloaded and installed silently **per-user**.
+2. **App files**: copied to `%LOCALAPPDATA%\Programs\NetVitals` (from the
+   local folder when run out of a checkout, otherwise from GitHub).
+3. **Shortcuts**: Start Menu + Desktop (both optional), launching the
+   graphical **launch window** with no console window.
+4. **Settings > Apps**: registers like a normal Windows app, with a working
+   **Uninstall** entry (`uninstall.ps1`; saved settings survive a reinstall).
+
+Scripted installs: `install.bat -Silent` (or run `install.ps1` directly with
+`-Silent`, `-InstallDir`, `-NoDesktopShortcut`, `-NoStartMenuShortcut`,
+`-SkipPythonInstall`, `-NoGui`).
+
 ## Requirements
 
-- **Python 3.8+** (tested on 3.11). Nothing to `pip install` — it uses only the
-  standard library. The GUI uses Tkinter, which is included with the standard
-  Python installer for Windows.
+- **Python 3.8+** (tested on 3.11/3.12; the installer above sets this up for
+  you). Nothing to `pip install` — it uses only the standard library. The GUI
+  uses Tkinter, which is included with the standard Python installer for
+  Windows.
 - No clock synchronization between the two machines is required (latency is
   measured by round-trip, so both clocks are irrelevant).
 
 ## Updating
 
-The app can update itself from the [netvitals repo](https://github.com/robertsonc/netvitals):
+The app updates itself from the [netvitals repo](https://github.com/robertsonc/netvitals),
+**from inside the UI**:
+
+- In the **launch window**: *⟳ Check for updates* (bottom-left).
+- In the running **dashboard**: the *⟳ Update* button in the header.
+
+Both open the same dialog: it reports whether a newer version exists and —
+one click — installs it and restarts the app with the same options (the old
+copy is kept as `netquality.py.bak`). The command line still works too:
 
 ```
 update.bat                      REM or: python netquality.py --update
@@ -113,12 +162,31 @@ python netquality.py --check-update   REM report only (exit code 3 = update avai
 
 `--update` downloads the latest `netquality.py`, sanity-checks it (compiles,
 recognisably this app, higher `__version__`), keeps the previous copy as
-`netquality.py.bak`, and swaps the file atomically. Restart to run the new
-version. A packaged `.exe` can't replace itself — rebuild with
-`build_exe.bat` after updating the source. Updates are only ever fetched when
-explicitly requested; the app never phones home on its own.
+`netquality.py.bak`, and swaps the file atomically. A packaged `.exe` can't
+replace itself — rebuild with `build_exe.bat` after updating the source.
+Updates are only ever fetched when explicitly requested (opening the update
+dialog counts as a request); the app never phones home on its own.
 
 ## Running it
+
+### The launch window (easiest)
+
+Start **Network Vitals** with no arguments — from the Start Menu shortcut, or:
+
+```
+python netquality.py
+```
+
+A launch window opens where everything is a field instead of a flag: peer IP
+(with a history of recent peers), probe size, rate, Don't-Fragment, and under
+*Advanced options* the bind address, ports, window/timeout/deadband, chart
+history, VXLAN encapsulation and console mode. It also shows this machine's
+IP (to type into the *other* machine), can run the **MTU sweep** from a
+button, and checks for updates. Every choice is remembered for next time in
+`%APPDATA%\NetVitals\settings.json` (Linux: `~/.config/netvitals/`).
+Scripts that must fail instead of opening a window can pass `--no-launcher`.
+
+### Command line
 
 On **workstation A** (say its peer is `10.0.0.2`):
 
@@ -132,7 +200,7 @@ On **workstation B** (peer is `10.0.0.1`):
 python netquality.py --peer 10.0.0.1
 ```
 
-That's the entire configuration. Or just double-click **`run.bat`** and type the
+That's the entire configuration. Or double-click **`run.bat`** and type the
 peer's IP when prompted. Site defaults (probe `--size`, `--dont-fragment`) are
 set in variables at the top of `run.bat` — edit them once for your environment;
 anything passed after the peer IP (`run.bat 10.0.0.2 --size 200`) overrides
@@ -247,7 +315,8 @@ Bad below.
 ## Options
 
 ```
---peer IP          (required) the other workstation's IP
+--peer IP          the other workstation's IP (required on the command line;
+                   without it the graphical launch window opens instead)
 --bind ADDR        local address to bind/listen on (default 0.0.0.0)
 --udp-ports A,B    the two UDP ports (default 30201,30202)
 --tcp-ports A,B    the two TCP ports (default 30101,30102)
@@ -265,6 +334,7 @@ Bad below.
 --history SECONDS  span of the live/history charts (default 300)
 --refresh-ms N     UI refresh interval (default 500)
 --no-gui           force console UI
+--no-launcher      with no --peer, error out instead of opening the launch window
 --mtu-sweep        one-shot: find the largest UDP payload that crosses unfragmented
 --sweep-min N      MTU sweep lower bound, payload bytes (default 1400)
 --sweep-max N      MTU sweep upper bound, payload bytes (default 9000)

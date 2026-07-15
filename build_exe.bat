@@ -7,7 +7,9 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
-pyinstaller --onefile --name netquality "%~dp0netquality.py"
+set "ICON="
+if exist "%~dp0assets\netvitals.ico" set "ICON=--icon "%~dp0assets\netvitals.ico""
+pyinstaller --onefile --name netquality %ICON% "%~dp0netquality.py"
 if errorlevel 1 (
     echo.
     echo ERROR: build FAILED - do not ship dist\netquality.exe from this run.
