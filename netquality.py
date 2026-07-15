@@ -191,17 +191,41 @@ def quench_udp_connreset(sock):
 
     When the peer app isn't running yet, our sendto() elicits ICMP Port
     Unreachable and Windows then raises ConnectionResetError (WSAECONNRESET)
-    from the NEXT recvfrom() on the same socket. Without this ioctl the
-    receive loop would die just because the other workstation was started a
-    minute later. No-op on non-Windows platforms.
+    from the NEXT recvfrom()/sendto() on the same socket. The receive loops
+    also catch that error, but each one still swallows a socket call - under
+    a stream of ICMP (peer app down or restarting) that means silently
+    dropped probes and echoes. This ioctl turns the reporting off entirely.
+
+    NOTE: this must go through WSAIoctl directly. CPython's socket.ioctl()
+    wrapper only accepts SIO_RCVALL / SIO_KEEPALIVE_VALS /
+    SIO_LOOPBACK_FAST_PATH and raises ValueError for SIO_UDP_CONNRESET, so
+    the obvious sock.ioctl(...) call is a silent no-op (an earlier version
+    of this function did exactly that and quenched nothing).
+    No-op on non-Windows platforms.
     """
     if sys.platform != "win32":
         return
-    SIO_UDP_CONNRESET = 0x9800000C
+    SIO_UDP_CONNRESET = 0x9800000C  # _WSAIOW(IOC_VENDOR, 12)
     try:
-        sock.ioctl(SIO_UDP_CONNRESET, False)
-    except (OSError, ValueError, AttributeError):
-        pass
+        import ctypes
+        from ctypes import wintypes
+        ws2 = ctypes.WinDLL("ws2_32")
+        ws2.WSAIoctl.argtypes = [
+            ctypes.c_void_p,                    # SOCKET s
+            wintypes.DWORD,                     # dwIoControlCode
+            ctypes.c_void_p, wintypes.DWORD,    # lpvInBuffer,  cbInBuffer
+            ctypes.c_void_p, wintypes.DWORD,    # lpvOutBuffer, cbOutBuffer
+            ctypes.POINTER(wintypes.DWORD),     # lpcbBytesReturned
+            ctypes.c_void_p, ctypes.c_void_p,   # lpOverlapped, lpCompletionRoutine
+        ]
+        ws2.WSAIoctl.restype = ctypes.c_int
+        report = wintypes.BOOL(0)               # FALSE -> stop reporting resets
+        returned = wintypes.DWORD(0)
+        ws2.WSAIoctl(sock.fileno(), SIO_UDP_CONNRESET,
+                     ctypes.byref(report), ctypes.sizeof(report),
+                     None, 0, ctypes.byref(returned), None, None)
+    except Exception:
+        pass  # best effort; the recv loops still catch ConnectionResetError
 
 
 def resolve_peer_ip(peer):
@@ -1464,8 +1488,19 @@ class Engine:
             size_status = "verified"
         else:
             size_status = "pending"
+        # Diagnostic: TCP alive while EVERY UDP stream is silent is never a
+        # healthy path - it means UDP is being dropped in the middle (port-
+        # blocking firewall/ACL) or the peer runs an old version whose UDP
+        # receive thread died (pre-1.1.0 WSAECONNRESET race). Surface it
+        # instead of letting it read as mystery loss. A short grace period
+        # avoids flapping while streams come up.
+        tcp_up = any(r["proto"] == "TCP" and r["connected"] for r in rows)
+        udp_up = any(r["proto"] == "UDP" and r["connected"] for r in rows)
+        udp_silent = (tcp_up and not udp_up
+                      and time.monotonic() - self.start_time > 15.0)
         return {
             "rows": rows,
+            "udp_silent": udp_silent,
             "overall": overall,
             "udp_mos": udp_mos,
             "udp_score": udp_score,
@@ -1793,6 +1828,9 @@ def run_gui(engine, args):
     foot_var = tk.StringVar(value="")
     tk.Label(footer, textvariable=foot_var, fg=TXT_DIM, bg=BG,
              font=(FONT, 9)).pack(side="left")
+    warn_var = tk.StringVar(value="")
+    tk.Label(footer, textvariable=warn_var, fg="#ffd27e", bg=BG,
+             font=(FONT, 9, "bold")).pack(side="right")
 
     # ---- totals table (hidden by default; toggled by the Totals button) ----
     totals_cols = ("stream", "sent", "recv", "lost", "late", "lossp",
@@ -1907,6 +1945,12 @@ def run_gui(engine, args):
                     "pending": "…"}[snap["size_status"]]
         vx = (f"  VXLAN vni {snap['vxlan']['vni']} udp/{snap['vxlan']['port']}"
               if snap["vxlan"] else "")
+        if snap.get("udp_silent"):
+            warn_var.set("⚠ UDP silent while TCP is up — UDP blocked in the "
+                         "path (firewall/ACL) or the peer runs an outdated "
+                         "version; update BOTH ends")
+        else:
+            warn_var.set("")
         foot_var.set(
             f"peer {args.peer}    {ports_summary()}    "
             f"frame {snap['frame_size']} B  DF {df}  size {size_tag}{vx}    "
@@ -2140,6 +2184,10 @@ def run_console_loop(engine, args, vt):
                   f"return <- {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%)"
                   + "".join(f"   {r['name'].split('-')[1]}:{loss_verdict(r['fwd_lost'], r['rtn_lost'])[0]}"
                             for r in snap["rows"] if r["fwd_lost"] > 6 or r["rtn_lost"] > 6))
+            if snap.get("udp_silent"):
+                print("  ! UDP silent while TCP is up: UDP blocked in the path "
+                      "(firewall/ACL) or the peer runs an outdated version - "
+                      "update BOTH ends.")
             if keys.enabled:
                 print("  keys:  [r] reset counters    [q] quit    (Ctrl-C also quits)")
             key = keys.poll(args.refresh_ms / 1000.0)

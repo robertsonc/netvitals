@@ -76,7 +76,16 @@ and the loss chart. (The lifetime totals always show the true raw counts.)
 - **Start order doesn't matter.** On Windows, probing a peer whose app isn't
   running yet used to kill the UDP receive thread (ICMP Port Unreachable
   surfaces as a socket error); this is now suppressed and either side can be
-  started, stopped or rebooted at any time.
+  started, stopped or rebooted at any time. (1.3.0 note: the suppression is
+  now done via `WSAIoctl` directly — Python's `socket.ioctl()` silently
+  rejects `SIO_UDP_CONNRESET`, so in 1.1.0–1.2.0 only the error-catching
+  half of this fix was active and a stream of ICMP could still eat probes.)
+- **"UDP silent" warning.** TCP streams flowing while *all* UDP streams are
+  down is never a healthy path — it means UDP is blocked in the middle
+  (firewall/ACL on ports 30201–30202) or the peer is running an outdated
+  version whose UDP receive thread died (the pre-1.1.0 race above). Both UIs
+  now call this out in the status bar instead of letting it read as loss;
+  the remedy is opening the UDP ports and updating **both** ends.
 - **Peer-only traffic.** Both the UDP and TCP listeners only answer the
   configured `--peer` address. Other hosts on the LAN can't skew the stats or
   use the tool as a packet reflector. (Run `--mtu-sweep` from the paired
