@@ -46,7 +46,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -2212,6 +2212,85 @@ def _parse_version(text):
     return (nums or None), m.group(1)
 
 
+def _is_cert_error(exc):
+    """True when exc is (or wraps) an SSL certificate-verification failure -
+    the 'unable to get local issuer certificate' class of errors."""
+    import ssl
+    candidates = (exc, getattr(exc, "reason", None), exc.__cause__)
+    return any(isinstance(c, ssl.SSLCertVerificationError)
+               for c in candidates if c is not None)
+
+
+def _download_via_windows_tls(url, timeout, _curl=None, _ps="powershell"):
+    """Fetch `url` with tools that validate TLS through Windows SChannel:
+    curl.exe (ships with Windows 10 1803+), then PowerShell.
+
+    Python's OpenSSL fails with 'unable to get local issuer certificate'
+    in two situations SChannel handles fine: a corporate TLS-inspecting
+    proxy whose root lives (only) in the Windows certificate store, and a
+    server that omits its intermediate cert (SChannel fetches it via AIA;
+    OpenSSL never does). Routing the download through curl/PowerShell
+    applies the SAME trust decisions as Edge - verification stays on.
+    Returns raw bytes; raises RuntimeError if both tools fail."""
+    import subprocess
+    import tempfile
+    creation = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    errors = []
+
+    if _curl is None:
+        _curl = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                             "System32", "curl.exe")
+        if not os.path.exists(_curl):
+            _curl = "curl.exe"  # fall back to PATH
+    try:
+        out = subprocess.run(
+            [_curl, "-sSfL", "--proto", "=https", "--proto-redir", "=https",
+             "--max-time", str(int(timeout) * 2), url],
+            capture_output=True, creationflags=creation, timeout=timeout * 4)
+        if out.returncode == 0 and out.stdout:
+            return out.stdout
+        errors.append("curl: " + (out.stderr or b"").decode("utf-8",
+                                                            "replace").strip())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        errors.append(f"curl: {e}")
+
+    # PowerShell fallback (Invoke-WebRequest -> .NET -> SChannel). The URL
+    # and output path travel in environment variables so no user-influenced
+    # text is ever spliced into the command string. -OutFile keeps the bytes
+    # exact (console capture would re-encode them).
+    tmp = tempfile.NamedTemporaryFile(prefix="nv-update-", delete=False)
+    tmp.close()
+    env = dict(os.environ, NV_UPDATE_URL=url, NV_UPDATE_OUT=tmp.name)
+    try:
+        out = subprocess.run(
+            [_ps, "-NoProfile", "-NonInteractive", "-Command",
+             "$ProgressPreference = 'SilentlyContinue'; "
+             "[Net.ServicePointManager]::SecurityProtocol = "
+             "[Net.ServicePointManager]::SecurityProtocol -bor 3072; "
+             "Invoke-WebRequest -UseBasicParsing -Uri $env:NV_UPDATE_URL "
+             "-OutFile $env:NV_UPDATE_OUT"],
+            capture_output=True, creationflags=creation, env=env,
+            timeout=timeout * 4)
+        if out.returncode == 0:
+            with open(tmp.name, "rb") as fh:
+                data = fh.read()
+            if data:
+                return data
+            errors.append("powershell: empty download")
+        else:
+            errors.append("powershell: " +
+                          (out.stderr or b"").decode("utf-8",
+                                                     "replace").strip())
+    except (OSError, subprocess.TimeoutExpired) as e:
+        errors.append(f"powershell: {e}")
+    finally:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+    raise RuntimeError("; ".join(errors) or "no downloader available")
+
+
 def fetch_update(url, timeout=15):
     """Download the candidate source. Returns (source_text, version_tuple,
     version_string). Raises RuntimeError with a friendly message on any
@@ -2228,7 +2307,27 @@ def fetch_update(url, timeout=15):
                 raise RuntimeError(f"refusing redirect to insecure URL {final}")
             raw = resp.read()
     except (urllib.error.URLError, OSError) as e:
-        raise RuntimeError(f"download failed: {e}") from e
+        cert_issue = _is_cert_error(e)
+        if (cert_issue and sys.platform == "win32"
+                and url.lower().startswith("https:")):
+            # Python's own trust chain failed - retry through the Windows
+            # certificate store (see _download_via_windows_tls). This is the
+            # normal path behind corporate TLS-inspecting proxies.
+            try:
+                raw = _download_via_windows_tls(url, timeout)
+            except RuntimeError as e2:
+                raise RuntimeError(
+                    f"download failed: {e} (then retried through the "
+                    f"Windows certificate store, which also failed: {e2})"
+                ) from e
+        else:
+            msg = f"download failed: {e}"
+            if cert_issue:
+                msg += (" - certificate verification failed. This usually "
+                        "means a TLS-inspecting proxy whose root certificate "
+                        "Python doesn't trust; on Windows the updater retries "
+                        "through the system certificate store automatically.")
+            raise RuntimeError(msg) from e
     try:
         src = raw.decode("utf-8")
     except UnicodeDecodeError as e:
