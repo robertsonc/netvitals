@@ -2220,6 +2220,12 @@ def fetch_update(url, timeout=15):
     import urllib.request
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
+            # urllib follows https->http redirects; installing code fetched
+            # over plaintext is where the line is, so refuse the downgrade.
+            final = getattr(resp, "url", None) or url
+            if (url.lower().startswith("https:")
+                    and not final.lower().startswith("https:")):
+                raise RuntimeError(f"refusing redirect to insecure URL {final}")
             raw = resp.read()
     except (urllib.error.URLError, OSError) as e:
         raise RuntimeError(f"download failed: {e}") from e
@@ -2373,12 +2379,17 @@ def local_ips():
             s.close()
     except OSError:
         pass
-    try:
-        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
-            if ip not in ips and not ip.startswith(("127.", "169.254.")):
-                ips.append(ip)
-    except OSError:
-        pass
+    # Windows answers a query for the machine's own name locally; other
+    # platforms may forward it to real DNS, which would break the "never
+    # touches the network unless asked" rule - the UDP-trick address above
+    # is all we list there.
+    if sys.platform == "win32":
+        try:
+            for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+                if ip not in ips and not ip.startswith(("127.", "169.254.")):
+                    ips.append(ip)
+        except OSError:
+            pass
     return ips
 
 
@@ -2391,6 +2402,22 @@ def _has_console():
         return bool(ctypes.windll.kernel32.GetConsoleWindow())
     except Exception:
         return True
+
+
+def _alert_gui_error(msg):
+    """Surface a fatal startup error in a dialog when there is no console to
+    print to (a pythonw.exe shortcut) - dying silently is not an option."""
+    if _has_console():
+        return
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Network Vitals", msg)
+        root.destroy()
+    except Exception:
+        pass  # headless AND console-less; stderr already got the message
 
 
 def _spawn_in_new_console(argv):
@@ -2592,6 +2619,10 @@ def open_update_dialog(root, update_url, relaunch_argv=None):
     outcome = {}  # worker thread -> UI poll loop; workers never touch Tk
 
     def check_worker():
+        # Catch EVERYTHING: fetch_update wraps the expected failures in
+        # RuntimeError, but a scheme-less --update-url raises ValueError and
+        # a misbehaving proxy raises http.client exceptions - any escape
+        # would kill this thread and leave the dialog on "Checking" forever.
         try:
             src, vt, vs = fetch_update(update_url)
             local_v, _ = _parse_version(f'__version__ = "{__version__}"')
@@ -2599,15 +2630,15 @@ def open_update_dialog(root, update_url, relaunch_argv=None):
                 outcome["check"] = ("uptodate", vs)
             else:
                 outcome["check"] = ("available", (src, vs))
-        except RuntimeError as e:
-            outcome["check"] = ("error", str(e))
+        except Exception as e:
+            outcome["check"] = ("error", str(e) or e.__class__.__name__)
 
     def install_worker():
         try:
             install_update(state["src"])
             outcome["install"] = ("done", None)
-        except RuntimeError as e:
-            outcome["install"] = ("error", str(e))
+        except Exception as e:
+            outcome["install"] = ("error", str(e) or e.__class__.__name__)
 
     def close_app():
         try:
@@ -2656,6 +2687,7 @@ def open_update_dialog(root, update_url, relaunch_argv=None):
                 return  # going down; stop polling
             status_var.set(f"Install failed: {val}")
             check_btn.configure(state="normal")
+            install_btn.configure(state="normal")  # allow a direct retry
         try:
             dlg.after(150, poll)
         except tk.TclError:
@@ -2884,21 +2916,7 @@ def run_launcher(update_url=UPDATE_URL):
         data["advanced_open"] = adv["on"]
         save_settings(data)
 
-    def do_start():
-        vals = collect()
-        try:
-            argv = _launcher_argv(vals)
-        except ValueError as e:
-            messagebox.showerror("Network Vitals", str(e), parent=root)
-            return
-        try:
-            socket.getaddrinfo(vals["peer"], None, socket.AF_INET)
-        except OSError:
-            messagebox.showerror(
-                "Network Vitals",
-                f"Peer '{vals['peer']}' is not a valid IPv4 address or a "
-                f"resolvable host name.", parent=root)
-            return
+    def _finish_start(vals, argv):
         persist(vals)
         if vals["no_gui"] and not _has_console():
             # Started from a GUI-only process (pythonw shortcut): console
@@ -2908,6 +2926,68 @@ def run_launcher(update_url=UPDATE_URL):
             return
         result["argv"] = argv
         root.destroy()
+
+    def do_start():
+        if str(start_btn.cget("state")) == "disabled":
+            return  # Enter pressed again while a resolve is in flight
+        vals = collect()
+        try:
+            argv = _launcher_argv(vals)
+        except ValueError as e:
+            messagebox.showerror("Network Vitals", str(e), parent=root)
+            return
+        bind = (vals["bind"] or "").strip()
+        if bind and bind != "0.0.0.0":
+            # A bind typo would otherwise kill the app AFTER this window
+            # closes - invisibly when started from a pythonw shortcut - and
+            # be restored from the saved settings on the next launch too.
+            try:
+                probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    probe.bind((bind, 0))
+                finally:
+                    probe.close()
+            except OSError as e:
+                messagebox.showerror(
+                    "Network Vitals",
+                    f"Can't bind '{bind}': {e}\n\nUse one of this machine's "
+                    f"addresses, or leave 0.0.0.0 for all interfaces.",
+                    parent=root)
+                return
+        peer = vals["peer"]
+        try:
+            socket.inet_aton(peer)      # numeric IPv4: no lookup needed
+        except OSError:
+            # Host name: resolve on a worker thread so a slow DNS server
+            # can't freeze the window; the button says what's happening.
+            start_btn.configure(state="disabled", text="Resolving ...")
+            res = {}
+
+            def resolver():
+                try:
+                    socket.getaddrinfo(peer, None, socket.AF_INET)
+                    res["ok"] = True
+                except OSError:
+                    res["ok"] = False
+
+            threading.Thread(target=resolver, daemon=True).start()
+
+            def wait_resolve():
+                if "ok" not in res:
+                    root.after(100, wait_resolve)
+                    return
+                start_btn.configure(state="normal", text="▶  Start")
+                if not res["ok"]:
+                    messagebox.showerror(
+                        "Network Vitals",
+                        f"Peer '{peer}' is not a valid IPv4 address or a "
+                        f"resolvable host name.", parent=root)
+                    return
+                _finish_start(vals, argv)
+
+            wait_resolve()
+            return
+        _finish_start(vals, argv)
 
     def do_sweep():
         vals = collect()
@@ -2928,8 +3008,11 @@ def run_launcher(update_url=UPDATE_URL):
                            ports)
 
     def do_update():
-        # Restarting from the launcher reopens the (new) launcher: argv [].
-        open_update_dialog(root, update_url, relaunch_argv=[])
+        # A restart from the launcher reopens the (new) launcher; a
+        # non-default update URL stays on the relaunched command line.
+        argv = ([] if update_url == UPDATE_URL
+                else ["--update-url", update_url])
+        open_update_dialog(root, update_url, relaunch_argv=argv)
 
     mkbarbtn("⟳  Check for updates", do_update).pack(side="left")
     start_btn = mkbarbtn("▶  Start", do_start, primary=True)
@@ -3161,6 +3244,9 @@ def main(argv=None):
             else:
                 if chosen is None:
                     return 0  # launcher closed without starting a run
+                if args.update_url != UPDATE_URL:
+                    # keep a custom update source across the launcher hop
+                    chosen = chosen + ["--update-url", args.update_url]
                 args = parse_args(chosen)
                 args._argv = chosen
         if not args.peer:
@@ -3196,20 +3282,39 @@ def main(argv=None):
         return
 
     set_timer_resolution(1)  # smooth pacing on Windows -> fewer microburst drops
-    engine = Engine(args.peer, args.bind, args.size, args.pps, args.window,
-                    args.timeout, history_seconds=args.history,
-                    loss_deadband=args.loss_deadband,
-                    dont_fragment=args.dont_fragment, vxlan=vxlan)
-    try:
-        engine.start()
-    except OSError as e:
+    # Binding can transiently fail right after an in-app update restart (the
+    # replaced instance is still letting go of the ports), so retry briefly
+    # before declaring a real conflict - and declare it VISIBLY: under a
+    # pythonw shortcut a raised traceback would vanish without a trace.
+    engine = None
+    last_err = None
+    for attempt in range(4):
+        engine = Engine(args.peer, args.bind, args.size, args.pps, args.window,
+                        args.timeout, history_seconds=args.history,
+                        loss_deadband=args.loss_deadband,
+                        dont_fragment=args.dont_fragment, vxlan=vxlan)
+        try:
+            engine.start()
+            last_err = None
+            break
+        except OSError as e:
+            last_err = e
+            engine.shutdown()
+            if attempt < 3:
+                time.sleep(1.2)  # let the previous instance's sockets close
+    if last_err is not None:
         if vxlan:
-            print(f"error: cannot bind the VXLAN tunnel on "
-                  f"{args.bind}:{vxlan['port']}/udp ({e}). Another VTEP or "
-                  f"instance on this port? Change it with --vxlan-port "
-                  f"(on BOTH ends).", file=sys.stderr)
-            return 2
-        raise
+            msg = (f"Cannot bind the VXLAN tunnel on "
+                   f"{args.bind}:{vxlan['port']}/udp ({last_err}). Another "
+                   f"VTEP or instance on this port? Change it with "
+                   f"--vxlan-port (on BOTH ends).")
+        else:
+            msg = (f"Cannot bind the probe ports on {args.bind} "
+                   f"({last_err}). Is another Network Vitals instance "
+                   f"already running on this machine?")
+        print(f"error: {msg}", file=sys.stderr)
+        _alert_gui_error(msg)
+        return 2
 
     use_gui = not args.no_gui
     if use_gui:

@@ -110,10 +110,12 @@ admin rights** and takes care of Python too:
 
 - **From a checkout / downloaded copy of this repo:** double-click
   **`install.bat`**.
-- **From nothing** (PowerShell one-liner — downloads the installer and runs it):
+- **From nothing** (PowerShell one-liner — downloads the installer and runs
+  it; the first statement enables TLS 1.2, which Windows PowerShell 5.1
+  doesn't use by default and GitHub requires):
 
   ```powershell
-  iwr -useb https://raw.githubusercontent.com/robertsonc/netvitals/main/install.ps1 -OutFile "$env:TEMP\nv-install.ps1"; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\nv-install.ps1"
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; iwr -useb https://raw.githubusercontent.com/robertsonc/netvitals/main/install.ps1 -OutFile "$env:TEMP\nv-install.ps1"; powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\nv-install.ps1"
   ```
 
 A setup window opens (install folder, shortcut choices, live log) and then:
@@ -313,7 +315,8 @@ Bad below.
 ## Options
 
 ```
---peer IP          (required) the other workstation's IP
+--peer IP          the other workstation's IP (required on the command line;
+                   without it the graphical launch window opens instead)
 --bind ADDR        local address to bind/listen on (default 0.0.0.0)
 --udp-ports A,B    the two UDP ports (default 30201,30202)
 --tcp-ports A,B    the two TCP ports (default 30101,30102)

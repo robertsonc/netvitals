@@ -233,7 +233,8 @@ function Get-SourceDir {
         Write-Log "Installing from local folder: $PSScriptRoot"
         return $PSScriptRoot
     }
-    $zip = Join-Path $env:TEMP "netvitals-$Branch.zip"
+    $safe = $Branch -replace '[\\/:*?"<>|]', '-'   # branch names may contain /
+    $zip = Join-Path $env:TEMP "netvitals-$safe.zip"
     $dst = Join-Path $env:TEMP "netvitals-unzip"
     Get-RemoteFile -Url "https://codeload.github.com/$Repo/zip/refs/heads/$Branch" `
                    -Destination $zip -What "$AppName ($Branch branch)"
@@ -520,10 +521,27 @@ function Show-InstallerGui {
     $form.Controls.Add($btnClose)
 
     $result = @{ Python = $null }
+    $script:Installing = $false
+    # DoEvents keeps the window responsive during the install, which also
+    # means Close/X clicks get dispatched - block them while work is running
+    # so the install can't silently continue behind a closed window.
+    $form.Add_FormClosing({
+        param($sender, $e)
+        if ($script:Installing) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Setup is still running - let it finish first.",
+                "$AppName setup",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+            $e.Cancel = $true
+        }
+    })
     $btnInstall.Add_Click({
         $btnInstall.Enabled = $false
+        $btnClose.Enabled = $false
         $browse.Enabled = $false
         $dirBox.Enabled = $false
+        $script:Installing = $true
         $script:InstallDir = $dirBox.Text.Trim()
         $script:NoStartMenuShortcut = -not $cbStart.Checked
         $script:NoDesktopShortcut = -not $cbDesk.Checked
@@ -548,6 +566,9 @@ function Show-InstallerGui {
             $btnInstall.Enabled = $true
             $browse.Enabled = $true
             $dirBox.Enabled = $true
+        } finally {
+            $script:Installing = $false
+            $btnClose.Enabled = $true
         }
     })
     $btnLaunch.Add_Click({
