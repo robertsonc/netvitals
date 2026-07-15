@@ -34,6 +34,7 @@ Local loopback smoke test (one machine, Linux only - two loopback aliases):
 
 import argparse
 import array
+import json
 import math
 import os
 import re
@@ -45,7 +46,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -1736,6 +1737,18 @@ def run_gui(engine, args):
                         font=(FONT, 9, "bold"), cursor="hand2")
     fit_btn.pack(side="left")
 
+    def do_update():
+        # Explicit user action; a restart re-runs with this exact argv.
+        open_update_dialog(root, args.update_url,
+                           relaunch_argv=getattr(args, "_argv", None))
+
+    upd_btn = tk.Button(header, text="⟳  Update", command=do_update,
+                        bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                        activeforeground="white", relief="flat", bd=0,
+                        highlightthickness=0, padx=12, pady=5,
+                        font=(FONT, 9, "bold"), cursor="hand2")
+    upd_btn.pack(side="left", padx=(6, 0))
+
     # right-hand stat cluster: quality text + experience score + composite MOS
     stats = tk.Frame(header, bg=BG)
     stats.pack(side="right")
@@ -2179,6 +2192,54 @@ def fetch_update(url, timeout=15):
     return src, vtuple, vstr
 
 
+def install_update(src):
+    """Write already-fetched-and-sanity-checked source over this file
+    (previous copy kept as .bak; the swap itself is atomic). Returns the
+    target path. Raises RuntimeError on any failure, including running as a
+    packaged .exe (which cannot replace itself)."""
+    if getattr(sys, "frozen", False):
+        raise RuntimeError("this is a packaged .exe — it can't replace "
+                           "itself. Download the new version (or rebuild "
+                           "with build_exe.bat).")
+    target = os.path.abspath(__file__)
+    backup = target + ".bak"
+    tmp = target + ".new"
+    try:
+        with open(target, "r", encoding="utf-8") as fh:
+            current = fh.read()
+        with open(backup, "w", encoding="utf-8") as fh:
+            fh.write(current)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(src)
+        os.replace(tmp, target)  # atomic on the same filesystem
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise RuntimeError(f"install failed: {e}") from e
+    return target
+
+
+def relaunch(argv=None, delay=1.5):
+    """Start a fresh copy of this app, detached, after `delay` seconds — long
+    enough for the current process to exit and release its sockets, so the
+    new instance can bind the same ports. Used after an in-app update."""
+    import subprocess
+    argv = list(argv or [])
+    if getattr(sys, "frozen", False):
+        # A packaged .exe can't run `python -c`; it also can't self-update,
+        # so the port-release delay doesn't matter here. Spawn directly.
+        subprocess.Popen([sys.executable] + argv)
+        return
+    inner = [sys.executable, os.path.abspath(__file__)] + argv
+    subprocess.Popen(
+        [sys.executable, "-c",
+         "import subprocess, sys, time; time.sleep(float(sys.argv[1])); "
+         "subprocess.Popen(sys.argv[2:])",
+         str(delay)] + inner)
+
+
 def perform_update(url, apply=True):
     """Check (and optionally install) the latest version. Returns an exit
     code: 0 = up to date / updated, 1 = failed, 3 = update available (check
@@ -2197,31 +2258,640 @@ def perform_update(url, apply=True):
     print(f"New version available: {remote_s}")
     if not apply:
         return 3
-    if getattr(sys, "frozen", False):
-        print("This is a packaged .exe — it can't replace itself. Download "
-              "the new version (or rebuild with build_exe.bat) from:\n  "
-              + url, file=sys.stderr)
-        return 1
-    target = os.path.abspath(__file__)
-    backup = target + ".bak"
-    tmp = target + ".new"
     try:
-        with open(backup, "w", encoding="utf-8") as fh:
-            fh.write(open(target, "r", encoding="utf-8").read())
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(src)
-        os.replace(tmp, target)  # atomic on the same filesystem
-    except OSError as e:
+        target = install_update(src)
+    except RuntimeError as e:
         print(f"Install failed: {e}", file=sys.stderr)
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
         return 1
     print(f"Updated {os.path.basename(target)} {__version__} -> {remote_s}.")
-    print(f"(previous version saved as {os.path.basename(backup)})")
+    print(f"(previous version saved as {os.path.basename(target)}.bak)")
     print("Restart the app to run the new version.")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Saved settings (used by the graphical launcher; the CLI stays canonical and
+# never reads them - a script gets exactly the flags it passed, nothing more)
+# ---------------------------------------------------------------------------
+def config_dir():
+    """Per-user config directory (created on demand by save_settings)."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "NetVitals")
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config")
+    return os.path.join(base, "netvitals")
+
+
+def settings_path():
+    return os.path.join(config_dir(), "settings.json")
+
+
+def load_settings():
+    """Best-effort read of the launcher settings; {} when absent or corrupt."""
+    try:
+        with open(settings_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    """Best-effort atomic write; launching must never fail on a settings file."""
+    try:
+        os.makedirs(config_dir(), exist_ok=True)
+        tmp = settings_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+        os.replace(tmp, settings_path())
+    except OSError:
+        pass
+
+
+def local_ips():
+    """Best-effort list of this machine's non-loopback IPv4 addresses, the
+    routable one first. connect() on a UDP socket sends NO packets - it only
+    asks the OS which source address it would route from."""
+    ips = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("192.0.2.1", 9))  # TEST-NET-1: never actually sent to
+            ip = s.getsockname()[0]
+            if not ip.startswith("127."):
+                ips.append(ip)
+        finally:
+            s.close()
+    except OSError:
+        pass
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip not in ips and not ip.startswith(("127.", "169.254.")):
+                ips.append(ip)
+    except OSError:
+        pass
+    return ips
+
+
+def _has_console():
+    """True when a usable console is attached (always True off-Windows)."""
+    if sys.platform != "win32":
+        return True
+    try:
+        import ctypes
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())
+    except Exception:
+        return True
+
+
+def _spawn_in_new_console(argv):
+    """Windows: re-run ourselves in a fresh console window. Console mode
+    started from a GUI-only process (a pythonw.exe shortcut) has nowhere to
+    draw, so the launcher hands the run to a real console instead."""
+    import subprocess
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable] + argv
+    else:
+        exe = sys.executable
+        if os.path.basename(exe).lower() == "pythonw.exe":
+            console_exe = os.path.join(os.path.dirname(exe), "python.exe")
+            if os.path.exists(console_exe):
+                exe = console_exe
+        cmd = [exe, os.path.abspath(__file__)] + argv
+    subprocess.Popen(cmd, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+
+
+# ---------------------------------------------------------------------------
+# Graphical launcher - the double-click experience. Running with no --peer
+# opens this window instead of erroring: every option/switch is a field here,
+# settings persist between runs, and updates install with one click.
+# ---------------------------------------------------------------------------
+def _fmt_num(v):
+    """10.0 -> '10', 0.5 -> '0.5', 16777215 -> '16777215' - keep generated
+    argv and messages human-friendly (never scientific notation)."""
+    try:
+        if float(v).is_integer():
+            return str(int(v))
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return repr(float(v)) if isinstance(v, float) else str(v)
+
+
+def _launcher_argv(vals):
+    """Turn the launcher's raw field values into a CLI argv list. Validates
+    everything, raising ValueError with a user-facing message. Only options
+    that differ from the defaults are emitted, so the produced command line
+    is exactly the one you would have typed by hand."""
+    def num(label, raw, conv, lo, hi):
+        try:
+            v = conv(str(raw).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"{label}: '{raw}' is not a number.")
+        if not (lo <= v <= hi):
+            raise ValueError(f"{label} must be between {_fmt_num(lo)} "
+                             f"and {_fmt_num(hi)}.")
+        return v
+
+    peer = (vals.get("peer") or "").strip()
+    if not peer:
+        raise ValueError("Peer IP is required - the address of the other "
+                         "workstation running Network Vitals.")
+    argv = ["--peer", peer]
+
+    size = num("Probe size", vals["size"], int, HEADER_LEN, MAX_SIZE)
+    if size != 200:
+        argv += ["--size", str(size)]
+    pps = num("Probes/sec", vals["pps"], int, 1, 100000)
+    if pps != 50:
+        argv += ["--pps", str(pps)]
+    if vals["dont_fragment"]:
+        argv += ["--dont-fragment"]
+
+    bind = (vals.get("bind") or "").strip() or "0.0.0.0"
+    if bind != "0.0.0.0":
+        argv += ["--bind", bind]
+    for label, key, flag, default in (
+            ("UDP ports", "udp_ports", "--udp-ports", DEFAULT_UDP_PORTS),
+            ("TCP ports", "tcp_ports", "--tcp-ports", DEFAULT_TCP_PORTS)):
+        raw = (vals.get(key) or "").strip()
+        if raw:
+            try:
+                ports = _port_pair(raw)
+            except argparse.ArgumentTypeError as e:
+                raise ValueError(f"{label}: {e}")
+            if ports != default:
+                argv += [flag, "%d,%d" % ports]
+    window = num("Window", vals["window"], float, 1.0, 3600.0)
+    if window != 10.0:
+        argv += ["--window", _fmt_num(window)]
+    timeout = num("Probe timeout", vals["timeout"], float, 0.1, 60.0)
+    if timeout != 2.0:
+        argv += ["--timeout", _fmt_num(timeout)]
+    deadband = num("Loss deadband", vals["loss_deadband"], float, 0.0, 100.0)
+    if deadband != 0.5:
+        argv += ["--loss-deadband", _fmt_num(deadband)]
+    history = num("Chart history", vals["history"], int, 10, 86400)
+    if history != 300:
+        argv += ["--history", str(history)]
+    refresh = num("UI refresh", vals["refresh_ms"], int, 50, 60000)
+    if refresh != 500:
+        argv += ["--refresh-ms", str(refresh)]
+    if vals["vxlan"]:
+        argv += ["--vxlan"]
+        vni = num("VXLAN VNI", vals["vxlan_vni"], int, 0, 0xFFFFFF)
+        if vni != VXLAN_DEFAULT_VNI:
+            argv += ["--vxlan-vni", str(vni)]
+        vxport = num("VXLAN port", vals["vxlan_port"], int, 1, 65535)
+        if vxport != VXLAN_DEFAULT_PORT:
+            argv += ["--vxlan-port", str(vxport)]
+    if vals["no_gui"]:
+        argv += ["--no-gui"]
+    return argv
+
+
+def _open_sweep_window(root, peer, bind, udp_ports):
+    """Run the MTU sweep in a background thread, streaming its output into a
+    small window. The sweep binds its own ephemeral port, so it can run while
+    anything else is running on either end."""
+    import queue
+    import tkinter as tk
+
+    q = queue.Queue()
+    dlg = tk.Toplevel(root)
+    dlg.title(f"MTU sweep -> {peer}")
+    dlg.configure(bg=BG)
+    txt = tk.Text(dlg, width=76, height=18, bg=PANEL, fg=TXT, relief="flat",
+                  font=("Consolas", 9), state="disabled", wrap="none",
+                  highlightthickness=0, padx=8, pady=8)
+    txt.pack(fill="both", expand=True, padx=10, pady=10)
+
+    ns = argparse.Namespace(peer=peer, bind=bind, udp_ports=tuple(udp_ports),
+                            sweep_min=1400, sweep_max=9000)
+
+    def worker():
+        try:
+            run_mtu_sweep(ns, out=lambda line="": q.put(str(line)))
+        except Exception as e:  # show the failure, don't kill the launcher
+            q.put(f"sweep failed: {e}")
+        q.put(None)  # done sentinel: stop polling
+
+    threading.Thread(target=worker, name="mtu-sweep", daemon=True).start()
+
+    def poll():
+        try:
+            while True:
+                line = q.get_nowait()
+                if line is None:
+                    return
+                txt.configure(state="normal")
+                txt.insert("end", line + "\n")
+                txt.see("end")
+                txt.configure(state="disabled")
+        except queue.Empty:
+            pass
+        try:
+            dlg.after(150, poll)
+        except tk.TclError:
+            pass  # window closed mid-sweep; the daemon thread just drains
+
+    poll()
+
+
+def open_update_dialog(root, update_url, relaunch_argv=None):
+    """Check for / install updates from the GUI. The network is only touched
+    after the user explicitly opens this dialog - the app never checks on its
+    own. 'Install and restart' swaps the file (previous copy kept as .bak),
+    starts a fresh instance a moment later (so the sockets are released
+    first), and closes this one."""
+    import tkinter as tk
+
+    existing = getattr(root, "_nq_update_dialog", None)
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.lift()
+                existing.focus_set()
+                return
+        except tk.TclError:
+            pass
+
+    dlg = tk.Toplevel(root)
+    root._nq_update_dialog = dlg
+    dlg.title("Network Vitals update")
+    dlg.configure(bg=BG, padx=18, pady=14)
+    dlg.resizable(False, False)
+    dlg.transient(root)
+
+    tk.Label(dlg, text=f"Installed version: {__version__}", fg=TXT, bg=BG,
+             font=(FONT, 11, "bold")).pack(anchor="w")
+    status_var = tk.StringVar(value="Checking ...")
+    tk.Label(dlg, textvariable=status_var, fg=TXT_DIM, bg=BG, font=(FONT, 10),
+             wraplength=430, justify="left").pack(anchor="w", pady=(6, 12))
+
+    btns = tk.Frame(dlg, bg=BG)
+    btns.pack(anchor="e", fill="x")
+
+    def mkbtn(text, cmd, primary=False):
+        return tk.Button(btns, text=text, command=cmd,
+                         bg=(HPE_GREEN if primary else PANEL_HI),
+                         fg=("white" if primary else TXT),
+                         activebackground=HPE_GREEN_DK, activeforeground="white",
+                         relief="flat", bd=0, highlightthickness=0,
+                         padx=12, pady=5, font=(FONT, 9, "bold"), cursor="hand2")
+
+    state = {"src": None, "vstr": None}
+    outcome = {}  # worker thread -> UI poll loop; workers never touch Tk
+
+    def check_worker():
+        try:
+            src, vt, vs = fetch_update(update_url)
+            local_v, _ = _parse_version(f'__version__ = "{__version__}"')
+            if vt <= local_v:
+                outcome["check"] = ("uptodate", vs)
+            else:
+                outcome["check"] = ("available", (src, vs))
+        except RuntimeError as e:
+            outcome["check"] = ("error", str(e))
+
+    def install_worker():
+        try:
+            install_update(state["src"])
+            outcome["install"] = ("done", None)
+        except RuntimeError as e:
+            outcome["install"] = ("error", str(e))
+
+    def close_app():
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+
+    def do_check():
+        check_btn.configure(state="disabled")
+        install_btn.pack_forget()
+        status_var.set(f"Checking {update_url} ...")
+        threading.Thread(target=check_worker, daemon=True).start()
+
+    def do_install():
+        install_btn.configure(state="disabled")
+        check_btn.configure(state="disabled")
+        status_var.set("Installing ...")
+        threading.Thread(target=install_worker, daemon=True).start()
+
+    check_btn = mkbtn("Check again", do_check)
+    install_btn = mkbtn("Install and restart", do_install, primary=True)
+    close_btn = mkbtn("Close", dlg.destroy)
+    close_btn.pack(side="right")
+    check_btn.pack(side="right", padx=(0, 6))
+    # install_btn is packed only once an update is actually available
+
+    def poll():
+        if "check" in outcome:
+            kind, val = outcome.pop("check")
+            check_btn.configure(state="normal")
+            if kind == "uptodate":
+                status_var.set(f"You're on the latest version ({val}).")
+            elif kind == "available":
+                state["src"], state["vstr"] = val
+                status_var.set(f"Version {state['vstr']} is available.")
+                install_btn.configure(state="normal")
+                install_btn.pack(side="right", padx=(0, 6))
+            else:
+                status_var.set(f"Update check failed: {val}")
+        if "install" in outcome:
+            kind, val = outcome.pop("install")
+            if kind == "done":
+                status_var.set(f"Updated to {state['vstr']}. Restarting ...")
+                relaunch(relaunch_argv, delay=1.5)
+                dlg.after(700, close_app)
+                return  # going down; stop polling
+            status_var.set(f"Install failed: {val}")
+            check_btn.configure(state="normal")
+        try:
+            dlg.after(150, poll)
+        except tk.TclError:
+            pass  # dialog closed; workers finish into a dict nobody reads
+
+    do_check()
+    poll()
+
+
+def run_launcher(update_url=UPDATE_URL):
+    """Graphical launch window: pick the peer and every option without
+    touching a command line. Returns the argv list to run with, or None when
+    the window was closed (or the run was handed to a new console process).
+    Raises RuntimeError when no display is available."""
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        raise RuntimeError(str(e)) from e
+
+    root.title(f"Network Vitals {__version__} - launch")
+    root.configure(bg=BG)
+    root.resizable(False, False)
+
+    s = load_settings()
+    result = {"argv": None}
+    adv = {"on": bool(s.get("advanced_open", False))}
+
+    def sstr(key, default):
+        v = s.get(key, default)
+        return str(v) if v is not None else str(default)
+
+    def sbool(key, default):
+        v = s.get(key, default)
+        return bool(v) if isinstance(v, (bool, int)) else default
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure("NQ.TCombobox", fieldbackground=PANEL_HI, background=PANEL_HI,
+                    foreground=TXT, arrowcolor=TXT, bordercolor=GRID,
+                    lightcolor=PANEL_HI, darkcolor=PANEL_HI, insertcolor=TXT,
+                    selectbackground=HPE_GREEN_DK, selectforeground="white")
+    root.option_add("*TCombobox*Listbox.background", PANEL_HI)
+    root.option_add("*TCombobox*Listbox.foreground", TXT)
+    root.option_add("*TCombobox*Listbox.selectBackground", HPE_GREEN_DK)
+    root.option_add("*TCombobox*Listbox.selectForeground", "white")
+
+    # ---- header -----------------------------------------------------------
+    header = tk.Frame(root, bg=BG, padx=16, pady=12)
+    header.pack(fill="x")
+    ekg = tk.Canvas(header, width=54, height=34, bg=BG, highlightthickness=0)
+    ekg.pack(side="left", padx=(0, 10))
+    _draw_ekg(ekg)
+    tk.Label(header, text="Network Vitals", fg=TXT, bg=BG,
+             font=(FONT, 17, "bold")).pack(side="left")
+    tk.Label(header, text=f"v{__version__}", fg=TXT_DIM, bg=BG,
+             font=(FONT, 10)).pack(side="left", padx=(8, 0), pady=(7, 0))
+    ips = local_ips()
+    if ips:
+        tk.Label(header, text="this machine:  " + "   ".join(ips[:3]),
+                 fg=TXT_DIM, bg=BG, font=(FONT, 9)).pack(side="right",
+                                                         pady=(9, 0))
+
+    body = tk.Frame(root, bg=BG, padx=18, pady=2)
+    body.pack(fill="x")
+
+    def mklabel(parent, text, row, dim=False):
+        tk.Label(parent, text=text, fg=(TXT_DIM if dim else TXT), bg=BG,
+                 font=(FONT, 10)).grid(row=row, column=0, sticky="w",
+                                       pady=3, padx=(0, 10))
+
+    def mkhint(parent, text, row):
+        tk.Label(parent, text=text, fg=TXT_DIM, bg=BG,
+                 font=(FONT, 8)).grid(row=row, column=2, sticky="w",
+                                      padx=(10, 0))
+
+    def mkentry(parent, var, row, width=16):
+        e = tk.Entry(parent, textvariable=var, width=width, bg=PANEL_HI,
+                     fg=TXT, insertbackground=TXT, relief="flat",
+                     highlightthickness=1, highlightbackground=GRID,
+                     highlightcolor=HPE_GREEN, font=(FONT, 10),
+                     disabledbackground=PANEL, disabledforeground=TXT_DIM)
+        e.grid(row=row, column=1, sticky="w", pady=3, ipady=2)
+        return e
+
+    def mkcheck(parent, text, var, row, column=1, columnspan=2):
+        c = tk.Checkbutton(parent, text=text, variable=var, bg=BG, fg=TXT,
+                           activebackground=BG, activeforeground=TXT,
+                           selectcolor=PANEL_HI, font=(FONT, 9),
+                           highlightthickness=0, anchor="w", cursor="hand2")
+        c.grid(row=row, column=column, columnspan=columnspan, sticky="w", pady=2)
+        return c
+
+    # ---- basic options ------------------------------------------------------
+    peer_var = tk.StringVar(value=sstr("peer", ""))
+    recent = [p for p in s.get("recent_peers", []) if isinstance(p, str)]
+    size_var = tk.StringVar(value=sstr("size", "200"))
+    pps_var = tk.StringVar(value=sstr("pps", "50"))
+    df_var = tk.BooleanVar(value=sbool("dont_fragment", False))
+
+    mklabel(body, "Peer IP / host", 0)
+    peer_box = ttk.Combobox(body, textvariable=peer_var, values=recent,
+                            width=17, style="NQ.TCombobox", font=(FONT, 10))
+    peer_box.grid(row=0, column=1, sticky="w", pady=3, ipady=1)
+    mkhint(body, "the other workstation running Network Vitals", 0)
+
+    mklabel(body, "Probe size (B)", 1)
+    mkentry(body, size_var, 1)
+    mkhint(body, "200 default · 1472 fills a 1500 MTU · 8972 a 9000 jumbo", 1)
+
+    mklabel(body, "Probes/sec", 2)
+    mkentry(body, pps_var, 2)
+    mkhint(body, "per stream (default 50)", 2)
+
+    mkcheck(body, "Don't fragment - drop oversized probes instead of "
+                  "splitting them (jumbo testing)", df_var, 3)
+
+    # ---- advanced options (collapsed by default) ----------------------------
+    adv_btn = tk.Button(root, bg=BG, fg=TXT_DIM, activebackground=BG,
+                        activeforeground=TXT, relief="flat", bd=0,
+                        highlightthickness=0, font=(FONT, 9, "bold"),
+                        cursor="hand2", anchor="w", padx=18)
+    adv_btn.pack(fill="x", pady=(8, 0))
+
+    adv_frame = tk.Frame(root, bg=BG, padx=18, pady=2)
+
+    bind_var = tk.StringVar(value=sstr("bind", "0.0.0.0"))
+    udp_var = tk.StringVar(value=sstr("udp_ports", "%d,%d" % DEFAULT_UDP_PORTS))
+    tcp_var = tk.StringVar(value=sstr("tcp_ports", "%d,%d" % DEFAULT_TCP_PORTS))
+    window_var = tk.StringVar(value=sstr("window", "10"))
+    timeout_var = tk.StringVar(value=sstr("timeout", "2"))
+    deadband_var = tk.StringVar(value=sstr("loss_deadband", "0.5"))
+    history_var = tk.StringVar(value=sstr("history", "300"))
+    refresh_var = tk.StringVar(value=sstr("refresh_ms", "500"))
+    vx_var = tk.BooleanVar(value=sbool("vxlan", False))
+    vni_var = tk.StringVar(value=sstr("vxlan_vni", str(VXLAN_DEFAULT_VNI)))
+    vxport_var = tk.StringVar(value=sstr("vxlan_port", str(VXLAN_DEFAULT_PORT)))
+    console_var = tk.BooleanVar(value=sbool("no_gui", False))
+
+    rows = [("Bind address", bind_var, "local address to listen on"),
+            ("UDP ports (A,B)", udp_var, "both ends must match"),
+            ("TCP ports (A,B)", tcp_var, "both ends must match"),
+            ("Window (s)", window_var, "sliding window for loss/jitter/rates"),
+            ("Probe timeout (s)", timeout_var, "un-echoed probe counts lost after this"),
+            ("Loss deadband (%)", deadband_var, "loss+late below this reads as 0"),
+            ("Chart history (s)", history_var, "span of the history charts"),
+            ("UI refresh (ms)", refresh_var, "dashboard redraw interval")]
+    for i, (label, var, hint) in enumerate(rows):
+        mklabel(adv_frame, label, i)
+        mkentry(adv_frame, var, i)
+        mkhint(adv_frame, hint, i)
+
+    r = len(rows)
+    mkcheck(adv_frame, "VXLAN encapsulation - carry all probe traffic inside "
+                       "a userspace VTEP (both ends)", vx_var, r, column=0,
+            columnspan=3)
+    mklabel(adv_frame, "    VXLAN VNI", r + 1, dim=True)
+    vni_entry = mkentry(adv_frame, vni_var, r + 1)
+    mkhint(adv_frame, "must match on both ends", r + 1)
+    mklabel(adv_frame, "    VXLAN UDP port", r + 2, dim=True)
+    vxport_entry = mkentry(adv_frame, vxport_var, r + 2)
+    mkhint(adv_frame, "outer tunnel port (default 4789)", r + 2)
+    mkcheck(adv_frame, "Console UI - run in a terminal instead of this "
+                       "dashboard", console_var, r + 3, column=0, columnspan=3)
+
+    def sync_vxlan(*_):
+        st = "normal" if vx_var.get() else "disabled"
+        vni_entry.configure(state=st)
+        vxport_entry.configure(state=st)
+
+    vx_var.trace_add("write", sync_vxlan)
+    sync_vxlan()
+
+    def show_adv():
+        adv_btn.configure(text="▾  Advanced options")
+        adv_frame.pack(fill="x", after=adv_btn)
+
+    def hide_adv():
+        adv_btn.configure(text="▸  Advanced options")
+        adv_frame.pack_forget()
+
+    def toggle_adv():
+        adv["on"] = not adv["on"]
+        (show_adv if adv["on"] else hide_adv)()
+
+    adv_btn.configure(command=toggle_adv)
+    (show_adv if adv["on"] else hide_adv)()
+
+    # ---- bottom bar ---------------------------------------------------------
+    bar = tk.Frame(root, bg=BG, padx=18, pady=14)
+    bar.pack(fill="x", side="bottom")
+
+    def mkbarbtn(text, cmd, primary=False):
+        return tk.Button(bar, text=text, command=cmd,
+                         bg=(HPE_GREEN if primary else PANEL_HI),
+                         fg=("white" if primary else TXT),
+                         activebackground=HPE_GREEN_DK, activeforeground="white",
+                         relief="flat", bd=0, highlightthickness=0,
+                         padx=(16 if primary else 12), pady=6,
+                         font=(FONT, 10 if primary else 9, "bold"),
+                         cursor="hand2")
+
+    def collect():
+        return {
+            "peer": peer_var.get().strip(),
+            "size": size_var.get(), "pps": pps_var.get(),
+            "dont_fragment": bool(df_var.get()),
+            "bind": bind_var.get(), "udp_ports": udp_var.get(),
+            "tcp_ports": tcp_var.get(), "window": window_var.get(),
+            "timeout": timeout_var.get(), "loss_deadband": deadband_var.get(),
+            "history": history_var.get(), "refresh_ms": refresh_var.get(),
+            "vxlan": bool(vx_var.get()), "vxlan_vni": vni_var.get(),
+            "vxlan_port": vxport_var.get(), "no_gui": bool(console_var.get()),
+        }
+
+    def persist(vals):
+        data = dict(s)  # keep keys this version doesn't know about
+        data.update(vals)
+        peers = [vals["peer"]] + [p for p in recent if p != vals["peer"]]
+        data["recent_peers"] = peers[:8]
+        data["advanced_open"] = adv["on"]
+        save_settings(data)
+
+    def do_start():
+        vals = collect()
+        try:
+            argv = _launcher_argv(vals)
+        except ValueError as e:
+            messagebox.showerror("Network Vitals", str(e), parent=root)
+            return
+        try:
+            socket.getaddrinfo(vals["peer"], None, socket.AF_INET)
+        except OSError:
+            messagebox.showerror(
+                "Network Vitals",
+                f"Peer '{vals['peer']}' is not a valid IPv4 address or a "
+                f"resolvable host name.", parent=root)
+            return
+        persist(vals)
+        if vals["no_gui"] and not _has_console():
+            # Started from a GUI-only process (pythonw shortcut): console
+            # mode needs a real console, so hand the run to a fresh one.
+            _spawn_in_new_console(argv)
+            root.destroy()
+            return
+        result["argv"] = argv
+        root.destroy()
+
+    def do_sweep():
+        vals = collect()
+        peer = vals["peer"]
+        if not peer:
+            messagebox.showerror("Network Vitals",
+                                 "Peer IP is required for an MTU sweep.",
+                                 parent=root)
+            return
+        try:
+            ports = (_port_pair(vals["udp_ports"])
+                     if vals["udp_ports"].strip() else DEFAULT_UDP_PORTS)
+        except argparse.ArgumentTypeError as e:
+            messagebox.showerror("Network Vitals", f"UDP ports: {e}",
+                                 parent=root)
+            return
+        _open_sweep_window(root, peer, vals["bind"].strip() or "0.0.0.0",
+                           ports)
+
+    def do_update():
+        # Restarting from the launcher reopens the (new) launcher: argv [].
+        open_update_dialog(root, update_url, relaunch_argv=[])
+
+    mkbarbtn("⟳  Check for updates", do_update).pack(side="left")
+    start_btn = mkbarbtn("▶  Start", do_start, primary=True)
+    start_btn.pack(side="right")
+    mkbarbtn("MTU sweep", do_sweep).pack(side="right", padx=(0, 8))
+
+    peer_box.focus_set()
+    root.bind("<Return>", lambda _e: do_start())
+    root.mainloop()
+    return result["argv"]
 
 
 # ---------------------------------------------------------------------------
@@ -2301,6 +2971,9 @@ def parse_args(argv=None):
                    help="UI refresh interval in ms (default 500).")
     p.add_argument("--no-gui", action="store_true",
                    help="Force the console UI even if a display is available.")
+    p.add_argument("--no-launcher", action="store_true",
+                   help="With no --peer, print an error instead of opening the "
+                        "graphical launch window (for scripts).")
     p.add_argument("--mtu-sweep", action="store_true",
                    help="One-shot: binary-search the largest UDP payload that reaches "
                         "the peer unfragmented (peer must be running Network Vitals), "
@@ -2338,29 +3011,32 @@ def clear_timer_resolution(period_ms):
         pass
 
 
-def run_mtu_sweep(args):
+def run_mtu_sweep(args, out=print):
     """Binary-search the largest UDP payload that reaches the peer unfragmented.
 
     Sends probes with DF set to the peer's UDP reflector and watches for echoes.
     Binds an ephemeral source port so it coexists with a normally-running
     instance on either end. Measures the FORWARD path MTU (this host -> peer);
-    the return echo may fragment without affecting detection.
+    the return echo may fragment without affecting detection. `out` receives
+    one line at a time (the launcher streams it into a window; the CLI prints).
     """
     peer, port = args.peer, args.udp_ports[0]
     lo = max(HEADER_LEN, min(args.sweep_min, MAX_SIZE))
     hi = max(lo, min(args.sweep_max, MAX_SIZE))
-    print(f"MTU sweep -> {peer}:{port} (UDP, Don't-Fragment). "
-          f"Peer must be running Network Vitals.\n")
+    out(f"MTU sweep -> {peer}:{port} (UDP, Don't-Fragment). "
+        f"Peer must be running Network Vitals.")
+    out("")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     enlarge_socket_buffers(sock)
     quench_udp_connreset(sock)  # peer down must read as 'dropped', not an error
     if not set_dont_fragment(sock):
-        print("WARNING: could not set Don't-Fragment - results may reflect "
-              "fragmentation, not true path MTU.\n")
+        out("WARNING: could not set Don't-Fragment - results may reflect "
+            "fragmentation, not true path MTU.")
+        out("")
     try:
         sock.bind((args.bind, 0))  # ephemeral source port
     except OSError as e:
-        print(f"bind failed: {e}")
+        out(f"bind failed: {e}")
         return
     sock.settimeout(0.4)
     seq = [0]
@@ -2389,44 +3065,60 @@ def run_mtu_sweep(args):
         return False
 
     if not round_trips(lo):
-        print(f"  {lo} B payload did not round-trip - peer down, UDP {port} "
-              f"blocked, or even the base size is being dropped.")
+        out(f"  {lo} B payload did not round-trip - peer down, UDP {port} "
+            f"blocked, or even the base size is being dropped.")
         sock.close()
         return
-    print(f"  {lo:>5} B payload  ...  OK")
+    out(f"  {lo:>5} B payload  ...  OK")
     best, blo, bhi = lo, lo + 1, hi
     while blo <= bhi:
         mid = (blo + bhi) // 2
         ok = round_trips(mid)
-        print(f"  {mid:>5} B payload  ...  {'OK' if ok else 'dropped'}")
+        out(f"  {mid:>5} B payload  ...  {'OK' if ok else 'dropped'}")
         if ok:
             best, blo = mid, mid + 1
         else:
             bhi = mid - 1
     sock.close()
     frame = best + 28  # + 20 IPv4 + 8 UDP
-    print()
-    print(f"Largest UDP payload that traverses unfragmented:  {best} bytes")
-    print(f"Forward path MTU (this host -> peer):            ~{frame} bytes")
+    out("")
+    out(f"Largest UDP payload that traverses unfragmented:  {best} bytes")
+    out(f"Forward path MTU (this host -> peer):            ~{frame} bytes")
     if frame >= 9000:
-        print("=> Jumbo frames (>=9000) confirmed end to end.  ✓")
+        out("=> Jumbo frames (>=9000) confirmed end to end.  ✓")
     elif frame > 1500:
-        print(f"=> Larger-than-standard frames supported up to ~{frame} B "
-              f"(but short of 9000 jumbo).")
+        out(f"=> Larger-than-standard frames supported up to ~{frame} B "
+            f"(but short of 9000 jumbo).")
     else:
-        print("=> Standard 1500-byte MTU; no jumbo on this path.")
+        out("=> Standard 1500-byte MTU; no jumbo on this path.")
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    cli_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parse_args(cli_argv)
+    args._argv = cli_argv  # what a post-update restart should re-run with
 
     if args.update or args.check_update:
         return perform_update(args.update_url, apply=args.update)
 
     if not args.peer:
-        print("error: --peer is required (except with --update/--check-update)",
-              file=sys.stderr)
-        return 2
+        # No peer given: open the graphical launcher (the double-click
+        # experience) unless it's explicitly disabled or plainly can't work.
+        if not (args.no_launcher or args.no_gui or args.mtu_sweep):
+            try:
+                chosen = run_launcher(args.update_url)
+            except (ImportError, RuntimeError) as e:
+                print(f"note: graphical launcher unavailable ({e})",
+                      file=sys.stderr)
+            else:
+                if chosen is None:
+                    return 0  # launcher closed without starting a run
+                args = parse_args(chosen)
+                args._argv = chosen
+        if not args.peer:
+            print("error: --peer is required (except with "
+                  "--update/--check-update)", file=sys.stderr)
+            return 2
 
     args.size = max(HEADER_LEN, min(args.size, MAX_SIZE))
     if args.pps < 1:

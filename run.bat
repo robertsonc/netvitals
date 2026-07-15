@@ -4,6 +4,10 @@ REM used (lastpeer.txt next to this script), and prompts with it as the
 REM default. Pass the peer as the first argument to skip the prompt; any
 REM further args pass through to netquality.py and override the site
 REM defaults below (the last occurrence of a flag wins).
+REM
+REM Tip: running netquality.py with NO arguments (or the Start Menu shortcut
+REM the installer creates) opens a graphical launch window instead - every
+REM option is a field there and settings are remembered between runs.
 setlocal EnableDelayedExpansion
 title Network Vitals
 set "HISTFILE=%~dp0lastpeer.txt"
