@@ -167,6 +167,17 @@ replace itself — rebuild with `build_exe.bat` after updating the source.
 Updates are only ever fetched when explicitly requested (opening the update
 dialog counts as a request); the app never phones home on its own.
 
+**Corporate networks / `unable to get local issuer certificate`:** that error
+is Python's bundled OpenSSL not trusting a TLS-inspecting proxy (whose root
+lives only in the *Windows* certificate store), or a chain with a missing
+intermediate that OpenSSL — unlike the browser — won't fetch. Since 1.3.1
+the updater detects this and automatically retries the download through the
+Windows certificate store (`curl.exe`/PowerShell → SChannel, the same trust
+decisions as Edge), so updating works wherever the browser does — with TLS
+verification still on. To lift a pre-1.3.1 install over this hump once,
+re-run `install.bat` (the installer downloads via PowerShell already); after
+that the in-app update works.
+
 ## Running it
 
 ### The launch window (easiest)
