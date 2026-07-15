@@ -46,7 +46,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -1694,26 +1694,35 @@ def run_gui(engine, args):
               foreground=[("selected", "white")])
 
     # ---- header bar -------------------------------------------------------
+    # row1 carries the branding and the score cluster; the button bar joins
+    # row1 when the window is wide and drops to its own row underneath when
+    # it is not, so the buttons can never sit on top of the health readout.
     header = tk.Frame(root, bg=BG, padx=14, pady=10)
     header.pack(fill="x", side="top")
+    row1 = tk.Frame(header, bg=BG)
+    row1.pack(fill="x", side="top")
 
     # EKG/heartbeat glyph (vector, drawn on a canvas)
-    ekg = tk.Canvas(header, width=54, height=34, bg=BG, highlightthickness=0)
+    ekg = tk.Canvas(row1, width=54, height=34, bg=BG, highlightthickness=0)
     ekg.pack(side="left", padx=(0, 10))
     _draw_ekg(ekg)
 
-    tk.Label(header, text="Network Vitals", fg=TXT, bg=BG,
-             font=(FONT, 17, "bold")).pack(side="left", anchor="w")
+    # packed AFTER the stats cluster below: pack grants space in packing
+    # order, so the brand title truncates before the score cluster clips
+    title_lbl = tk.Label(row1, text="Network Vitals", fg=TXT, bg=BG,
+                         font=(FONT, 17, "bold"), anchor="w")
+
+    btnbar = tk.Frame(header, bg=BG)  # placed by _reflow_header below
 
     def do_reset():
         engine.reset()  # charts + stats clear; they repopulate on the next tick
 
-    reset_btn = tk.Button(header, text="↺  Reset / Clear", command=do_reset,
+    reset_btn = tk.Button(btnbar, text="↺  Reset / Clear", command=do_reset,
                           bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
                           activeforeground="white", relief="flat", bd=0,
                           highlightthickness=0, padx=12, pady=5,
                           font=(FONT, 9, "bold"), cursor="hand2")
-    reset_btn.pack(side="left", padx=(18, 6))
+    reset_btn.pack(side="left", padx=(0, 6))
 
     totals_shown = {"on": False}
 
@@ -1729,7 +1738,7 @@ def run_gui(engine, args):
             totals_frame.pack_forget()
             totals_btn.configure(text="▾  Totals")
 
-    totals_btn = tk.Button(header, text="▾  Totals", command=do_toggle_totals,
+    totals_btn = tk.Button(btnbar, text="▾  Totals", command=do_toggle_totals,
                            bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
                            activeforeground="white", relief="flat", bd=0,
                            highlightthickness=0, padx=12, pady=5,
@@ -1747,7 +1756,7 @@ def run_gui(engine, args):
             iso_frame.pack_forget()
             isolate_btn.configure(text="⇄  Isolate")
 
-    isolate_btn = tk.Button(header, text="⇄  Isolate", command=do_toggle_isolate,
+    isolate_btn = tk.Button(btnbar, text="⇄  Isolate", command=do_toggle_isolate,
                             bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
                             activeforeground="white", relief="flat", bd=0,
                             highlightthickness=0, padx=12, pady=5,
@@ -1765,7 +1774,7 @@ def run_gui(engine, args):
             c.configure(width=100, height=80)
         root.update_idletasks()
 
-    fit_btn = tk.Button(header, text="⤢  Fit charts", command=do_fit_charts,
+    fit_btn = tk.Button(btnbar, text="⤢  Fit charts", command=do_fit_charts,
                         bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
                         activeforeground="white", relief="flat", bd=0,
                         highlightthickness=0, padx=12, pady=5,
@@ -1777,7 +1786,7 @@ def run_gui(engine, args):
         open_update_dialog(root, args.update_url,
                            relaunch_argv=getattr(args, "_argv", None))
 
-    upd_btn = tk.Button(header, text="⟳  Update", command=do_update,
+    upd_btn = tk.Button(btnbar, text="⟳  Update", command=do_update,
                         bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
                         activeforeground="white", relief="flat", bd=0,
                         highlightthickness=0, padx=12, pady=5,
@@ -1785,7 +1794,7 @@ def run_gui(engine, args):
     upd_btn.pack(side="left", padx=(6, 0))
 
     # right-hand stat cluster: quality text + experience score + composite MOS
-    stats = tk.Frame(header, bg=BG)
+    stats = tk.Frame(row1, bg=BG)
     stats.pack(side="right")
 
     # Per-protocol headline metrics: UDP keeps MOS (a media metric); TCP gets
@@ -1817,20 +1826,53 @@ def run_gui(engine, args):
     txt.pack(side="right", padx=(0, 12))
     tk.Label(txt, text="EXPERIENCE", fg=TXT_DIM, bg=BG,
              font=(FONT, 8, "bold")).pack(anchor="e")
-    tk.Label(txt, textvariable=label_var, fg=TXT, bg=BG,
-             font=(FONT, 17, "bold")).pack(anchor="e")
-    tk.Label(txt, textvariable=sub_var, fg=TXT_DIM, bg=BG,
-             font=(FONT, 9)).pack(anchor="e")
+    tk.Label(txt, textvariable=label_var, fg=TXT, bg=BG, anchor="e",
+             font=(FONT, 17, "bold")).pack(anchor="e", fill="x")
+    tk.Label(txt, textvariable=sub_var, fg=TXT_DIM, bg=BG, anchor="e",
+             font=(FONT, 9)).pack(anchor="e", fill="x")
+
+    title_lbl.pack(side="left", anchor="w")
+
+    hdr = {"wide": None, "btn_req": 0}
+
+    def _reflow_header(_event=None):
+        w = header.winfo_width()
+        if w <= 1:
+            return  # not laid out yet
+        if not hdr["btn_req"]:
+            root.update_idletasks()  # settle requested sizes once
+            hdr["btn_req"] = btnbar.winfo_reqwidth()
+        need = (28 + ekg.winfo_reqwidth() + 10 + title_lbl.winfo_reqwidth()
+                + 18 + hdr["btn_req"] + 16 + stats.winfo_reqwidth())
+        wide = w >= need
+        if wide == hdr["wide"]:
+            return
+        hdr["wide"] = wide
+        btnbar.pack_forget()
+        if wide:
+            btnbar.pack(in_=row1, side="left", padx=(18, 0))
+        else:
+            btnbar.pack(in_=header, side="top", anchor="w", pady=(8, 0))
+
+    header.bind("<Configure>", _reflow_header)
+    stats.bind("<Configure>", _reflow_header)  # score/label text can widen
 
     # ---- footer (pinned to the bottom, before charts claim the middle) ----
+    # Two short left-anchored lines instead of one mega-line: a label centers
+    # its text in the space it gets, so the old single line clipped at BOTH
+    # ends in a narrow window.  The warning gets a row only while active.
     footer = tk.Frame(root, bg=BG, padx=14, pady=6)
     footer.pack(fill="x", side="bottom")
-    foot_var = tk.StringVar(value="")
-    tk.Label(footer, textvariable=foot_var, fg=TXT_DIM, bg=BG,
-             font=(FONT, 9)).pack(side="left")
     warn_var = tk.StringVar(value="")
-    tk.Label(footer, textvariable=warn_var, fg="#ffd27e", bg=BG,
-             font=(FONT, 9, "bold")).pack(side="right")
+    warn_lbl = tk.Label(footer, textvariable=warn_var, fg="#ffd27e", bg=BG,
+                        font=(FONT, 9, "bold"), anchor="w")
+    foot_path_var = tk.StringVar(value="")
+    foot_path_lbl = tk.Label(footer, textvariable=foot_path_var, fg=TXT_DIM,
+                             bg=BG, font=(FONT, 9), anchor="w")
+    foot_path_lbl.pack(fill="x")
+    foot_cnt_var = tk.StringVar(value="")
+    tk.Label(footer, textvariable=foot_cnt_var, fg=TXT_DIM, bg=BG,
+             font=(FONT, 9), anchor="w").pack(fill="x")
 
     # ---- totals table (hidden by default; toggled by the Totals button) ----
     totals_cols = ("stream", "sent", "recv", "lost", "late", "lossp",
@@ -1943,24 +1985,32 @@ def run_gui(engine, args):
         df = "on" if snap["dont_fragment"] else "off"
         size_tag = {"verified": "✓ verified", "mismatch": "⚠ MISMATCH",
                     "pending": "…"}[snap["size_status"]]
-        vx = (f"  VXLAN vni {snap['vxlan']['vni']} udp/{snap['vxlan']['port']}"
+        vx = (f"  ·  VXLAN vni {snap['vxlan']['vni']} udp/{snap['vxlan']['port']}"
               if snap["vxlan"] else "")
         if snap.get("udp_silent"):
             warn_var.set("⚠ UDP silent while TCP is up — UDP blocked in the "
                          "path (firewall/ACL) or the peer runs an outdated "
                          "version; update BOTH ends")
+            if not warn_lbl.winfo_ismapped():
+                warn_lbl.pack(fill="x", before=foot_path_lbl)
         else:
             warn_var.set("")
-        foot_var.set(
-            f"peer {args.peer}    {ports_summary()}    "
-            f"frame {snap['frame_size']} B  DF {df}  size {size_tag}{vx}    "
-            f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}"
-            f"    |  since reset:  sent {t['tx']:,}  recv {t['recv']:,}  "
+            if warn_lbl.winfo_ismapped():
+                warn_lbl.pack_forget()
+        foot_path_var.set(
+            f"peer {args.peer}  ·  {ports_summary()}  ·  "
+            f"frame {snap['frame_size']} B  DF {df}  size {size_tag}{vx}  ·  "
+            f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}")
+        # lifetime repeats since-reset until the first reset — show it only
+        # once it actually says something different
+        life = ("" if t["life_tx"] == t["tx"] and t["life_lost"] == t["lost"]
+                else f"  ·  lifetime  sent {t['life_tx']:,}  "
+                     f"lost {t['life_lost']:,} ({t['life_loss_pct']:.2f}%)")
+        foot_cnt_var.set(
+            f"since reset  sent {t['tx']:,}  recv {t['recv']:,}  "
             f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  "
-            f"[fwd→ {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%)  "
-            f"rtn← {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%)]"
-            f"    |  lifetime:  sent {t['life_tx']:,}  "
-            f"lost {t['life_lost']:,} ({t['life_loss_pct']:.2f}%)")
+            f"fwd→ {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%)  "
+            f"rtn← {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%){life}")
 
         if isolate_shown["on"]:
             for row in snap["rows"]:
