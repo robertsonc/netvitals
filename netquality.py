@@ -46,7 +46,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -1874,7 +1874,12 @@ class Engine:
             "peer": peer,
             "rows": rows,
             "udp_silent": udp_silent,
-            "loss_pattern": self._loss_pattern.get(peer),  # 1/s via _sampler
+            # 1/s via _sampler. Suppressed while the pair is fully down: a
+            # dead peer makes only the still-sending streams accrue loss
+            # events, which the classifier would misread as something
+            # selective ("UDP only - QoS policy?") when the truth is simply
+            # "no link".
+            "loss_pattern": self._loss_pattern.get(peer) if scores else None,
             "overall": overall,
             "udp_mos": udp_mos,
             "udp_score": udp_score,
