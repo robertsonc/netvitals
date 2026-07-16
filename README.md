@@ -63,6 +63,11 @@ plus, in the header:
   **forward** component (probes that never reached the peer) and a **return**
   component (echoes that never made it back), and names the failing leg — see
   *Locating loss* below.
+- an **Anatomy** button that toggles a byte-proportional wire view of one
+  probe through an EdgeConnect SD-WAN fabric: the LAN packet on top and the
+  predicted tunnel packets (slices + encapsulation overhead) below, with the
+  packet amplification factor and predicted WAN pps — see *Wire anatomy*
+  below.
 
 Charts keep a rolling history (default 5 minutes, `--history`). The window
 resizes freely; the charts grow and shrink with it.
@@ -440,6 +445,44 @@ Forward path MTU (this host -> peer):            ~9000 bytes
 => Jumbo frames (>=9000) confirmed end to end.  ✓
 ```
 
+## Wire anatomy (EdgeConnect slicing model)
+
+When the two hosts sit behind **EdgeConnect** appliances, a large DF=1 probe
+is not IP-fragmented on the WAN: the ingress EC **slices** it into
+tunnel-sized pieces, encrypts and encapsulates each one, and the egress EC
+reassembles the original packet before handing it to the LAN — so one LAN
+packet becomes several WAN packets, invisibly to both hosts.
+
+The **Anatomy** button shows exactly what that looks like for the probe size
+you are running, drawn byte-proportionally:
+
+- **LAN row** — the one packet the fabric ingests (probe payload + IP/UDP
+  headers, + VXLAN encap when `--vxlan` is on), with the DF flag.
+- **WAN row** — the predicted tunnel packets: payload in blue, per-packet
+  encryption/encapsulation overhead in orange, wire bytes under each.
+- The totals: WAN packet count, wire bytes, **overhead tax %**, the **×N
+  packet amplification**, and the predicted WAN rate (`--pps` × N per UDP
+  stream, each direction — echoes are full-size, so the return leg slices the
+  same way).
+- What the same packet would do **without** the fabric at a standard 1500 B
+  hop: PMTUD-or-black-hole with DF on, or N IP fragments with DF off.
+
+The model mirrors a **measured** AES-GCM-256 fabric (Auto tunnel MTU 1488):
+slice payload budget 1360 B, 60 B GCM framing per tunnel packet
+(outer IPv4 20 + UDP 8 + SPI/seq 8 + IV 8 + ICV 16), 12 B per-piece framing
+for a whole packet / 16 B for a slice, padded to the 16 B cipher block:
+
+```
+wire = 60 + 16 x ceil((piece + framing) / 16)
+```
+
+A 3000 B packet therefore predicts 1360 + 1360 + 280 → three tunnel packets
+of 1436 + 1436 + 364 B (+7.9%). The constants live in one block at the top of
+`netquality.py` (`EC_SLICE_BUDGET` and friends) — tune them there if your
+fabric measures differently. Note the numbers are a *prediction* from that
+model, not a measurement of your fabric; pair the panel with the WAN-side
+counters on the roadmap below to close the loop.
+
 ## VXLAN encapsulation (`--vxlan`)
 
 Run **both ends** with `--vxlan` and every probe stream — the TCP streams as
@@ -529,3 +572,45 @@ If you'd rather hand someone a single executable with no Python install, run
 ```
 netquality.exe --peer 10.0.0.2
 ```
+
+## Roadmap — validating the fabric, not just the endpoints
+
+The app measures the **host view** (the "LAN row" of the anatomy panel); the
+WAN middle is currently *predicted* by the model, not observed. Planned work
+to close that gap, roughly in order:
+
+1. **EC WAN counter polling (API or SNMP).** Poll the EdgeConnect WAN-side
+   TX/RX packet counters and show *measured* WAN pps next to the anatomy
+   panel's *predicted* pps — live proof that 1 LAN packet becomes N WAN
+   packets. Open questions before this lands:
+   - which appliance/Orchestrator REST endpoints (or SNMP OIDs — plain
+     `ifHCIn/OutUcastPkts` would also cover non-EC devices) to poll, and how
+     to authenticate;
+   - **path selection**: the app runs point-to-point between two hosts, but
+     the fabric path may be EC1↔EC2 direct *or* transit one or more hubs
+     (EC1→hub→hub→EC2), so the tool must know *which* appliances and tunnels
+     to poll. Initial scope is the direct EC1↔EC2 case (labs/demos);
+     hub-transit topologies need either manual appliance lists or
+     Orchestrator-driven path discovery.
+   - **attribution** on busy fabrics: per-tunnel stats where available, plus
+     a "calibration burst" mode (square-wave the probe rate and diff the
+     counters between on/off windows) so the ratio is measurable next to
+     background traffic.
+2. **Slice-level vs probe-level loss / FEC verdict** (needs 1): WAN counters
+   dropping while probe loss stays 0% is measured proof FEC is repairing;
+   probe loss ≈ N × WAN slice loss quantifies loss amplification.
+3. **Slice-boundary detector in the MTU sweep**: sweep size vs RTT/loss and
+   detect the discontinuities at multiples of the slice budget — measures the
+   real budget empirically instead of trusting the model constants.
+4. **LAN fragment sniffer** (raw socket: `SIO_RCVALL` on Windows,
+   `AF_PACKET` on Linux): count IP fragments arriving for the probe flow to
+   prove the fabric delivered whole packets — app-level size checks can't
+   distinguish EC reassembly from kernel reassembly of mid-path fragments.
+5. **ICMP frag-needed listener**: during the sweep, report "ICMP Type 3/Code 4
+   received (MTU=1500)" vs "silently dropped → PMTUD black hole".
+6. **Coalescing detector**: receiver-side inter-arrival clustering (bundled
+   small packets exit the far EC back-to-back) plus the ~1–3 ms wait-timer
+   signature in small-probe RTT.
+7. **Live topology strip**: Host → EC1 → fabric → EC2 → Host with measured
+   pps at each hop and the amplification ratio on the tunnel span — the blog
+   animation's layout, with real numbers moving.

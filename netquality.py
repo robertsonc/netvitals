@@ -46,7 +46,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -1069,6 +1069,48 @@ VXLAN_OVERHEAD_TCP = 8 + 14 + 20 + 20   # VXLAN + inner Ether + IPv4 + TCP = 62
 VXLAN_MAX_PROBE = 65507 - VXLAN_OVERHEAD_TCP
 
 
+# ---------------------------------------------------------------------------
+# EdgeConnect wire model (drives the GUI's Anatomy panel)
+# ---------------------------------------------------------------------------
+# Measured slicing/encapsulation behavior of an EdgeConnect SD-WAN fabric
+# (AES-GCM-256 tunnels, Auto tunnel MTU 1488).  An inner IP packet above the
+# slice payload budget is cut into budget-sized slices and every piece rides
+# its own tunnel packet:
+#
+#   wire = GCM_FRAMING + CIPHER_BLOCK * ceil((piece + per_piece) / CIPHER_BLOCK)
+#
+# GCM_FRAMING is outer IPv4 20 + UDP 8 + SPI/seq 8 + IV 8 + ICV 16; per-piece
+# framing is 12 B for a whole packet and 16 B for a slice (the extra 4 B is
+# the reassembly offset).  This is a model of ONE measured fabric, not a
+# protocol constant - tune the numbers here if your fabric differs.
+EC_SLICE_BUDGET = 1360    # inner bytes per slice (empirically 1488 - 128)
+EC_GCM_FRAMING = 60
+EC_FRAMING_WHOLE = 12
+EC_FRAMING_SLICE = 16
+EC_CIPHER_BLOCK = 16
+EC_TUNNEL_MTU = 1488      # Orchestrator-displayed Auto tunnel MTU
+
+
+def ec_wire_view(inner):
+    """Predict how the EdgeConnect fabric carries one `inner`-byte IP packet.
+
+    Returns a list of (inner_piece_bytes, tunnel_packet_wire_bytes) - one
+    entry per WAN packet: a single whole-packet encapsulation when the packet
+    fits the slice budget, otherwise one entry per slice."""
+    def wire(piece, framing):
+        ct = piece + framing
+        pad = (EC_CIPHER_BLOCK - ct % EC_CIPHER_BLOCK) % EC_CIPHER_BLOCK
+        return EC_GCM_FRAMING + ct + pad
+    if inner <= EC_SLICE_BUDGET:
+        return [(inner, wire(inner, EC_FRAMING_WHOLE))]
+    pieces, off = [], 0
+    while off < inner:
+        s = min(EC_SLICE_BUDGET, inner - off)
+        pieces.append((s, wire(s, EC_FRAMING_SLICE)))
+        off += s
+    return pieces
+
+
 def _inet_checksum(data):
     """RFC 1071 internet checksum, for the inner IPv4/UDP/TCP headers (so
     captures dissect as valid packets, not checksum errors)."""
@@ -1763,6 +1805,25 @@ def run_gui(engine, args):
                             font=(FONT, 9, "bold"), cursor="hand2")
     isolate_btn.pack(side="left", padx=(0, 6))
 
+    anatomy_shown = {"on": False}
+
+    def do_toggle_anatomy():
+        anatomy_shown["on"] = not anatomy_shown["on"]
+        if anatomy_shown["on"]:
+            anat_frame.pack(fill="x", side="bottom", before=charts)
+            anatomy_btn.configure(text="▴  Anatomy")
+            draw_anatomy()
+        else:
+            anat_frame.pack_forget()
+            anatomy_btn.configure(text="▦  Anatomy")
+
+    anatomy_btn = tk.Button(btnbar, text="▦  Anatomy", command=do_toggle_anatomy,
+                            bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                            activeforeground="white", relief="flat", bd=0,
+                            highlightthickness=0, padx=12, pady=5,
+                            font=(FONT, 9, "bold"), cursor="hand2")
+    anatomy_btn.pack(side="left", padx=(0, 6))
+
     def do_fit_charts():
         """Collapse the bottom tables and force a fresh geometry pass so the
         charts reclaim the full current window space."""
@@ -1770,6 +1831,8 @@ def run_gui(engine, args):
             do_toggle_totals()
         if isolate_shown["on"]:
             do_toggle_isolate()
+        if anatomy_shown["on"]:
+            do_toggle_anatomy()
         for c in (lat_canvas, loss_canvas, jit_canvas):
             c.configure(width=100, height=80)
         root.update_idletasks()
@@ -1921,6 +1984,95 @@ def run_gui(engine, args):
         iso_tree.insert("", "end", iid=f"i{sid}",
                         values=(name, 0, 0, "0.00", 0, "0.00", "…"))
     # frame stays unpacked -> hidden until the Isolate button is clicked
+
+    # ---- anatomy panel (hidden; one probe's wire view through the fabric) --
+    # Byte-proportional bars, LAN packet on top and its predicted tunnel
+    # packets below, drawn from the EdgeConnect wire model (ec_wire_view).
+    # Everything here is static per run (probe size, DF, VXLAN, pps), so it
+    # redraws only on toggle and canvas resize - never in the refresh loop.
+    anat_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
+    # not packed here — do_toggle_anatomy packs/unpacks the whole frame
+    anat_canvas = tk.Canvas(anat_frame, bg=PANEL, highlightthickness=0,
+                            height=204)
+    anat_canvas.pack(fill="x")
+    ANAT_PAY, ANAT_OH = "#00B0E6", "#FF8300"  # payload / encap overhead
+
+    def draw_anatomy(_event=None):
+        c = anat_canvas
+        w = c.winfo_width()
+        if w <= 1 or not anatomy_shown["on"]:
+            return
+        c.delete("all")
+        probe = engine.size
+        vx_on = bool(engine.vxlan)
+        inner = probe + 28 + (VXLAN_OVERHEAD_UDP if vx_on else 0)
+        pieces = ec_wire_view(inner)
+        n = len(pieces)
+        wan_total = sum(wr for _, wr in pieces)
+        tax = (wan_total - inner) / inner * 100.0
+
+        x0, gap, bh = 64, 6, 20
+        usable = max(50, w - x0 - 16 - (n - 1) * gap)
+        scale = usable / wan_total
+
+        c.create_text(14, 16, anchor="w", fill=TXT, font=(FONT, 10, "bold"),
+                      text="Wire anatomy — one UDP probe through the fabric")
+        c.create_text(w - 14, 16, anchor="e", fill=TXT_DIM, font=(FONT, 8),
+                      text=f"model: tunnel MTU {EC_TUNNEL_MTU} · slice budget "
+                           f"{EC_SLICE_BUDGET} B · GCM framing {EC_GCM_FRAMING} B")
+
+        y = 40  # LAN row: the one packet the fabric ingests on lan1
+        c.create_text(x0 - 10, y + bh / 2, anchor="e", fill=TXT_DIM,
+                      font=(FONT, 9, "bold"), text="LAN")
+        c.create_rectangle(x0, y, x0 + inner * scale, y + bh,
+                           fill=ANAT_PAY, outline="")
+        parts = (f"probe {probe:,} + VXLAN {VXLAN_OVERHEAD_UDP} + IP/UDP 28"
+                 if vx_on else f"probe {probe:,} + IP/UDP 28")
+        df = "DF on" if args.dont_fragment else "DF off"
+        c.create_text(x0 + 2, y + bh + 11, anchor="w", fill=TXT_DIM,
+                      font=(FONT, 8), text=f"1 packet · {inner:,} B ({parts}) · {df}")
+
+        y2 = y + bh + 30
+        verb = (f"EC encrypts + encapsulates → 1 tunnel packet (no slicing: "
+                f"{inner:,} B ≤ {EC_SLICE_BUDGET:,} B budget)" if n == 1 else
+                f"EC slices + encapsulates → {n} tunnel packets")
+        c.create_text(x0, y2, anchor="w", fill=HPE_GREEN,
+                      font=(FONT, 9, "bold"), text=verb)
+
+        y3 = y2 + 12  # WAN row: the tunnel packets, payload + overhead
+        c.create_text(x0 - 10, y3 + bh / 2, anchor="e", fill=TXT_DIM,
+                      font=(FONT, 9, "bold"), text="WAN")
+        x = x0
+        for s, wr in pieces:
+            c.create_rectangle(x, y3, x + s * scale, y3 + bh,
+                               fill=ANAT_PAY, outline="")
+            c.create_rectangle(x + s * scale, y3, x + wr * scale, y3 + bh,
+                               fill=ANAT_OH, outline="")
+            if wr * scale >= 48:
+                c.create_text(x + wr * scale / 2, y3 + bh + 11,
+                              fill=TXT_DIM, font=(FONT, 8), text=f"{wr:,} B")
+            x += wr * scale + gap
+
+        y4 = y3 + bh + 28
+        c.create_text(x0, y4, anchor="w", fill=TXT, font=(FONT, 9),
+                      text=f"WAN: {n} packet{'s' if n > 1 else ''} · "
+                           f"{wan_total:,} B on the wire · +{tax:.1f}% overhead"
+                           f" · ×{n} packet amplification")
+        c.create_text(x0, y4 + 18, anchor="w", fill=TXT_DIM, font=(FONT, 9),
+                      text=f"predicted per UDP stream: {args.pps} pps LAN → "
+                           f"{args.pps * n} pps WAN, each direction "
+                           f"(echoes are full-size)")
+        if inner > 1500:
+            frags = -(-(inner - 20) // 1480)  # RFC 791: 1480 B payload per frag
+            noec = (f"without the fabric at a 1500 B hop: DF on → PMTUD "
+                    f"required (or black hole) · DF off → {frags} IP fragments,"
+                    f" only #1 carries the L4 header")
+        else:
+            noec = "without the fabric: fits a standard 1500 B hop as-is"
+        c.create_text(x0, y4 + 36, anchor="w", fill=TXT_DIM, font=(FONT, 9),
+                      text=noec)
+
+    anat_canvas.bind("<Configure>", draw_anatomy)
 
     # ---- charts: latency (top, full width), loss + jitter (bottom row) ----
     # Laid out with grid + row weights, NOT pack: pack hands the space freed
