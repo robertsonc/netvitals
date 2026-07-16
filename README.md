@@ -29,11 +29,19 @@ encapsulation** between the hosts (userspace VTEP, no admin rights) — see
 *VXLAN encapsulation* below for using it to demonstrate transparent
 fragmentation.
 
-The dashboard shows **three live + history charts** with one line per stream:
+The dashboard shows **four live + history charts**:
 
-- **Latency (RTT, ms)**
-- **Loss + late (%)**
-- **Jitter (ms)**
+- **Latency (RTT, ms)** — one line per stream, over a shaded **p5–p95 band**
+  of the pooled UDP samples: tail latency (bufferbloat, microbursts) widens
+  the band even while the averages look fine.
+- **Loss + late (%)** — one line per stream.
+- **Jitter (ms)** — one line per stream.
+- **One-way drift (ms)** — two lines, `fwd→` and `rtn←`: how much each
+  *direction's* delay has grown above its recent (~60 s) best. Congestion is
+  almost always directional; this names the direction without synchronized
+  clocks (the echo carries the reflector's clock, the unknown offset cancels
+  against a min-filtered baseline, and residual clock slew at tens of ppm is
+  ~1 ms/min — negligible against real queueing).
 
 plus, in the header:
 
@@ -354,6 +362,10 @@ Bad below.
 --mtu-sweep        one-shot: find the largest UDP payload that crosses unfragmented
 --sweep-min N      MTU sweep lower bound, payload bytes (default 1400)
 --sweep-max N      MTU sweep upper bound, payload bytes (default 9000)
+--burst-test       one-shot: staged rate ramp against the peer (bufferbloat /
+                   policer / shaper signatures) - see "Burst test" below
+--burst-mbps A,B   burst stages in Mbps (default 1,2,5,10,25)
+--burst-secs S     seconds per burst stage (default 3)
 ```
 
 At the defaults each stream is ~50 packets/s × 200 B ≈ 10 KB/s each way, i.e.
@@ -394,9 +406,27 @@ Buffers*, and disable *RSC* / *Interrupt Moderation*.
 > washes out over a long run, and the per-stream verdict ignores single-digit
 > counts. Trust the split once counts are in the hundreds+.
 
-> **Version note:** the wire header changed to carry the reflector count, so
-> **both ends must run this version** — a mixed pair won't parse each other's
-> packets.
+### Loss pattern
+
+When loss is present, both UIs also name its **pattern** over the last 60 s,
+on two independent axes:
+
+- **texture** — `bursty` (losses clump into sub-second instants at densities
+  far above the overall loss rate: link flap, reroute, queue tail-drop) vs
+  `scattered` (random-ish: noisy link, RED/AQM).
+- **scope** — `all streams together` (multiple streams losing in the same
+  instants → a path-wide event), `<stream> only` (policer/ACL on that port),
+  or `UDP/TCP streams only` (protocol-selective QoS policy).
+
+So "2% loss" turns into, e.g., *"bursty, all streams together — path-wide
+(flap / reroute / shared queue)"* or *"scattered, UDP-30201 only —
+port-specific (policer/ACL on that port?)"*. The first ~10 s of a run are
+excluded so bring-up churn doesn't mislabel a fresh session.
+
+> **Version note:** the wire header changed in **1.5.0** (echoes now carry the
+> reflector's clock for one-way drift), so **both ends must run 1.5.0+** — a
+> mixed pair won't parse each other's packets and reads as "no link"
+> (earlier header changes have the same rule).
 
 ## Jumbo-frame testing
 
@@ -444,6 +474,35 @@ Largest UDP payload that traverses unfragmented:  8972 bytes
 Forward path MTU (this host -> peer):            ~9000 bytes
 => Jumbo frames (>=9000) confirmed end to end.  ✓
 ```
+
+## Burst test (responsiveness under load)
+
+The continuous probes measure the path **at idle**; the burst test measures
+what **load** does to it — the three most common "nothing is red but it's
+slow" causes have distinct signatures:
+
+```
+python netquality.py --peer 10.0.0.2 --burst-test
+```
+
+It ramps paced 1200 B UDP probes through the offered rates (default
+`1,2,5,10,25` Mbps, 3 s each; `--burst-mbps` / `--burst-secs` to change),
+against a peer that is running Network Vitals, and reads the response:
+
+- **RTT grows with rate while loss stays low** → a deep queue
+  (bufferbloat-like).
+- **Loss appears above some rate with RTT flat** → a policer (hard rate cap
+  that drops instead of queueing).
+- **RTT grows first, then loss** → a shaper (queue fills, then drops).
+- Otherwise it reports the highest **clean** stage (loss <1%, p95 RTT within
+  +30 ms of idle).
+
+Also available as the **Burst test** button in the launch window, next to the
+MTU sweep. Like the sweep it binds an ephemeral port and runs fine alongside
+a live session — test probes are excluded from the loss-isolation bookkeeping
+on both ends, so they don't skew the session's forward/return split. Echoes
+are full-size: the offered load is carried **in both directions at once**,
+and it is real traffic, so mind shared links at the higher stages.
 
 ## Wire anatomy (EdgeConnect slicing model)
 
@@ -575,6 +634,10 @@ netquality.exe --peer 10.0.0.2
 
 ## Roadmap — validating the fabric, not just the endpoints
 
+*Shipped in 1.5.0:* directional **one-way drift** chart, the latency
+**p5–p95 band**, the **loss pattern** diagnostic, and the **burst test** —
+the host-side measurement tranche of this roadmap.
+
 The app measures the **host view** (the "LAN row" of the anatomy panel); the
 WAN middle is currently *predicted* by the model, not observed. Planned work
 to close that gap, roughly in order:
@@ -601,7 +664,10 @@ to close that gap, roughly in order:
    probe loss ≈ N × WAN slice loss quantifies loss amplification.
 3. **Slice-boundary detector in the MTU sweep**: sweep size vs RTT/loss and
    detect the discontinuities at multiples of the slice budget — measures the
-   real budget empirically instead of trusting the model constants.
+   real budget empirically instead of trusting the model constants. Related
+   always-on variant: run a small (1-slice) and a large (N-slice) UDP stream
+   concurrently and chart their loss ratio — sustained large ≈ N × small is
+   live slicing evidence with no EC access at all.
 4. **LAN fragment sniffer** (raw socket: `SIO_RCVALL` on Windows,
    `AF_PACKET` on Linux): count IP fragments arriving for the probe flow to
    prove the fabric delivered whole packets — app-level size checks can't
@@ -614,3 +680,22 @@ to close that gap, roughly in order:
 7. **Live topology strip**: Host → EC1 → fabric → EC2 → Host with measured
    pps at each hop and the amplification ratio on the tunnel span — the blog
    animation's layout, with real numbers moving.
+8. **Per-DSCP probe classes**: parallel probe sets marked EF vs BE, charted
+   side by side — on EdgeConnect this effectively tests per-overlay /
+   business-intent behavior, and reading the received TOS back also catches
+   DSCP bleaching mid-path. Caveat to resolve first: Windows ignores
+   `IP_TOS` on ordinary sockets; DSCP marking without admin rights needs the
+   qWAVE API (`QOSAddSocketToFlow`), whose non-admin path only offers the
+   traffic-type-mapped code points — needs a spike before committing to UX.
+9. **Point-to-multipoint / full mesh** (3-6 endpoints), phased:
+   1. multi-peer engine (per-pair stats, peer-set filters) + an **N×N mesh
+      matrix** view — cells colored by score/loss/RTT, click to drill into
+      the pair's dashboard;
+   2. **static-FIB VXLAN mesh** transport: each node's single outer UDP
+      socket talks to all peers, demuxed by outer source IP, inner MAC/IP
+      per node derived from a node index — a genuine static VXLAN full mesh,
+      one open port per node;
+   3. **common-endpoint auto-diagnosis** from the matrix: every pair touching
+      node C degrading = C's site/link; only A-C degrading = that path;
+   4. **hub/star mode** (spokes probe only the hub) to match EC hub
+      topologies and keep probe count linear beyond demo scale.

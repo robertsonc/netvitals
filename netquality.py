@@ -46,7 +46,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -68,8 +68,8 @@ UPDATE_URL = ("https://raw.githubusercontent.com/robertsonc/netvitals/"
 # The reflector copies the header back verbatim with ptype flipped to ECHO, so
 # the originator computes RTT = now - ts_ns purely against its OWN clock.
 
-MAGIC = 0x4E51_5631  # "NQV1"
-# magic(I) type(B) sid(B) seq(I) ts_ns(Q) psize(H) rxsize(H) rxcount(I)
+MAGIC = 0x4E51_5632  # "NQV2" (V2: echoes carry the reflector's clock, peer_ns)
+# magic(I) type(B) sid(B) seq(I) ts_ns(Q) psize(H) rxsize(H) rxcount(I) peer_ns(Q)
 #   psize   = the total size this packet is meant to be (self-describing; lets
 #             the receiver assert it got a full-size datagram - jumbo testing).
 #   rxsize  = bytes the reflector actually received (0 in a probe; filled into
@@ -78,13 +78,22 @@ MAGIC = 0x4E51_5631  # "NQV1"
 #             (0 in a probe; filled into the echo) so the originator can split
 #             its round-trip loss into forward (probes that never reached the
 #             peer) vs return (echoes that never made it back) - loss isolation.
-HEADER = struct.Struct("!IBBIQHHI")
-HEADER_LEN = HEADER.size  # 26 bytes
+#   peer_ns = the reflector's monotonic clock when it built the echo (0 in a
+#             probe). The two clocks share no epoch, so peer_ns - ts_ns is the
+#             forward one-way delay plus an unknown constant offset - useless
+#             absolutely, but its CHANGE against a min-filtered baseline shows
+#             which direction's delay is growing (see StreamStats.on_echo).
+HEADER = struct.Struct("!IBBIQHHIQ")
+HEADER_LEN = HEADER.size  # 34 bytes
 MAX_SIZE = 65535          # psize/rxsize are uint16
 MAX_COUNT = 0xFFFF_FFFF   # rxcount is uint32
 
 TYPE_PROBE = 1
 TYPE_ECHO = 2
+# Side-channel test probe (MTU sweep, burst test): echoed like a probe but
+# NOT folded into the reflector's gap tracking, so a test running alongside a
+# live session can't pollute the session's forward/return loss isolation.
+TYPE_TEST = 3
 
 # Stream catalogue. Order is the display order in the UI; sids stay 0..3 so the
 # colour map and chart series are stable regardless of which ports are chosen.
@@ -121,30 +130,30 @@ def ports_summary():
     return f"UDP {udp}  TCP {tcp}"
 
 
-def build_packet(ptype, sid, seq, ts_ns, size, rxsize=0, rxcount=0):
+def build_packet(ptype, sid, seq, ts_ns, size, rxsize=0, rxcount=0, peer_ns=0):
     """Build a fixed-size packet padded out to `size` bytes.
 
     `size` is stamped into the header (psize) so the receiver can confirm it got
-    a full-size datagram; `rxsize`/`rxcount` are the size and cumulative probe
-    count the reflector observed (set only on echoes).
+    a full-size datagram; `rxsize`/`rxcount`/`peer_ns` are the size, cumulative
+    probe count and clock the reflector observed (set only on echoes).
     """
     if size < HEADER_LEN:
         size = HEADER_LEN
     if size > MAX_SIZE:
         size = MAX_SIZE
     hdr = HEADER.pack(MAGIC, ptype, sid, seq & MAX_COUNT, ts_ns, size,
-                      min(rxsize, MAX_SIZE), rxcount & MAX_COUNT)
+                      min(rxsize, MAX_SIZE), rxcount & MAX_COUNT, peer_ns)
     return hdr + b"\x00" * (size - HEADER_LEN)
 
 
 def parse_header(data):
-    """Return (ptype, sid, seq, ts_ns, psize, rxsize, rxcount) or None."""
+    """Return (ptype, sid, seq, ts_ns, psize, rxsize, rxcount, peer_ns) or None."""
     if len(data) < HEADER_LEN:
         return None
     fields = HEADER.unpack(data[:HEADER_LEN])
     if fields[0] != MAGIC:
         return None
-    return fields[1:]  # ptype, sid, seq, ts_ns, psize, rxsize, rxcount
+    return fields[1:]  # ptype, sid, seq, ts_ns, psize, rxsize, rxcount, peer_ns
 
 
 # Socket buffer size. Windows defaults to a small (~64 KB) UDP receive buffer.
@@ -296,6 +305,23 @@ class StreamStats:
         self.last_rtt = None
         self.last_echo_t = 0.0        # monotonic time of most recent echo (any kind)
 
+        # One-way-delay drift. Each on-time echo gives two RELATIVE delays:
+        # forward = peer_clock_at_echo - my_clock_at_send, return = my_clock_at
+        # _receive - peer_clock_at_echo. Both contain the unknown clock offset
+        # (equal and opposite), so only their movement means anything: the
+        # drift of each against its min over this deque shows which DIRECTION
+        # is queueing. The deque spans ~60 s: long enough that a congestion
+        # episode can't drag the baseline up with it, short enough that
+        # relative clock slew (tens of ppm => ~1 ms/min) stays negligible.
+        self.owd_samples = deque()    # (t_mono, fwd_rel_ms, rtn_rel_ms)
+        self.owd_horizon = max(window, 60.0)
+
+        # Loss-pattern diagnostics: when each lost probe was reaped, kept for
+        # ~60 s so the engine can classify recent loss as bursty vs scattered
+        # and correlated-across-streams vs port-specific.
+        self.loss_events = deque()    # t_mono of each probe declared lost
+        self.diag_horizon = 60.0
+
         # cumulative session counters (for the footer / totals)
         self.cum_tx = 0
         self.cum_recv = 0
@@ -384,7 +410,8 @@ class StreamStats:
             self.life_tx += 1
             self._trim_locked()
 
-    def on_echo(self, seq, ts_ns, now_ns, rx_len=0, psize=0, peer_rx=0, peer_fwd=0):
+    def on_echo(self, seq, ts_ns, now_ns, rx_len=0, psize=0, peer_rx=0,
+                peer_fwd=0, peer_ns=0):
         with self.lock:
             rtt = (now_ns - ts_ns) / 1e6
             if rtt < 0:
@@ -418,6 +445,10 @@ class StreamStats:
                 self.state[seq] = "recv"
                 self.resolved_order.append((now_w, seq))
                 self.rtt_samples.append((now_w, rtt))
+                if peer_ns:
+                    # Relative one-way delays (offset included; see __init__).
+                    self.owd_samples.append((now_w, (peer_ns - ts_ns) / 1e6,
+                                             (now_ns - peer_ns) / 1e6))
                 self.cum_recv += 1
                 self.life_recv += 1
                 if self.last_rtt is not None:
@@ -449,6 +480,7 @@ class StreamStats:
                 self.pending.pop(s, None)
                 self.state[s] = "lost"
                 self.resolved_order.append((now_w, s))
+                self.loss_events.append(now_w)
                 self.cum_lost += 1
                 self.life_lost += 1
             self._trim_locked()
@@ -509,6 +541,20 @@ class StreamStats:
             rtn_lost = max(0, self.cum_lost - fwd_lost)
             fwd_pct = (fwd_lost / self.cum_tx * 100.0) if self.cum_tx else 0.0
             rtn_pct = (rtn_lost / self.cum_tx * 100.0) if self.cum_tx else 0.0
+            # One-way drift per direction: median of the last ~1.5 s of
+            # relative delays, above each direction's min over the deque.
+            # The unknown clock offset cancels in the subtraction.
+            owd_fwd = owd_rtn = None
+            if len(self.owd_samples) >= 5:
+                recent_f = sorted(f for t, f, _ in self.owd_samples
+                                  if t > now - 1.5)
+                recent_r = sorted(r for t, _, r in self.owd_samples
+                                  if t > now - 1.5)
+                if recent_f:
+                    base_f = min(f for _, f, _ in self.owd_samples)
+                    base_r = min(r for _, _, r in self.owd_samples)
+                    owd_fwd = max(0.0, recent_f[len(recent_f) // 2] - base_f)
+                    owd_rtn = max(0.0, recent_r[len(recent_r) // 2] - base_r)
             return {
                 "connected": connected,
                 "rtt_avg": avg,
@@ -542,7 +588,19 @@ class StreamStats:
                 "rtn_lost": rtn_lost,
                 "fwd_pct": fwd_pct,
                 "rtn_pct": rtn_pct,
+                "owd_fwd": owd_fwd,
+                "owd_rtn": owd_rtn,
             }
+
+    def window_rtts(self):
+        """Copy of the RTT samples (ms) currently in the stats window."""
+        with self.lock:
+            return [r for _, r in self.rtt_samples]
+
+    def recent_losses(self):
+        """Copy of the loss-event times (monotonic s) from the last ~60 s."""
+        with self.lock:
+            return list(self.loss_events)
 
     def reset(self):
         """Drop all accumulated samples/counters (used by the GUI Reset button
@@ -555,6 +613,8 @@ class StreamStats:
             self.state.clear()
             self.pending.clear()
             self.connect_samples.clear()
+            self.owd_samples.clear()
+            self.loss_events.clear()
             self.jitter = 0.0
             self.last_rtt = None
             self.last_echo_t = 0.0
@@ -570,7 +630,8 @@ class StreamStats:
             self.peer_fwd_base = None
 
     def _trim_locked(self):
-        horizon = time.monotonic() - self.window
+        now = time.monotonic()
+        horizon = now - self.window
         while self.rtt_samples and self.rtt_samples[0][0] < horizon:
             self.rtt_samples.popleft()
         while self.tx_events and self.tx_events[0] < horizon:
@@ -578,6 +639,12 @@ class StreamStats:
         while self.resolved_order and self.resolved_order[0][0] < horizon:
             _, seq = self.resolved_order.popleft()
             self.state.pop(seq, None)
+        owd_h = now - self.owd_horizon
+        while self.owd_samples and self.owd_samples[0][0] < owd_h:
+            self.owd_samples.popleft()
+        diag_h = now - self.diag_horizon
+        while self.loss_events and self.loss_events[0] < diag_h:
+            self.loss_events.popleft()
 
 
 # ---------------------------------------------------------------------------
@@ -650,6 +717,62 @@ def score_label(r):
     if r >= 50:
         return "Poor"
     return "Bad"
+
+
+def classify_loss_pattern(events_by_name, min_events=5, bin_s=0.25):
+    """Classify the last ~60 s of loss across streams into a short sentence.
+
+    events_by_name: {stream_name: [monotonic loss-reap times]}. Returns None
+    when there is too little loss to characterize. Two independent axes:
+
+      * texture - bursty (losses clump into sub-second bins: flap, reroute,
+                  queue tail-drop) vs scattered (random-ish: noisy link, RED).
+      * scope   - correlated (multiple streams lose in the same instant ->
+                  path-wide event) vs one stream only (policer/ACL on that
+                  port) vs one protocol only (QoS/ACL selecting on protocol).
+
+    Loss times are reap times: every lost probe surfaces exactly `timeout`
+    after it was sent, so simultaneous wire events stay simultaneous here.
+    """
+    total = sum(len(v) for v in events_by_name.values())
+    if total < min_events:
+        return None
+    per_stream = {n: len(v) for n, v in events_by_name.items()}
+    bin_streams = {}   # bin -> set(stream names losing in that bin)
+    bin_count = {}     # bin -> losses in that bin
+    for name, evs in events_by_name.items():
+        for t in evs:
+            b = int(t / bin_s)
+            bin_count[b] = bin_count.get(b, 0) + 1
+            bin_streams.setdefault(b, set()).add(name)
+    nstreams = len(events_by_name)
+    # scope: how much of the loss happened in instants shared by most streams?
+    thresh = max(2, nstreams - 1)
+    shared = sum(c for b, c in bin_count.items() if len(bin_streams[b]) >= thresh)
+    dominant = max(per_stream, key=per_stream.get)
+    dom_share = per_stream[dominant] / total
+    udp_share = sum(c for n, c in per_stream.items() if n.startswith("UDP")) / total
+    if shared / total > 0.5:
+        scope = "all streams together — path-wide (flap / reroute / shared queue)"
+    elif dom_share >= 0.8:
+        scope = f"{dominant} only — port-specific (policer/ACL on that port?)"
+    elif udp_share >= 0.9:
+        scope = "UDP streams only — protocol-selective (QoS policy / ACL?)"
+    elif udp_share <= 0.1:
+        scope = "TCP streams only — protocol-selective (QoS policy / ACL?)"
+    else:
+        scope = "spread across streams"
+    # texture: how much of the loss lives in bins far denser than the overall
+    # loss RATE would fill by chance? A fixed count can't tell a flap from
+    # merely heavy random loss - at high rates every bin holds several losses,
+    # so the burst bar scales with the expected per-bin count (lam).
+    times = [t for evs in events_by_name.values() for t in evs]
+    dur = min(60.0, max(5.0, max(times) - min(times)))
+    lam = total * bin_s / dur
+    burst_bar = max(3, math.ceil(3.0 * lam))
+    burst = sum(c for c in bin_count.values() if c >= burst_bar)
+    texture = "bursty" if burst / total > 0.5 else "scattered"
+    return f"{texture}, {scope}"
 
 
 def loss_verdict(fwd_lost, rtn_lost, inflight=6):
@@ -763,15 +886,18 @@ class UDPStream:
             parsed = parse_header(data)
             if parsed is None:
                 continue
-            ptype, sid, seq, ts_ns, psize, rxsize, rxcount = parsed
-            if ptype == TYPE_PROBE:
+            ptype, sid, seq, ts_ns, psize, rxsize, rxcount, peer_ns = parsed
+            if ptype in (TYPE_PROBE, TYPE_TEST):
                 # Reflect back, stamping the bytes and cumulative probe count we
                 # received so the originator can verify size and split loss by
-                # direction.
+                # direction, plus our clock for one-way-delay drift. TEST
+                # probes (MTU sweep / burst test side-channels) are echoed but
+                # kept out of the gap tracking.
                 rxlen = len(data)
-                fwd = self.stats.on_probe_rx(seq)
+                fwd = self.stats.on_probe_rx(seq) if ptype == TYPE_PROBE else 0
                 echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, rxlen,
-                                    rxsize=rxlen, rxcount=fwd)
+                                    rxsize=rxlen, rxcount=fwd,
+                                    peer_ns=time.monotonic_ns())
                 try:
                     self.sock.sendto(echo, addr)
                 except OSError:
@@ -779,7 +905,7 @@ class UDPStream:
             elif ptype == TYPE_ECHO:
                 self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
                                    rx_len=len(data), psize=psize, peer_rx=rxsize,
-                                   peer_fwd=rxcount)
+                                   peer_fwd=rxcount, peer_ns=peer_ns)
 
 
 # ---------------------------------------------------------------------------
@@ -938,14 +1064,15 @@ class TCPStream:
                 parsed = parse_header(msg)
                 if parsed is None:
                     continue
-                ptype, sid, seq, ts_ns, psize, rxsize, rxcount = parsed
+                ptype, sid, seq, ts_ns, psize, rxsize, rxcount, peer_ns = parsed
                 if ptype == TYPE_PROBE:
                     fwd = self.stats.on_probe_rx(seq)
                     # Echo at the PROBE's size (not our local --size) so the
                     # originator's reader frames it correctly even when the
                     # two ends run different sizes.
                     echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, len(msg),
-                                        rxsize=len(msg), rxcount=fwd)
+                                        rxsize=len(msg), rxcount=fwd,
+                                        peer_ns=time.monotonic_ns())
                     try:
                         conn.sendall(echo)
                     except OSError:
@@ -1033,11 +1160,11 @@ class TCPStream:
             parsed = parse_header(msg)
             if parsed is None:
                 continue
-            ptype, sid, seq, ts_ns, psize, rxsize, rxcount = parsed
+            ptype, sid, seq, ts_ns, psize, rxsize, rxcount, peer_ns = parsed
             if ptype == TYPE_ECHO:
                 self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
                                    rx_len=len(msg), psize=psize, peer_rx=rxsize,
-                                   peer_fwd=rxcount)
+                                   peer_fwd=rxcount, peer_ns=peer_ns)
 
 
 # ---------------------------------------------------------------------------
@@ -1361,17 +1488,18 @@ class VXStream:
         parsed = parse_header(payload)
         if parsed is None:
             return
-        ptype, sid, seq, ts_ns, psize, rxsize, rxcount = parsed
+        ptype, sid, seq, ts_ns, psize, rxsize, rxcount, peer_ns = parsed
         if ptype == TYPE_PROBE:
             rxlen = len(payload)
             fwd = self.stats.on_probe_rx(seq)
             echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, rxlen,
-                                rxsize=rxlen, rxcount=fwd)
+                                rxsize=rxlen, rxcount=fwd,
+                                peer_ns=time.monotonic_ns())
             self.tunnel.send(self.proto, self.port, echo)
         elif ptype == TYPE_ECHO:
             self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
                                rx_len=len(payload), psize=psize, peer_rx=rxsize,
-                               peer_fwd=rxcount)
+                               peer_fwd=rxcount, peer_ns=peer_ns)
 
 
 # ---------------------------------------------------------------------------
@@ -1401,6 +1529,10 @@ class Engine:
                                       self.stop, dont_fragment=dont_fragment)
         # Per-second history ring buffer per stream, for the live/history charts.
         self.history = {cfg[0]: deque(maxlen=history_seconds + 2) for cfg in STREAMS}
+        # Aggregate histories: directional one-way drift (mean over the live
+        # UDP streams) and the pooled-UDP RTT p5-p95 band for the latency chart.
+        self.owd_history = deque(maxlen=history_seconds + 2)
+        self.band_history = deque(maxlen=history_seconds + 2)
         self.history_lock = threading.Lock()
         for cfg in STREAMS:
             sid, proto, port, name = cfg
@@ -1432,8 +1564,13 @@ class Engine:
 
     def _sampler(self):
         """Append one history sample per stream every second."""
+        udp_sids = {sid for sid, proto, _p, _n in STREAMS if proto == "UDP"}
         while not self.stop.wait(1.0):
             now = time.monotonic()  # chart X axis; immune to NTP steps
+            fwd_vals, rtn_vals = [], []
+            pooled = []
+            for sid in udp_sids:
+                pooled.extend(self.stats[sid].window_rtts())
             with self.history_lock:
                 for sid in self.history:
                     snap = self.stats[sid].snapshot()
@@ -1448,10 +1585,35 @@ class Engine:
                         "score": r if up else None,
                         "up": up,
                     })
+                    if sid in udp_sids and up and snap["owd_fwd"] is not None:
+                        fwd_vals.append(snap["owd_fwd"])
+                        rtn_vals.append(snap["owd_rtn"])
+                self.owd_history.append({
+                    "t": now, "up": bool(fwd_vals),
+                    "fwd": sum(fwd_vals) / len(fwd_vals) if fwd_vals else None,
+                    "rtn": sum(rtn_vals) / len(rtn_vals) if rtn_vals else None,
+                })
+                # Pooled-UDP RTT band: the percentile of the pooled samples,
+                # not a mix of per-stream percentiles.
+                if len(pooled) >= 20:
+                    pooled.sort()
+                    self.band_history.append({
+                        "t": now, "up": True,
+                        "lo": pooled[int(0.05 * (len(pooled) - 1))],
+                        "hi": pooled[int(0.95 * (len(pooled) - 1))],
+                    })
+                else:
+                    self.band_history.append({"t": now, "up": False,
+                                              "lo": None, "hi": None})
 
     def history_copy(self):
         with self.history_lock:
             return {sid: list(dq) for sid, dq in self.history.items()}
+
+    def extra_history_copy(self):
+        """(owd_history, band_history) lists for the aggregate charts."""
+        with self.history_lock:
+            return list(self.owd_history), list(self.band_history)
 
     def snapshot(self):
         """Return per-stream snapshots + overall aggregate quality."""
@@ -1540,9 +1702,16 @@ class Engine:
         udp_up = any(r["proto"] == "UDP" and r["connected"] for r in rows)
         udp_silent = (tcp_up and not udp_up
                       and time.monotonic() - self.start_time > 15.0)
+        # Ignore bring-up churn: probes sent before every stream was up read
+        # as loss and would mislabel the first minute of every run.
+        diag_floor = self.start_time + 10.0
+        loss_pattern = classify_loss_pattern(
+            {name: [t for t in self.stats[sid].recent_losses() if t > diag_floor]
+             for sid, proto, port, name in STREAMS})
         return {
             "rows": rows,
             "udp_silent": udp_silent,
+            "loss_pattern": loss_pattern,
             "overall": overall,
             "udp_mos": udp_mos,
             "udp_score": udp_score,
@@ -1568,6 +1737,8 @@ class Engine:
         with self.history_lock:
             for dq in self.history.values():
                 dq.clear()
+            self.owd_history.clear()
+            self.band_history.clear()
         self.last_reset = time.monotonic()
 
 
@@ -1620,12 +1791,18 @@ def _nice_ceiling(v):
     return 10 * base
 
 
+BAND_FILL = "#3a6f7d"   # percentile band (stippled -> reads as translucent)
+
+
 def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
-                ymin_floor=1.0, unit="", value_fmt=None):
+                ymin_floor=1.0, unit="", value_fmt=None, band=None,
+                band_label=None):
     """Render one time-series chart onto a Tk Canvas.
 
     series: list of (sid, color, short_label). samples_by_sid: {sid: [sample]}.
     Each sample is {'t', key..., 'up'}; None values break the line (gap = down).
+    band: optional [{'t','lo','hi','up'}] drawn as a shaded region behind the
+    series lines (None/down samples break it), labeled `band_label`.
     """
     if value_fmt is None:
         value_fmt = lambda v: f"{v:.0f}"
@@ -1650,6 +1827,10 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
             v = s.get(key)
             if v is not None and s["up"]:
                 vmax = max(vmax, v)
+    if band:
+        for s in band:
+            if s.get("hi") is not None and s["up"]:
+                vmax = max(vmax, s["hi"])
     vmax = _nice_ceiling(vmax)
 
     # horizontal gridlines + Y labels
@@ -1666,6 +1847,30 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
 
     def Y(v):
         return pad_t + ph * (1 - min(1.0, max(0.0, v) / vmax))
+
+    # percentile band (behind the series lines; gaps where the link was down)
+    if band:
+        seg_top, seg_bot = [], []
+
+        def _flush_band():
+            if len(seg_top) >= 4:
+                bot_xy = list(zip(seg_bot[0::2], seg_bot[1::2]))
+                pts = seg_top + [c for xy in reversed(bot_xy) for c in xy]
+                canvas.create_polygon(*pts, fill=BAND_FILL, outline="",
+                                      stipple="gray50")
+            del seg_top[:], seg_bot[:]
+
+        for s in band:
+            if s["t"] < t0:
+                continue
+            lo, hi = s.get("lo"), s.get("hi")
+            if lo is None or hi is None or not s["up"]:
+                _flush_band()
+                continue
+            x = X(s["t"])
+            seg_top.extend((x, Y(hi)))
+            seg_bot.extend((x, Y(lo)))
+        _flush_band()
 
     # X axis time labels
     for frac, lbl in ((0.0, f"-{int(view_seconds)}s"),
@@ -1702,6 +1907,11 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
         tid = canvas.create_text(lx + 13, 15, text=txt, anchor="w",
                                  fill=TXT_DIM, font=(FONT, 8))
         lx = canvas.bbox(tid)[2] + 12
+    if band and band_label:
+        canvas.create_rectangle(lx, 11, lx + 9, 19, fill=BAND_FILL, outline="",
+                                stipple="gray50")
+        canvas.create_text(lx + 13, 15, text=band_label, anchor="w",
+                           fill=TXT_DIM, font=(FONT, 8))
 
 
 # ---------------------------------------------------------------------------
@@ -1833,7 +2043,7 @@ def run_gui(engine, args):
             do_toggle_isolate()
         if anatomy_shown["on"]:
             do_toggle_anatomy()
-        for c in (lat_canvas, loss_canvas, jit_canvas):
+        for c in (lat_canvas, loss_canvas, jit_canvas, owd_canvas):
             c.configure(width=100, height=80)
         root.update_idletasks()
 
@@ -2096,12 +2306,16 @@ def run_gui(engine, args):
     bottom.rowconfigure(0, weight=1)
     bottom.columnconfigure(0, weight=1, uniform="bottom")
     bottom.columnconfigure(1, weight=1, uniform="bottom")
+    bottom.columnconfigure(2, weight=1, uniform="bottom")
     loss_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
                             width=100, height=80)
     loss_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
     jit_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
                            width=100, height=80)
-    jit_canvas.grid(row=0, column=1, sticky="nsew", padx=(3, 0))
+    jit_canvas.grid(row=0, column=1, sticky="nsew", padx=(3, 3))
+    owd_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
+                           width=100, height=80)
+    owd_canvas.grid(row=0, column=2, sticky="nsew", padx=(3, 0))
 
     def refresh_body():
         snap = engine.snapshot()
@@ -2143,12 +2357,15 @@ def run_gui(engine, args):
             warn_var.set("⚠ UDP silent while TCP is up — UDP blocked in the "
                          "path (firewall/ACL) or the peer runs an outdated "
                          "version; update BOTH ends")
-            if not warn_lbl.winfo_ismapped():
-                warn_lbl.pack(fill="x", before=foot_path_lbl)
+        elif snap.get("loss_pattern"):
+            warn_var.set(f"⚠ loss pattern (last 60 s): {snap['loss_pattern']}")
         else:
             warn_var.set("")
-            if warn_lbl.winfo_ismapped():
-                warn_lbl.pack_forget()
+        if warn_var.get():
+            if not warn_lbl.winfo_ismapped():
+                warn_lbl.pack(fill="x", before=foot_path_lbl)
+        elif warn_lbl.winfo_ismapped():
+            warn_lbl.pack_forget()
         foot_path_var.set(
             f"peer {args.peer}  ·  {ports_summary()}  ·  "
             f"frame {snap['frame_size']} B  DF {df}  size {size_tag}{vx}  ·  "
@@ -2191,15 +2408,28 @@ def run_gui(engine, args):
                     size_cell))
 
         hist = engine.history_copy()
+        owd_hist, band_hist = engine.extra_history_copy()
         now = time.monotonic()  # history samples are stamped with monotonic time
         _draw_chart(lat_canvas, "Latency (RTT, ms)", "rtt", series, hist,
                     view_seconds, now, ymin_floor=2.0, unit="",
-                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
+                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}",
+                    band=band_hist, band_label="p5–p95 (UDP)")
         _draw_chart(loss_canvas, "Loss + late (%)", "loss", series, hist,
                     view_seconds, now, ymin_floor=2.0, unit="%",
                     value_fmt=lambda v: f"{v:.0f}")
         _draw_chart(jit_canvas, "Jitter (ms)", "jitter", series, hist,
                     view_seconds, now, ymin_floor=1.0, unit="",
+                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
+        # Directional one-way drift: two aggregate lines (mean over live UDP
+        # streams), each direction's delay growth above its ~60 s best. The
+        # clocks' unknown offset cancels, so only the MOVEMENT is meaningful.
+        _draw_chart(owd_canvas, "One-way drift (ms)", "v",
+                    [("F", HPE_GREEN, "fwd→"), ("R", "#FF8300", "rtn←")],
+                    {"F": [{"t": s["t"], "up": s["up"], "v": s["fwd"]}
+                           for s in owd_hist],
+                     "R": [{"t": s["t"], "up": s["up"], "v": s["rtn"]}
+                           for s in owd_hist]},
+                    view_seconds, now, ymin_floor=2.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
 
     def refresh():
@@ -2390,6 +2620,8 @@ def run_console_loop(engine, args, vt):
                 print("  ! UDP silent while TCP is up: UDP blocked in the path "
                       "(firewall/ACL) or the peer runs an outdated version - "
                       "update BOTH ends.")
+            elif snap.get("loss_pattern"):
+                print(f"  ! loss pattern (last 60 s): {snap['loss_pattern']}")
             if keys.enabled:
                 print("  keys:  [r] reset counters    [q] quit    (Ctrl-C also quits)")
             key = keys.poll(args.refresh_ms / 1000.0)
@@ -2826,33 +3058,30 @@ def _launcher_argv(vals):
     return argv
 
 
-def _open_sweep_window(root, peer, bind, udp_ports):
-    """Run the MTU sweep in a background thread, streaming its output into a
-    small window. The sweep binds its own ephemeral port, so it can run while
-    anything else is running on either end."""
+def _open_tool_window(root, title, runner, thread_name):
+    """Run a one-shot tool (`runner(out)`) in a background thread, streaming
+    its output into a small window. The tools bind their own ephemeral port,
+    so they can run while anything else is running on either end."""
     import queue
     import tkinter as tk
 
     q = queue.Queue()
     dlg = tk.Toplevel(root)
-    dlg.title(f"MTU sweep -> {peer}")
+    dlg.title(title)
     dlg.configure(bg=BG)
     txt = tk.Text(dlg, width=76, height=18, bg=PANEL, fg=TXT, relief="flat",
                   font=("Consolas", 9), state="disabled", wrap="none",
                   highlightthickness=0, padx=8, pady=8)
     txt.pack(fill="both", expand=True, padx=10, pady=10)
 
-    ns = argparse.Namespace(peer=peer, bind=bind, udp_ports=tuple(udp_ports),
-                            sweep_min=1400, sweep_max=9000)
-
     def worker():
         try:
-            run_mtu_sweep(ns, out=lambda line="": q.put(str(line)))
+            runner(lambda line="": q.put(str(line)))
         except Exception as e:  # show the failure, don't kill the launcher
-            q.put(f"sweep failed: {e}")
+            q.put(f"failed: {e}")
         q.put(None)  # done sentinel: stop polling
 
-    threading.Thread(target=worker, name="mtu-sweep", daemon=True).start()
+    threading.Thread(target=worker, name=thread_name, daemon=True).start()
 
     def poll():
         try:
@@ -3290,23 +3519,43 @@ def run_launcher(update_url=UPDATE_URL):
             return
         _finish_start(vals, argv)
 
-    def do_sweep():
+    def _tool_target(what):
+        """Common peer/ports validation for the one-shot tools."""
         vals = collect()
         peer = vals["peer"]
         if not peer:
             messagebox.showerror("Network Vitals",
-                                 "Peer IP is required for an MTU sweep.",
+                                 f"Peer IP is required for a {what}.",
                                  parent=root)
-            return
+            return None
         try:
             ports = (_port_pair(vals["udp_ports"])
                      if vals["udp_ports"].strip() else DEFAULT_UDP_PORTS)
         except argparse.ArgumentTypeError as e:
             messagebox.showerror("Network Vitals", f"UDP ports: {e}",
                                  parent=root)
+            return None
+        return peer, vals["bind"].strip() or "0.0.0.0", ports
+
+    def do_sweep():
+        target = _tool_target("MTU sweep")
+        if target is None:
             return
-        _open_sweep_window(root, peer, vals["bind"].strip() or "0.0.0.0",
-                           ports)
+        peer, bind, ports = target
+        ns = argparse.Namespace(peer=peer, bind=bind, udp_ports=ports,
+                                sweep_min=1400, sweep_max=9000)
+        _open_tool_window(root, f"MTU sweep -> {peer}",
+                          lambda out: run_mtu_sweep(ns, out=out), "mtu-sweep")
+
+    def do_burst():
+        target = _tool_target("burst test")
+        if target is None:
+            return
+        peer, bind, ports = target
+        ns = argparse.Namespace(peer=peer, bind=bind, udp_ports=ports,
+                                burst_mbps=[1, 2, 5, 10, 25], burst_secs=3.0)
+        _open_tool_window(root, f"Burst test -> {peer}",
+                          lambda out: run_burst_test(ns, out=out), "burst-test")
 
     def do_update():
         # A restart from the launcher reopens the (new) launcher; a
@@ -3319,6 +3568,7 @@ def run_launcher(update_url=UPDATE_URL):
     start_btn = mkbarbtn("▶  Start", do_start, primary=True)
     start_btn.pack(side="right")
     mkbarbtn("MTU sweep", do_sweep).pack(side="right", padx=(0, 8))
+    mkbarbtn("Burst test", do_burst).pack(side="right", padx=(0, 8))
 
     peer_box.focus_set()
     root.bind("<Return>", lambda _e: do_start())
@@ -3329,6 +3579,18 @@ def run_launcher(update_url=UPDATE_URL):
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+def _mbps_list(text):
+    """Parse '1,5,25' into a list of per-stage Mbps floats."""
+    try:
+        vals = [float(x) for x in text.split(",") if x.strip()]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid Mbps list: {text!r}")
+    if not vals or any(v <= 0 or v > 500 for v in vals):
+        raise argparse.ArgumentTypeError(
+            "expected comma-separated Mbps values in (0, 500]")
+    return vals
+
+
 def _port_pair(text):
     """Parse 'A,B' into a (A, B) tuple of two valid ports."""
     parts = [p.strip() for p in text.split(",") if p.strip()]
@@ -3414,6 +3676,17 @@ def parse_args(argv=None):
                    help="MTU sweep lower bound, UDP payload bytes (default 1400).")
     p.add_argument("--sweep-max", type=int, default=9000,
                    help="MTU sweep upper bound, UDP payload bytes (default 9000).")
+    p.add_argument("--burst-test", action="store_true",
+                   help="One-shot: staged UDP rate ramp against the peer "
+                        "(responsiveness under load: bufferbloat / policer / "
+                        "shaper signatures), then exit. Peer must be running "
+                        "Network Vitals. Sends real traffic; echoes double it.")
+    p.add_argument("--burst-mbps", type=_mbps_list, default=[1, 2, 5, 10, 25],
+                   metavar="A,B,...",
+                   help="Burst test stages in Mbps (default 1,2,5,10,25; "
+                        "max 500 each).")
+    p.add_argument("--burst-secs", type=float, default=3.0, metavar="S",
+                   help="Seconds per burst stage (default 3).")
     return p.parse_args(argv)
 
 
@@ -3478,7 +3751,7 @@ def run_mtu_sweep(args, out=print):
         for _ in range(4):
             seq[0] += 1
             s = seq[0]
-            pkt = build_packet(TYPE_PROBE, 0, s, time.monotonic_ns(), size, rxsize=size)
+            pkt = build_packet(TYPE_TEST, 0, s, time.monotonic_ns(), size, rxsize=size)
             try:
                 sock.sendto(pkt, (peer, port))
             except OSError:
@@ -3525,6 +3798,163 @@ def run_mtu_sweep(args, out=print):
         out("=> Standard 1500-byte MTU; no jumbo on this path.")
 
 
+BURST_PROBE_SIZE = 1200   # fits one EC slice AND a standard 1500 B hop
+
+
+def run_burst_test(args, out=print):
+    """Responsiveness under load: staged UDP rate ramp against a running peer.
+
+    The continuous probes measure the path at idle; this measures what LOAD
+    does to it. Paced 1200 B test probes go from an ephemeral port to the
+    peer's first UDP probe port, at each offered rate in turn, and the RTT/
+    loss response names the path's behavior:
+
+      * RTT grows with rate while loss stays low -> deep queue (bufferbloat).
+      * loss appears above some rate, RTT flat   -> policer (hard rate cap).
+      * RTT grows first, then loss               -> shaper (queue, then drop).
+
+    Echoes are full-size, so the offered load is symmetric: both directions
+    carry it at once and the figures are per direction. TEST-type probes are
+    excluded from the peer's loss-isolation bookkeeping, so this can run
+    beside a live session without skewing its numbers.
+    """
+    peer, port = args.peer, args.udp_ports[0]
+    size = BURST_PROBE_SIZE
+    stages = args.burst_mbps
+    dur = args.burst_secs
+    out(f"Burst test -> {peer}:{port} (UDP, {size} B probes). "
+        f"Peer must be running Network Vitals.")
+    out(f"Stages: {', '.join(f'{m:g}' for m in stages)} Mbps, {dur:g} s each. "
+        f"This is real traffic, and echoes double it.")
+    out("")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    enlarge_socket_buffers(sock)
+    quench_udp_connreset(sock)
+    try:
+        sock.bind((args.bind, 0))  # ephemeral source port
+    except OSError as e:
+        out(f"bind failed: {e}")
+        return
+    sock.setblocking(False)
+    seq = [0]
+
+    def run_stage(pps, seconds):
+        """Send paced probes for `seconds`; return (sent, rtts_ms)."""
+        pending = {}
+        rtts = []
+
+        def drain():
+            while True:
+                try:
+                    data, _addr = sock.recvfrom(MAX_SIZE)
+                except (BlockingIOError, InterruptedError):
+                    return
+                except (ConnectionResetError, OSError):
+                    return
+                p = parse_header(data)
+                if p and p[0] == TYPE_ECHO:
+                    ns = pending.pop(p[2], None)
+                    if ns is not None:
+                        rtts.append((time.monotonic_ns() - ns) / 1e6)
+
+        sent = 0
+        # Accumulator pacing in ~2 ms ticks: sleep-per-packet can't pace
+        # thousands of pps under Windows timer granularity, batches can.
+        t_end = time.monotonic() + seconds
+        last = time.monotonic()
+        carry = 0.0
+        while True:
+            now = time.monotonic()
+            if now >= t_end:
+                break
+            carry += (now - last) * pps
+            last = now
+            for _ in range(min(int(carry), 500)):
+                seq[0] += 1
+                ns = time.monotonic_ns()
+                pkt = build_packet(TYPE_TEST, 0, seq[0], ns, size)
+                try:
+                    sock.sendto(pkt, (peer, port))
+                except (BlockingIOError, OSError):
+                    carry = min(carry, 1.0)  # local backpressure: don't pile up
+                    break
+                pending[seq[0]] = ns
+                sent += 1
+                carry -= 1.0
+            drain()
+            time.sleep(0.002)
+        t_drain = time.monotonic() + 0.6  # let stragglers arrive
+        while time.monotonic() < t_drain:
+            drain()
+            time.sleep(0.005)
+        return sent, rtts
+
+    def pctl(sorted_vals, q):
+        return sorted_vals[int(q * (len(sorted_vals) - 1))]
+
+    # Baseline: the idle path, so stage RTTs have something to move against.
+    base_sent, base_rtts = run_stage(20, 1.5)
+    if len(base_rtts) < 10:
+        out(f"  baseline got {len(base_rtts)}/{base_sent} echoes - peer down, "
+            f"UDP {port} blocked, or both ends aren't on this version.")
+        sock.close()
+        return
+    base_rtts.sort()
+    base_med, base_p95 = pctl(base_rtts, 0.5), pctl(base_rtts, 0.95)
+    out(f"  baseline (idle): RTT median {base_med:.1f} ms  p95 {base_p95:.1f} ms")
+    out("")
+
+    results = []
+    for mbps in stages:
+        pps = max(20, int(mbps * 1e6 / 8 / size))
+        sent, rtts = run_stage(pps, dur)
+        if not sent:
+            out(f"  {mbps:6g} Mbps: could not send (local socket error)")
+            continue
+        loss = (sent - len(rtts)) / sent * 100.0
+        offered = sent * size * 8 / dur / 1e6
+        if rtts:
+            rtts.sort()
+            med, p95 = pctl(rtts, 0.5), pctl(rtts, 0.95)
+            out(f"  {mbps:6g} Mbps offered ({offered:5.1f} achieved, {pps} pps): "
+                f"loss {loss:5.1f}%   RTT med {med:6.1f} ms  p95 {p95:6.1f} ms")
+        else:
+            med = p95 = None
+            out(f"  {mbps:6g} Mbps offered ({offered:5.1f} achieved, {pps} pps): "
+                f"loss 100.0%   no echoes")
+        results.append((mbps, loss, med, p95))
+    sock.close()
+    out("")
+
+    # Verdicts. Thresholds are deliberately blunt: this names the SHAPE of
+    # the response, the table above carries the exact numbers.
+    clean = [m for m, loss, med, p95 in results
+             if loss < 1.0 and p95 is not None and p95 < base_p95 + 30.0]
+    bloated = [(m, p95) for m, loss, med, p95 in results
+               if loss < 2.0 and p95 is not None and p95 > base_p95 + 100.0]
+    capped = [(m, loss, med) for m, loss, med, p95 in results
+              if loss >= 5.0 and med is not None]
+    if clean:
+        out(f"=> Clean up to {max(clean):g} Mbps offered "
+            f"(loss <1%, p95 RTT within +30 ms of idle).")
+    if bloated:
+        m, p95 = bloated[0]
+        out(f"=> Deep queue (bufferbloat-like): at {m:g} Mbps p95 RTT hit "
+            f"{p95:.0f} ms (idle {base_p95:.1f} ms) before any real loss.")
+    if capped:
+        m, loss, med = capped[0]
+        if med < base_med + 20.0:
+            out(f"=> Policer-like: {loss:.0f}% loss at {m:g} Mbps with RTT "
+                f"still flat ({med:.1f} ms) - a hard rate cap that drops, "
+                f"not queues.")
+        else:
+            out(f"=> Shaper-like: {loss:.0f}% loss at {m:g} Mbps after RTT "
+                f"grew to {med:.0f} ms - a queue that fills, then drops.")
+    if not (clean or bloated or capped):
+        out("=> No stage ran clean and none showed a clear queue/cap "
+            "signature - see the table.")
+
+
 def main(argv=None):
     cli_argv = list(argv) if argv is not None else sys.argv[1:]
     args = parse_args(cli_argv)
@@ -3536,7 +3966,8 @@ def main(argv=None):
     if not args.peer:
         # No peer given: open the graphical launcher (the double-click
         # experience) unless it's explicitly disabled or plainly can't work.
-        if not (args.no_launcher or args.no_gui or args.mtu_sweep):
+        if not (args.no_launcher or args.no_gui or args.mtu_sweep
+                or args.burst_test):
             try:
                 chosen = run_launcher(args.update_url)
             except (ImportError, RuntimeError) as e:
@@ -3580,6 +4011,10 @@ def main(argv=None):
 
     if args.mtu_sweep:
         run_mtu_sweep(args)
+        return
+
+    if args.burst_test:
+        run_burst_test(args)
         return
 
     set_timer_resolution(1)  # smooth pacing on Windows -> fewer microburst drops
