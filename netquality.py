@@ -46,7 +46,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -4402,6 +4402,31 @@ def run_burst_test(args, out=print):
             "signature - see the table.")
 
 
+def _normalize_peer_args(args):
+    """Reconcile --peer/--peers so args.peer is always the first peer (every
+    single-peer code path - footer, sweep/burst targets - keys off it).
+    A comma list typed as --peer upgrades to a mesh instead of resolving as
+    a bogus hostname. Returns False (after printing/alerting) on bad input.
+    Must run again on args re-parsed from the launcher's argv."""
+    if args.peer and "," in args.peer and not args.peers:
+        try:
+            args.peers = _peer_list(args.peer)
+        except argparse.ArgumentTypeError as e:
+            msg = f"--peer: {e}"
+            print(f"error: {msg}", file=sys.stderr)
+            _alert_gui_error(msg)
+            return False
+        args.peer = None
+    if args.peers:
+        if args.peer:
+            msg = "use either --peer or --peers, not both"
+            print(f"error: {msg}", file=sys.stderr)
+            _alert_gui_error(msg)
+            return False
+        args.peer = args.peers[0]
+    return True
+
+
 def main(argv=None):
     cli_argv = list(argv) if argv is not None else sys.argv[1:]
     args = parse_args(cli_argv)
@@ -4410,14 +4435,8 @@ def main(argv=None):
     if args.update or args.check_update:
         return perform_update(args.update_url, apply=args.update)
 
-    # Normalize --peers early: args.peer stays the first peer so every
-    # single-peer code path (footer, sweep/burst targets) keeps working.
-    if args.peers:
-        if args.peer:
-            print("error: use either --peer or --peers, not both",
-                  file=sys.stderr)
-            return 2
-        args.peer = args.peers[0]
+    if not _normalize_peer_args(args):
+        return 2
 
     if not args.peer:
         # No peer given: open the graphical launcher (the double-click
@@ -4437,9 +4456,16 @@ def main(argv=None):
                     chosen = chosen + ["--update-url", args.update_url]
                 args = parse_args(chosen)
                 args._argv = chosen
+                # The launcher's argv may carry --peers: normalize the fresh
+                # args too. (1.6.0/1.6.1 skipped this, so starting a MESH
+                # from the launcher died on "--peer is required" - written
+                # to stderr, which a pythonw shortcut makes invisible.)
+                if not _normalize_peer_args(args):
+                    return 2
         if not args.peer:
-            print("error: --peer is required (except with "
-                  "--update/--check-update)", file=sys.stderr)
+            msg = ("--peer is required (except with --update/--check-update)")
+            print(f"error: {msg}", file=sys.stderr)
+            _alert_gui_error(msg)  # pythonw shortcut: stderr is invisible
             return 2
 
     args.size = max(HEADER_LEN, min(args.size, MAX_SIZE))
