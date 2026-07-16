@@ -46,7 +46,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.5.1"
+__version__ = "1.5.2"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -1601,8 +1601,10 @@ class Engine:
                 pooled.extend(self.stats[sid].window_rtts())
             fwd_vals, rtn_vals = [], []
             per_sid = {}
+            tx_pps_total = 0.0
             for sid, proto, _port, _name in STREAMS:
                 snap = self.stats[sid].snapshot()
+                tx_pps_total += snap["tx_pps"]
                 eff = self.effective_loss(snap["loss"], snap["late"])
                 r, _, _ = quality_score(snap["latency"], eff, snap["jitter"])
                 up = snap["connected"]
@@ -1633,12 +1635,19 @@ class Engine:
                 band_s = {"t": now, "up": False, "lo": None, "hi": None}
             # Loss-pattern verdict, cached for snapshot(). Bring-up churn
             # (probes sent before every stream was up) is excluded so it
-            # can't mislabel the first minute of a run.
+            # can't mislabel the first minute of a run, and the verdict
+            # respects the loss deadband: sub-deadband noise reads as 0
+            # everywhere else on screen (score, loss chart), so the pattern
+            # line must not nag about it either - and scope claims like
+            # "TCP only" need more than a handful of events to mean anything.
             diag_floor = self.start_time + 10.0
+            floor_events = max(5, int(tx_pps_total * 60.0
+                                      * self.loss_deadband / 100.0))
             self._loss_pattern = classify_loss_pattern(
                 {name: [t for t in self.stats[sid].recent_losses()
                         if t > diag_floor]
-                 for sid, proto, port, name in STREAMS})
+                 for sid, proto, port, name in STREAMS},
+                min_events=floor_events)
             with self.history_lock:
                 for sid, sample in per_sid.items():
                     self.history[sid].append(sample)

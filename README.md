@@ -432,7 +432,12 @@ on two independent axes:
 So "2% loss" turns into, e.g., *"bursty, all streams together — path-wide
 (flap / reroute / shared queue)"* or *"scattered, UDP-30201 only —
 port-specific (policer/ACL on that port?)"*. The first ~10 s of a run are
-excluded so bring-up churn doesn't mislabel a fresh session.
+excluded so bring-up churn doesn't mislabel a fresh session, and the line
+**respects `--loss-deadband`** (1.5.2): loss the score and loss chart already
+read as 0 doesn't produce a pattern warning either — when the line speaks,
+the 60 s loss rate is above the deadband and there are enough events for the
+scope claim to be statistically meaningful. Raise or lower `--loss-deadband`
+to tune both together.
 
 > **Version note:** the wire header changed in **1.5.0** (echoes now carry the
 > reflector's clock for one-way drift), so **both ends must run 1.5.0+** — a
