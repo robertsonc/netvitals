@@ -46,7 +46,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -416,6 +416,22 @@ class StreamStats:
             self.cum_tx += 1
             self.life_tx += 1
             self._trim_locked()
+
+    def cancel_send(self, seq):
+        """Withdraw a probe registered with on_send whose transmit failed.
+
+        Senders must register BEFORE transmitting: send calls release the
+        GIL, and on a fast path the echo can come back and be processed
+        before the sending thread runs again - an unregistered probe's echo
+        is discarded as a duplicate and the probe then reads as (return)
+        loss. Registering first closes that race; this undoes the
+        registration on the rare failed transmit."""
+        with self.lock:
+            if self.pending.pop(seq, None) is not None:
+                self.cum_tx -= 1
+                self.life_tx -= 1
+                if self.tx_events:
+                    self.tx_events.pop()
 
     def on_echo(self, seq, ts_ns, now_ns, rx_len=0, psize=0, peer_rx=0,
                 peer_fwd=0, peer_ns=0):
@@ -831,17 +847,22 @@ def score_color(r):
 # UDP stream: one bound socket per port, both originates and reflects.
 # ---------------------------------------------------------------------------
 class UDPStream:
-    def __init__(self, cfg, peer, bind, size, interval, stats, stop, dont_fragment=False):
+    """One UDP port serving every configured peer: probes fan out to each
+    peer on its own sequence/stats, and inbound packets demux by source
+    address. A single peer is just the one-element case."""
+
+    def __init__(self, cfg, peers, bind, size, interval, stats_of, stop,
+                 dont_fragment=False):
         self.sid, _, self.port, self.name = cfg
-        self.peer = peer
+        self.peers = list(peers)
         self.bind = bind
         self.size = size
         self.interval = interval
-        self.stats = stats
+        self.stats_of = stats_of   # {peer: StreamStats}
         self.stop = stop
         self.dont_fragment = dont_fragment
         self.sock = None
-        self.peer_ip = None
+        self.ip_of = {}            # resolved source IP -> peer
         self.threads = []
 
     def start(self):
@@ -854,7 +875,10 @@ class UDPStream:
         s.bind((self.bind, self.port))
         s.settimeout(0.5)
         self.sock = s
-        self.peer_ip = resolve_peer_ip(self.peer)
+        for p in self.peers:
+            ip = resolve_peer_ip(p)
+            if ip is not None:
+                self.ip_of[ip] = p
         self.threads = [
             threading.Thread(target=self._recv_loop, name=f"{self.name}-rx", daemon=True),
             threading.Thread(target=self._send_loop, name=f"{self.name}-tx", daemon=True),
@@ -862,20 +886,34 @@ class UDPStream:
         for t in self.threads:
             t.start()
 
+    def _peer_for(self, src_ip):
+        """Map a source address to a configured peer. Only talk to configured
+        peers: a hostile/chatty LAN must not be able to skew stats or use us
+        as a packet reflector. (Sole exception: a single unresolvable-at-
+        start peer keeps the pre-mesh behavior of accepting its traffic.)"""
+        peer = self.ip_of.get(src_ip)
+        if peer is None and len(self.peers) == 1 and not self.ip_of:
+            return self.peers[0]
+        return peer
+
     def _send_loop(self):
-        seq = 0
-        peer_addr = (self.peer, self.port)
+        seqs = dict.fromkeys(self.peers, 0)
         next_t = time.monotonic()
         while not self.stop.is_set():
-            seq += 1
-            ns = time.monotonic_ns()
-            pkt = build_packet(TYPE_PROBE, self.sid, seq, ns, self.size)
-            try:
-                self.sock.sendto(pkt, peer_addr)
-                self.stats.on_send(seq, ns)
-            except OSError:
-                pass
-            self.stats.reap()
+            for p in self.peers:
+                seqs[p] += 1
+                ns = time.monotonic_ns()
+                pkt = build_packet(TYPE_PROBE, self.sid, seqs[p], ns, self.size)
+                st = self.stats_of[p]
+                # Register BEFORE transmitting: sendto releases the GIL and
+                # on a fast path the echo can be processed before this thread
+                # runs again - see StreamStats.cancel_send.
+                st.on_send(seqs[p], ns)
+                try:
+                    self.sock.sendto(pkt, (p, self.port))
+                except OSError:
+                    st.cancel_send(seqs[p])
+                st.reap()
             next_t += self.interval
             delay = next_t - time.monotonic()
             if delay > 0:
@@ -898,10 +936,10 @@ class UDPStream:
                     break
                 time.sleep(0.1)  # unexpected; don't spin, don't die
                 continue
-            # Only talk to the configured peer: a hostile/chatty LAN must not
-            # be able to skew stats or use us as a packet reflector.
-            if self.peer_ip is not None and addr[0] != self.peer_ip:
+            peer = self._peer_for(addr[0])
+            if peer is None:
                 continue
+            stats = self.stats_of[peer]
             parsed = parse_header(data)
             if parsed is None:
                 continue
@@ -913,7 +951,7 @@ class UDPStream:
                 # probes (MTU sweep / burst test side-channels) are echoed but
                 # kept out of the gap tracking.
                 rxlen = len(data)
-                fwd = self.stats.on_probe_rx(seq) if ptype == TYPE_PROBE else 0
+                fwd = stats.on_probe_rx(seq) if ptype == TYPE_PROBE else 0
                 echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, rxlen,
                                     rxsize=rxlen, rxcount=fwd,
                                     peer_ns=time.monotonic_ns())
@@ -922,9 +960,9 @@ class UDPStream:
                 except OSError:
                     pass
             elif ptype == TYPE_ECHO:
-                self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
-                                   rx_len=len(data), psize=psize, peer_rx=rxsize,
-                                   peer_fwd=rxcount, peer_ns=peer_ns)
+                stats.on_echo(seq, ts_ns, time.monotonic_ns(),
+                              rx_len=len(data), psize=psize, peer_rx=rxsize,
+                              peer_fwd=rxcount, peer_ns=peer_ns)
 
 
 # ---------------------------------------------------------------------------
@@ -984,36 +1022,53 @@ def _recv_msg(sock, stop=None, idle_timeout=None):
 
 
 class TCPStream:
-    def __init__(self, cfg, peer, bind, size, interval, stats, stop):
+    """One TCP port serving every configured peer: a single listener reflects
+    each peer on its own connection/stats, and one client (plus handshake
+    sampler) runs per peer. A single peer is just the one-element case."""
+
+    def __init__(self, cfg, peers, bind, size, interval, stats_of, stop):
         self.sid, _, self.port, self.name = cfg
-        self.peer = peer
+        self.peers = list(peers)
         self.bind = bind
         self.size = max(size, HEADER_LEN)
         self.interval = interval
-        self.stats = stats
+        self.stats_of = stats_of   # {peer: StreamStats}
         self.stop = stop
         self.listen_sock = None
-        self.client_sock = None
-        self.peer_ip = None
+        self.ip_of = {}            # resolved source IP -> peer
         self.threads = []
         # Probe seq continues across reconnects (see _client_send).
-        self._tx_seq = 0
-        # At most one live reflector connection: when the peer reconnects, the
-        # old (usually half-dead) connection is closed so its thread exits
-        # instead of leaking, and so two connections can't interleave probes
-        # into the same StreamStats.
+        self._tx_seq = dict.fromkeys(self.peers, 0)
+        # At most one live reflector connection PER PEER: when a peer
+        # reconnects, its old (usually half-dead) connection is closed so the
+        # thread exits instead of leaking, and so two connections can't
+        # interleave probes into the same StreamStats.
         self._reflect_lock = threading.Lock()
-        self._active_reflect = None
+        self._active_reflect = {}
 
     def start(self):
-        self.peer_ip = resolve_peer_ip(self.peer)
-        self.threads = [
-            threading.Thread(target=self._server_loop, name=f"{self.name}-srv", daemon=True),
-            threading.Thread(target=self._client_manager, name=f"{self.name}-cli", daemon=True),
-            threading.Thread(target=self._connect_sampler, name=f"{self.name}-syn", daemon=True),
-        ]
+        for p in self.peers:
+            ip = resolve_peer_ip(p)
+            if ip is not None:
+                self.ip_of[ip] = p
+        self.threads = [threading.Thread(target=self._server_loop,
+                                         name=f"{self.name}-srv", daemon=True)]
+        for p in self.peers:
+            self.threads.append(threading.Thread(
+                target=self._client_manager, args=(p,),
+                name=f"{self.name}-cli-{p}", daemon=True))
+            self.threads.append(threading.Thread(
+                target=self._connect_sampler, args=(p,),
+                name=f"{self.name}-syn-{p}", daemon=True))
         for t in self.threads:
             t.start()
+
+    def _peer_for(self, src_ip):
+        """Same peer-set filter as UDPStream._peer_for."""
+        peer = self.ip_of.get(src_ip)
+        if peer is None and len(self.peers) == 1 and not self.ip_of:
+            return self.peers[0]
+        return peer
 
     # -- server side: reflect peer probes ---------------------------------
     def _server_loop(self):
@@ -1050,42 +1105,61 @@ class TCPStream:
                 continue
             except OSError:
                 break
-            if self.peer_ip is not None and addr[0] != self.peer_ip:
-                # Only reflect for the configured peer (hostile-LAN hardening:
+            peer = self._peer_for(addr[0])
+            if peer is None:
+                # Only reflect for configured peers (hostile-LAN hardening:
                 # no thread-per-connection for arbitrary hosts).
                 try:
                     conn.close()
                 except OSError:
                     pass
                 continue
-            with self._reflect_lock:
-                old, self._active_reflect = self._active_reflect, conn
-            if old is not None:
-                try:
-                    old.close()  # unblocks the old reflector thread -> exits
-                except OSError:
-                    pass
-            threading.Thread(target=self._reflect_conn, args=(conn,), daemon=True).start()
+            threading.Thread(target=self._reflect_conn, args=(conn, peer),
+                             daemon=True).start()
 
-    def _reflect_conn(self, conn):
+    def _reflect_conn(self, conn, peer):
+        stats = self.stats_of[peer]
         conn.settimeout(0.5)
         try:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        with conn:
-            while not self.stop.is_set():
-                # 30s with no bytes = silently dead peer (no FIN/RST after a
-                # crash/power-off); exit rather than leak this thread forever.
-                msg = _recv_msg(conn, stop=self.stop, idle_timeout=30.0)
-                if msg is None:
-                    return
-                parsed = parse_header(msg)
-                if parsed is None:
-                    continue
-                ptype, sid, seq, ts_ns, psize, rxsize, rxcount, peer_ns = parsed
-                if ptype == TYPE_PROBE:
-                    fwd = self.stats.on_probe_rx(seq)
+        # A new connection does NOT displace the live one until it delivers a
+        # real probe. The connect-time PQI sampler opens a throwaway
+        # handshake every ~15 s, and adopting on accept made that handshake
+        # close the LIVE reflector connection - killing the probes buffered
+        # on it (counted by the reflector, echo never sent -> a steady
+        # trickle of phantom "return loss" on every TCP stream, worse the
+        # more peers/samplers there are).
+        adopted = False
+        try:
+            with conn:
+                while not self.stop.is_set():
+                    # 30s with no bytes = silently dead peer (no FIN/RST after
+                    # a crash/power-off); exit rather than leak this thread.
+                    msg = _recv_msg(conn, stop=self.stop, idle_timeout=30.0)
+                    if msg is None:
+                        return
+                    parsed = parse_header(msg)
+                    if parsed is None:
+                        continue
+                    ptype, sid, seq, ts_ns, psize, rxsize, rxcount, peer_ns = parsed
+                    if ptype != TYPE_PROBE:
+                        continue
+                    if not adopted:
+                        # First probe: this IS the peer's live client now -
+                        # retire the previous connection so two conns can't
+                        # interleave probes into the same StreamStats.
+                        with self._reflect_lock:
+                            old = self._active_reflect.get(peer)
+                            self._active_reflect[peer] = conn
+                        if old is not None and old is not conn:
+                            try:
+                                old.close()  # unblocks its thread -> exits
+                            except OSError:
+                                pass
+                        adopted = True
+                    fwd = stats.on_probe_rx(seq)
                     # Echo at the PROBE's size (not our local --size) so the
                     # originator's reader frames it correctly even when the
                     # two ends run different sizes.
@@ -1096,6 +1170,11 @@ class TCPStream:
                         conn.sendall(echo)
                     except OSError:
                         return
+        finally:
+            if adopted:
+                with self._reflect_lock:
+                    if self._active_reflect.get(peer) is conn:
+                        self._active_reflect.pop(peer, None)
 
     def _source_address(self):
         """Source address for outbound TCP, so the peer's reflector sees us
@@ -1106,38 +1185,39 @@ class TCPStream:
         return (self.bind, 0)
 
     # -- connection-establishment sampler (PQI input) ----------------------
-    def _connect_sampler(self):
+    def _connect_sampler(self, peer):
         """Every ~15s, time a throwaway TCP handshake to the peer port."""
         while not self.stop.wait(15.0):
             t0 = time.monotonic()
             try:
-                s = socket.create_connection((self.peer, self.port), timeout=3.0,
+                s = socket.create_connection((peer, self.port), timeout=3.0,
                                              source_address=self._source_address())
-                self.stats.on_connect((time.monotonic() - t0) * 1000.0)
+                self.stats_of[peer].on_connect((time.monotonic() - t0) * 1000.0)
                 s.close()
             except OSError:
                 pass  # peer down; connection health shows via the main stream
 
     # -- client side: originate probes ------------------------------------
-    def _client_manager(self):
+    def _client_manager(self, peer):
+        stats = self.stats_of[peer]
         while not self.stop.is_set():
             t0 = time.monotonic()
             try:
-                cs = socket.create_connection((self.peer, self.port), timeout=2.0,
+                cs = socket.create_connection((peer, self.port), timeout=2.0,
                                               source_address=self._source_address())
             except OSError:
                 self.stop.wait(1.0)
                 continue
-            self.stats.on_connect((time.monotonic() - t0) * 1000.0)
+            stats.on_connect((time.monotonic() - t0) * 1000.0)
             cs.settimeout(0.5)
             try:
                 cs.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
-            self.client_sock = cs
-            rx = threading.Thread(target=self._client_recv, args=(cs,), daemon=True)
+            rx = threading.Thread(target=self._client_recv, args=(cs, stats),
+                                  daemon=True)
             rx.start()
-            self._client_send(cs)   # blocks until the connection dies
+            self._client_send(cs, peer, stats)  # blocks until the conn dies
             try:
                 cs.close()
             except OSError:
@@ -1146,7 +1226,7 @@ class TCPStream:
             if not self.stop.is_set():
                 self.stop.wait(0.5)  # brief backoff before reconnect
 
-    def _client_send(self, cs):
+    def _client_send(self, cs, peer, stats):
         # seq continues across reconnects so the peer's reflector sees ONE
         # monotonic sequence: the gap across a reconnect is exactly the probes
         # that died with the old connection (real forward loss), and pending
@@ -1154,16 +1234,18 @@ class TCPStream:
         # silently overwritten by a restarted sequence.
         next_t = time.monotonic()
         while not self.stop.is_set():
-            self._tx_seq += 1
-            seq = self._tx_seq
+            self._tx_seq[peer] += 1
+            seq = self._tx_seq[peer]
             ns = time.monotonic_ns()
             pkt = build_packet(TYPE_PROBE, self.sid, seq, ns, self.size)
+            # Register BEFORE transmitting (see StreamStats.cancel_send).
+            stats.on_send(seq, ns)
             try:
                 cs.sendall(pkt)
-                self.stats.on_send(seq, ns)
             except OSError:
+                stats.cancel_send(seq)
                 return
-            self.stats.reap()
+            stats.reap()
             next_t += self.interval
             delay = next_t - time.monotonic()
             if delay > 0:
@@ -1171,7 +1253,7 @@ class TCPStream:
             else:
                 next_t = time.monotonic()
 
-    def _client_recv(self, cs):
+    def _client_recv(self, cs, stats):
         while not self.stop.is_set():
             msg = _recv_msg(cs, stop=self.stop)
             if msg is None:
@@ -1181,9 +1263,9 @@ class TCPStream:
                 continue
             ptype, sid, seq, ts_ns, psize, rxsize, rxcount, peer_ns = parsed
             if ptype == TYPE_ECHO:
-                self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
-                                   rx_len=len(msg), psize=psize, peer_rx=rxsize,
-                                   peer_fwd=rxcount, peer_ns=peer_ns)
+                stats.on_echo(seq, ts_ns, time.monotonic_ns(),
+                              rx_len=len(msg), psize=psize, peer_rx=rxsize,
+                              peer_fwd=rxcount, peer_ns=peer_ns)
 
 
 # ---------------------------------------------------------------------------
@@ -1493,8 +1575,10 @@ class VXStream:
             seq += 1
             ns = time.monotonic_ns()
             pkt = build_packet(TYPE_PROBE, self.sid, seq, ns, self.size)
-            if self.tunnel.send(self.proto, self.port, pkt):
-                self.stats.on_send(seq, ns)
+            # Register BEFORE transmitting (see StreamStats.cancel_send).
+            self.stats.on_send(seq, ns)
+            if not self.tunnel.send(self.proto, self.port, pkt):
+                self.stats.cancel_send(seq)
             self.stats.reap()
             next_t += self.interval
             delay = next_t - time.monotonic()
@@ -1525,9 +1609,20 @@ class VXStream:
 # Engine: owns all streams + their stats
 # ---------------------------------------------------------------------------
 class Engine:
-    def __init__(self, peer, bind, size, pps, window, timeout, history_seconds=300,
-                 loss_deadband=0.5, dont_fragment=False, vxlan=None):
-        self.peer = peer
+    def __init__(self, peer=None, bind="0.0.0.0", size=200, pps=50, window=10.0,
+                 timeout=2.0, history_seconds=300, loss_deadband=0.5,
+                 dont_fragment=False, vxlan=None, peers=None, tcp_pps=None):
+        # `peers` (a list) is the mesh form; `peer` is the classic 1:1 form.
+        # Everything below is keyed per (peer, sid) pair; single-peer callers
+        # keep using the peer-defaulted accessors and see no difference.
+        self.peers = [p.strip() for p in (peers if peers else [peer])
+                      if p and p.strip()]
+        if not self.peers:
+            raise ValueError("Engine needs at least one peer")
+        self.peer = self.peers[0]
+        if vxlan and len(self.peers) > 1:
+            raise ValueError("VXLAN mesh is not supported yet (roadmap "
+                             "phase 2) - use native transport for --peers")
         self.bind = bind
         self.size = size
         self.dont_fragment = dont_fragment
@@ -1537,39 +1632,52 @@ class Engine:
         self.last_reset = time.monotonic()
         self.history_seconds = history_seconds
         self.loss_deadband = loss_deadband  # combined loss+late below this reads as 0
-        interval = 1.0 / pps
-        self.stats = {}
+        # The 50 pps / ~200 B UDP default deliberately matches a G.711 voice
+        # stream (20 ms packetization); TCP models an interactive app, not
+        # media, so its rate is independently tunable via --tcp-pps.
+        rate_of = {"UDP": pps, "TCP": tcp_pps or pps}
+        self.stats = {}      # (peer, sid) -> StreamStats
         self.streams = []
         # In VXLAN mode ALL four streams ride one shared userspace VTEP; the
         # native per-port UDP/TCP transports are not opened at all.
         self.tunnel = None
         if vxlan:
-            self.tunnel = VXLANTunnel(peer, bind, vxlan["vni"], vxlan["port"],
-                                      self.stop, dont_fragment=dont_fragment)
-        # Per-second history ring buffer per stream, for the live/history charts.
-        self.history = {cfg[0]: deque(maxlen=history_seconds + 2) for cfg in STREAMS}
-        # Aggregate histories: directional one-way drift (mean over the live
-        # UDP streams, stored per direction ready for the chart) and the
-        # pooled-UDP RTT p5-p95 band for the latency chart.
-        self.owd_hist_f = deque(maxlen=history_seconds + 2)
-        self.owd_hist_r = deque(maxlen=history_seconds + 2)
-        self.band_history = deque(maxlen=history_seconds + 2)
+            self.tunnel = VXLANTunnel(self.peer, bind, vxlan["vni"],
+                                      vxlan["port"], self.stop,
+                                      dont_fragment=dont_fragment)
+        # Per-second history ring buffers per (peer, stream) for the charts.
+        H = history_seconds + 2
+        self.history = {(p, cfg[0]): deque(maxlen=H)
+                        for p in self.peers for cfg in STREAMS}
+        # Aggregate histories per peer: directional one-way drift (mean over
+        # the live UDP streams, stored per direction ready for the chart) and
+        # the pooled-UDP RTT p5-p95 band for the latency chart.
+        self.owd_hist_f = {p: deque(maxlen=H) for p in self.peers}
+        self.owd_hist_r = {p: deque(maxlen=H) for p in self.peers}
+        self.band_history = {p: deque(maxlen=H) for p in self.peers}
         self.history_lock = threading.Lock()
-        # Loss-pattern verdict, recomputed once per second by the sampler so
-        # the GUI's snapshot() calls don't churn the stream locks for it.
-        self._loss_pattern = None
+        # Loss-pattern verdict per peer, recomputed once per second by the
+        # sampler so the GUI's snapshot() calls don't churn the stream locks.
+        self._loss_pattern = dict.fromkeys(self.peers)
         for cfg in STREAMS:
             sid, proto, port, name = cfg
-            st = StreamStats(window=window, timeout=timeout, target_pps=pps)
-            self.stats[sid] = st
+            interval = 1.0 / rate_of[proto]
+            stats_of = {}
+            for p in self.peers:
+                st = StreamStats(window=window, timeout=timeout,
+                                 target_pps=rate_of[proto])
+                self.stats[(p, sid)] = st
+                stats_of[p] = st
             if self.tunnel is not None:
                 self.streams.append(VXStream(cfg, self.tunnel, size, interval,
-                                             st, self.stop))
+                                             stats_of[self.peer], self.stop))
             elif proto == "UDP":
-                self.streams.append(UDPStream(cfg, peer, bind, size, interval, st,
-                                              self.stop, dont_fragment=dont_fragment))
+                self.streams.append(UDPStream(cfg, self.peers, bind, size,
+                                              interval, stats_of, self.stop,
+                                              dont_fragment=dont_fragment))
             else:
-                self.streams.append(TCPStream(cfg, peer, bind, size, interval, st, self.stop))
+                self.streams.append(TCPStream(cfg, self.peers, bind, size,
+                                              interval, stats_of, self.stop))
 
     def start(self):
         if self.tunnel is not None:
@@ -1596,77 +1704,87 @@ class Engine:
         udp_sids = {sid for sid, proto, _p, _n in STREAMS if proto == "UDP"}
         while not self.stop.wait(1.0):
             now = time.monotonic()  # chart X axis; immune to NTP steps
-            pooled = []
-            for sid in udp_sids:
-                pooled.extend(self.stats[sid].window_rtts())
-            fwd_vals, rtn_vals = [], []
-            per_sid = {}
-            tx_pps_total = 0.0
-            for sid, proto, _port, _name in STREAMS:
-                snap = self.stats[sid].snapshot()
-                tx_pps_total += snap["tx_pps"]
-                eff = self.effective_loss(snap["loss"], snap["late"])
-                r, _, _ = quality_score(snap["latency"], eff, snap["jitter"])
-                up = snap["connected"]
-                per_sid[sid] = {
-                    "t": now,
-                    "rtt": snap["rtt_avg"] if up else None,
-                    "loss": eff,
-                    "jitter": snap["jitter"] if up else None,
-                    "score": r if up else None,
-                    "up": up,
-                }
-                if sid in udp_sids and up and snap["owd_fwd"] is not None:
-                    fwd_vals.append(snap["owd_fwd"])
-                    rtn_vals.append(snap["owd_rtn"])
-            owd_up = bool(fwd_vals)
-            fwd_s = {"t": now, "up": owd_up,
-                     "v": sum(fwd_vals) / len(fwd_vals) if fwd_vals else None}
-            rtn_s = {"t": now, "up": owd_up,
-                     "v": sum(rtn_vals) / len(rtn_vals) if rtn_vals else None}
-            # Pooled-UDP RTT band: the percentile of the pooled samples, not
-            # a mix of per-stream percentiles.
-            if len(pooled) >= 20:
-                pooled.sort()
-                band_s = {"t": now, "up": True,
-                          "lo": pooled[int(0.05 * (len(pooled) - 1))],
-                          "hi": pooled[int(0.95 * (len(pooled) - 1))]}
-            else:
-                band_s = {"t": now, "up": False, "lo": None, "hi": None}
-            # Loss-pattern verdict, cached for snapshot(). Bring-up churn
-            # (probes sent before every stream was up) is excluded so it
-            # can't mislabel the first minute of a run, and the verdict
-            # respects the loss deadband: sub-deadband noise reads as 0
-            # everywhere else on screen (score, loss chart), so the pattern
-            # line must not nag about it either - and scope claims like
-            # "TCP only" need more than a handful of events to mean anything.
-            diag_floor = self.start_time + 10.0
-            floor_events = max(5, int(tx_pps_total * 60.0
-                                      * self.loss_deadband / 100.0))
-            self._loss_pattern = classify_loss_pattern(
-                {name: [t for t in self.stats[sid].recent_losses()
-                        if t > diag_floor]
-                 for sid, proto, port, name in STREAMS},
-                min_events=floor_events)
+            results = []  # (peer, per_sid, fwd_s, rtn_s, band_s)
+            for peer in self.peers:
+                pooled = []
+                for sid in udp_sids:
+                    pooled.extend(self.stats[(peer, sid)].window_rtts())
+                fwd_vals, rtn_vals = [], []
+                per_sid = {}
+                tx_pps_total = 0.0
+                for sid, proto, _port, _name in STREAMS:
+                    snap = self.stats[(peer, sid)].snapshot()
+                    tx_pps_total += snap["tx_pps"]
+                    eff = self.effective_loss(snap["loss"], snap["late"])
+                    r, _, _ = quality_score(snap["latency"], eff, snap["jitter"])
+                    up = snap["connected"]
+                    per_sid[sid] = {
+                        "t": now,
+                        "rtt": snap["rtt_avg"] if up else None,
+                        "loss": eff,
+                        "jitter": snap["jitter"] if up else None,
+                        "score": r if up else None,
+                        "up": up,
+                    }
+                    if sid in udp_sids and up and snap["owd_fwd"] is not None:
+                        fwd_vals.append(snap["owd_fwd"])
+                        rtn_vals.append(snap["owd_rtn"])
+                owd_up = bool(fwd_vals)
+                fwd_s = {"t": now, "up": owd_up,
+                         "v": sum(fwd_vals) / len(fwd_vals) if fwd_vals else None}
+                rtn_s = {"t": now, "up": owd_up,
+                         "v": sum(rtn_vals) / len(rtn_vals) if rtn_vals else None}
+                # Pooled-UDP RTT band: the percentile of the pooled samples,
+                # not a mix of per-stream percentiles.
+                if len(pooled) >= 20:
+                    pooled.sort()
+                    band_s = {"t": now, "up": True,
+                              "lo": pooled[int(0.05 * (len(pooled) - 1))],
+                              "hi": pooled[int(0.95 * (len(pooled) - 1))]}
+                else:
+                    band_s = {"t": now, "up": False, "lo": None, "hi": None}
+                # Loss-pattern verdict, cached for snapshot(). Bring-up churn
+                # (probes sent before every stream was up) is excluded so it
+                # can't mislabel the first minute of a run, and the verdict
+                # respects the loss deadband: sub-deadband noise reads as 0
+                # everywhere else on screen (score, loss chart), so the
+                # pattern line must not nag about it either - and scope
+                # claims like "TCP only" need more than a handful of events
+                # to mean anything.
+                diag_floor = self.start_time + 10.0
+                floor_events = max(5, int(tx_pps_total * 60.0
+                                          * self.loss_deadband / 100.0))
+                self._loss_pattern[peer] = classify_loss_pattern(
+                    {name: [t for t in self.stats[(peer, sid)].recent_losses()
+                            if t > diag_floor]
+                     for sid, proto, port, name in STREAMS},
+                    min_events=floor_events)
+                results.append((peer, per_sid, fwd_s, rtn_s, band_s))
             with self.history_lock:
-                for sid, sample in per_sid.items():
-                    self.history[sid].append(sample)
-                self.owd_hist_f.append(fwd_s)
-                self.owd_hist_r.append(rtn_s)
-                self.band_history.append(band_s)
+                for peer, per_sid, fwd_s, rtn_s, band_s in results:
+                    for sid, sample in per_sid.items():
+                        self.history[(peer, sid)].append(sample)
+                    self.owd_hist_f[peer].append(fwd_s)
+                    self.owd_hist_r[peer].append(rtn_s)
+                    self.band_history[peer].append(band_s)
 
-    def history_copy(self):
+    def history_copy(self, peer=None):
+        peer = peer or self.peer
         with self.history_lock:
-            return {sid: list(dq) for sid, dq in self.history.items()}
+            return {sid: list(self.history[(peer, sid)])
+                    for sid, *_ in STREAMS}
 
-    def extra_history_copy(self):
+    def extra_history_copy(self, peer=None):
         """(owd_fwd, owd_rtn, band) sample lists for the aggregate charts."""
+        peer = peer or self.peer
         with self.history_lock:
-            return (list(self.owd_hist_f), list(self.owd_hist_r),
-                    list(self.band_history))
+            return (list(self.owd_hist_f[peer]), list(self.owd_hist_r[peer]),
+                    list(self.band_history[peer]))
 
-    def snapshot(self):
-        """Return per-stream snapshots + overall aggregate quality."""
+    def snapshot(self, peer=None):
+        """Return per-stream snapshots + overall aggregate quality for one
+        peer pair (the first/only peer by default)."""
+        peer = peer or self.peer
         rows = []
         scores = []
         proto_mos = {"UDP": [], "TCP": []}
@@ -1675,7 +1793,7 @@ class Engine:
         tot_fwd = tot_rtn = 0
         life_tx = life_recv = life_lost = life_late = 0
         for sid, proto, port, name in STREAMS:
-            snap = self.stats[sid].snapshot()
+            snap = self.stats[(peer, sid)].snapshot()
             eff = self.effective_loss(snap["loss"], snap["late"])  # deadbanded impairment
             if proto == "TCP":
                 # TCP gets a Path Quality Index, not MOS: retransmissions show
@@ -1753,9 +1871,10 @@ class Engine:
         udp_silent = (tcp_up and not udp_up
                       and time.monotonic() - self.start_time > 15.0)
         return {
+            "peer": peer,
             "rows": rows,
             "udp_silent": udp_silent,
-            "loss_pattern": self._loss_pattern,  # recomputed 1/s by _sampler
+            "loss_pattern": self._loss_pattern.get(peer),  # 1/s via _sampler
             "overall": overall,
             "udp_mos": udp_mos,
             "udp_score": udp_score,
@@ -1781,10 +1900,10 @@ class Engine:
         with self.history_lock:
             for dq in self.history.values():
                 dq.clear()
-            self.owd_hist_f.clear()
-            self.owd_hist_r.clear()
-            self.band_history.clear()
-        self._loss_pattern = None
+            for hist in (self.owd_hist_f, self.owd_hist_r, self.band_history):
+                for dq in hist.values():
+                    dq.clear()
+        self._loss_pattern = dict.fromkeys(self.peers)
         self.last_reset = time.monotonic()
 
 
@@ -2505,6 +2624,246 @@ def run_gui(engine, args):
 
 
 # ---------------------------------------------------------------------------
+# Mesh GUI (--peers): a row per pair, charts for the selected pair
+# ---------------------------------------------------------------------------
+def run_mesh_gui(engine, args):
+    import tkinter as tk
+
+    view_seconds = float(args.history)
+    series = [(sid, STREAM_COLORS[sid], name.split("-")[1])
+              for sid, proto, port, name in STREAMS]
+    peers = engine.peers
+
+    root = tk.Tk()
+    root.title(f"Network Vitals {__version__}  -  mesh, {len(peers)} peers")
+    root.geometry("1150x760")
+    root.minsize(700, 500)
+    root.configure(bg=BG)
+
+    # ---- header -----------------------------------------------------------
+    header = tk.Frame(root, bg=BG, padx=14, pady=10)
+    header.pack(fill="x", side="top")
+    ekg = tk.Canvas(header, width=54, height=34, bg=BG, highlightthickness=0)
+    ekg.pack(side="left", padx=(0, 10))
+    _draw_ekg(ekg)
+    tk.Label(header, text="Network Vitals — mesh", fg=TXT, bg=BG,
+             font=(FONT, 17, "bold"), anchor="w").pack(side="left")
+    mesh_sub = tk.StringVar(value="")
+    tk.Label(header, textvariable=mesh_sub, fg=TXT_DIM, bg=BG,
+             font=(FONT, 10)).pack(side="left", padx=(16, 0))
+
+    def mkbtn(text, cmd):
+        return tk.Button(header, text=text, command=cmd,
+                         bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                         activeforeground="white", relief="flat", bd=0,
+                         highlightthickness=0, padx=12, pady=5,
+                         font=(FONT, 9, "bold"), cursor="hand2")
+
+    def do_update():
+        open_update_dialog(root, args.update_url,
+                           relaunch_argv=getattr(args, "_argv", None))
+
+    mkbtn("⟳  Update", do_update).pack(side="right")
+    mkbtn("↺  Reset / Clear", engine.reset).pack(side="right", padx=(0, 6))
+
+    # ---- pair matrix: one row per peer, click to select --------------------
+    # Local vantage only (phase 1): this node's half of the full N x N mesh.
+    COLS = [("peer", "Peer", 20, "w"), ("score", "Score", 6, "center"),
+            ("label", "", 10, "w"), ("rtt", "RTT ms", 8, "e"),
+            ("loss", "Loss %", 8, "e"), ("jit", "Jitter", 8, "e"),
+            ("up", "Up", 6, "center"), ("flag", "", 34, "w")]
+    rowsF = tk.Frame(root, bg=BG, padx=12, pady=4)
+    rowsF.pack(fill="x")
+    rowsF.columnconfigure(len(COLS) - 1, weight=1)
+    for c, (key, title, width, anchor) in enumerate(COLS):
+        tk.Label(rowsF, text=title, width=width, anchor=anchor, bg=BG,
+                 fg=HPE_GREEN, font=(FONT, 9, "bold")).grid(
+            row=0, column=c, sticky="nsew", padx=1)
+
+    sel = {"peer": peers[0]}
+    row_widgets = {}
+
+    def select_peer(p):
+        sel["peer"] = p
+        for peer, w in row_widgets.items():
+            on = peer == p
+            w["peer"].configure(text=("▶ " if on else "  ") + peer)
+            for key, lbl in w.items():
+                if key != "score":
+                    lbl.configure(bg=PANEL_HI if on else PANEL)
+
+    for r, p in enumerate(peers, start=1):
+        w = {}
+        for c, (key, _t, width, anchor) in enumerate(COLS):
+            lbl = tk.Label(rowsF, text="", width=width, anchor=anchor,
+                           bg=PANEL, fg=TXT, font=(FONT, 10), pady=4, padx=4)
+            lbl.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
+            lbl.bind("<Button-1>", lambda _e, peer=p: select_peer(peer))
+            lbl.configure(cursor="hand2")
+            w[key] = lbl
+        w["flag"].configure(fg="#ffd27e", font=(FONT, 9))
+        row_widgets[p] = w
+
+    # ---- footer + charts for the selected pair ----------------------------
+    footer = tk.Frame(root, bg=BG, padx=14, pady=6)
+    footer.pack(fill="x", side="bottom")
+    foot_var = tk.StringVar(value="")
+    tk.Label(footer, textvariable=foot_var, fg=TXT_DIM, bg=BG,
+             font=(FONT, 9), anchor="w").pack(fill="x")
+
+    charts = tk.Frame(root, bg=BG, padx=12, pady=6)
+    charts.pack(fill="both", expand=True)
+    charts.columnconfigure(0, weight=1)
+    charts.rowconfigure(0, weight=3, uniform="charts")
+    charts.rowconfigure(1, weight=2, uniform="charts")
+    lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0,
+                           width=100, height=80)
+    lat_canvas.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+    bottom = tk.Frame(charts, bg=BG)
+    bottom.grid(row=1, column=0, sticky="nsew")
+    bottom.rowconfigure(0, weight=1)
+    canvases = []
+    for c in range(3):
+        bottom.columnconfigure(c, weight=1, uniform="bottom")
+        cv = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
+                       width=100, height=80)
+        cv.grid(row=0, column=c, sticky="nsew",
+                padx=((0, 3), (3, 3), (3, 0))[c])
+        canvases.append(cv)
+    loss_canvas, jit_canvas, owd_canvas = canvases
+
+    def refresh_body():
+        worst = None
+        for p in peers:
+            snap = engine.snapshot(p)
+            w = row_widgets[p]
+            t = snap["totals"]
+            if snap["links_up"]:
+                o = snap["overall"]
+                if worst is None or o < worst[0]:
+                    worst = (o, p)
+                live = [r for r in snap["rows"] if r["connected"]]
+                rtt = sum(r["rtt_avg"] for r in live) / len(live)
+                jit = max(r["jitter"] for r in live)
+                w["score"].configure(text=f"{o:.0f}", fg="white",
+                                     bg=score_color(o))
+                w["label"].configure(text=snap["overall_label"])
+                w["rtt"].configure(text=f"{rtt:.1f}")
+                w["jit"].configure(text=f"{jit:.1f}")
+            else:
+                w["score"].configure(text="--", fg=TXT_DIM, bg="#555a61")
+                w["label"].configure(text="no link")
+                w["rtt"].configure(text="-")
+                w["jit"].configure(text="-")
+            w["loss"].configure(text=f"{t['loss_pct']:.2f}")
+            w["up"].configure(text=f"{snap['links_up']}/{len(STREAMS)}")
+            flag = ("⚠ UDP silent — blocked or old peer version"
+                    if snap["udp_silent"] else (snap["loss_pattern"] or ""))
+            w["flag"].configure(text=flag)
+        mesh_sub.set(f"{len(peers)} peers · worst pair: "
+                     f"{worst[1]} ({worst[0]:.0f})" if worst else
+                     f"{len(peers)} peers · waiting for links")
+
+        p = sel["peer"]
+        snap = engine.snapshot(p)
+        t = snap["totals"]
+        up_s = int(snap["uptime"])
+        foot_var.set(
+            f"pair → {p}  ·  {ports_summary()}  ·  frame {snap['frame_size']} B"
+            f"  ·  uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:"
+            f"{up_s % 60:02d}  ·  since reset  sent {t['tx']:,}  "
+            f"recv {t['recv']:,}  lost {t['lost']:,} ({t['loss_pct']:.2f}%)  "
+            f"fwd→ {t['fwd_lost']:,}  rtn← {t['rtn_lost']:,}")
+        hist = engine.history_copy(p)
+        owd_f, owd_r, band_hist = engine.extra_history_copy(p)
+        now = time.monotonic()
+        _draw_chart(lat_canvas, f"Latency (RTT, ms) — {p}", "rtt", series,
+                    hist, view_seconds, now, ymin_floor=2.0, unit="",
+                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}",
+                    band=band_hist, band_label="p5–p95 (UDP)")
+        _draw_chart(loss_canvas, "Loss + late (%)", "loss", series, hist,
+                    view_seconds, now, ymin_floor=2.0, unit="%",
+                    value_fmt=lambda v: f"{v:.0f}")
+        _draw_chart(jit_canvas, "Jitter (ms)", "jitter", series, hist,
+                    view_seconds, now, ymin_floor=1.0, unit="",
+                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
+        _draw_chart(owd_canvas, "One-way drift (ms)", "v",
+                    [("F", HPE_GREEN, "fwd→"), ("R", "#FF8300", "rtn←")],
+                    {"F": owd_f, "R": owd_r},
+                    view_seconds, now, ymin_floor=2.0, unit="",
+                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
+
+    def refresh():
+        try:
+            refresh_body()
+        except tk.TclError:
+            return  # window is being torn down
+        except Exception:
+            traceback.print_exc()
+        try:
+            root.after(args.refresh_ms, refresh)
+        except tk.TclError:
+            pass
+
+    def on_close():
+        engine.shutdown()
+        root.destroy()
+
+    select_peer(peers[0])
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.after(120, refresh)
+    root.mainloop()
+
+
+def run_console_mesh(engine, args):
+    vt = enable_vt_mode()
+    print(f"Network Vitals {__version__}  mesh: {', '.join(engine.peers)}  "
+          f"bind={args.bind}  {ports_summary()}")
+    print("Ctrl-C to stop.\n")
+    try:
+        with ConsoleKeys() as keys:
+            while not engine.stop.is_set():
+                if vt:
+                    print("\033[2J\033[H", end="")
+                else:
+                    os.system("cls" if sys.platform == "win32" else "clear")
+                print(f"  {'Peer':<22}{'Up':>5}{'Score':>7}  {'':<10}"
+                      f"{'RTT ms':>8}{'Loss %':>8}{'Fwd':>6}{'Rtn':>6}")
+                print("  " + "-" * 76)
+                for p in engine.peers:
+                    snap = engine.snapshot(p)
+                    t = snap["totals"]
+                    if snap["links_up"]:
+                        live = [r for r in snap["rows"] if r["connected"]]
+                        rtt = sum(r["rtt_avg"] for r in live) / len(live)
+                        print(f"  {p:<22}{snap['links_up']:>3}/{len(STREAMS)}"
+                              f"{snap['overall']:>7.0f}  "
+                              f"{snap['overall_label']:<10}{rtt:>8.1f}"
+                              f"{t['loss_pct']:>8.2f}{t['fwd_lost']:>6}"
+                              f"{t['rtn_lost']:>6}")
+                    else:
+                        print(f"  {p:<22}  0/{len(STREAMS)}{'--':>7}  "
+                              f"{'no link':<10}{'-':>8}{t['loss_pct']:>8.2f}"
+                              f"{t['fwd_lost']:>6}{t['rtn_lost']:>6}")
+                    warn = ("UDP silent - blocked or old peer version"
+                            if snap["udp_silent"]
+                            else snap["loss_pattern"])
+                    if warn:
+                        print(f"      ! {warn}")
+                if keys.enabled:
+                    print("\n  keys:  [r] reset counters    [q] quit")
+                key = keys.poll(args.refresh_ms / 1000.0)
+                if key == "r":
+                    engine.reset()
+                elif key in ("q", "\x03"):
+                    return
+    except KeyboardInterrupt:
+        pass
+    finally:
+        engine.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # Console UI (fallback when no display / --no-gui)
 # ---------------------------------------------------------------------------
 def enable_vt_mode():
@@ -3053,7 +3412,15 @@ def _launcher_argv(vals):
     if not peer:
         raise ValueError("Peer IP is required - the address of the other "
                          "workstation running Network Vitals.")
-    argv = ["--peer", peer]
+    if "," in peer:
+        # Mesh run: a comma-separated list of peers, one row per pair.
+        try:
+            plist = _peer_list(peer)
+        except argparse.ArgumentTypeError as e:
+            raise ValueError(f"Peers: {e}")
+        argv = ["--peers", ",".join(plist)]
+    else:
+        argv = ["--peer", peer]
 
     size = num("Probe size", vals["size"], int, HEADER_LEN, MAX_SIZE)
     if size != 200:
@@ -3094,6 +3461,9 @@ def _launcher_argv(vals):
     if refresh != 500:
         argv += ["--refresh-ms", str(refresh)]
     if vals["vxlan"]:
+        if argv[0] == "--peers":
+            raise ValueError("VXLAN with multiple peers is not supported yet "
+                             "- untick VXLAN or use a single peer.")
         argv += ["--vxlan"]
         vni = num("VXLAN VNI", vals["vxlan_vni"], int, 0, 0xFFFFFF)
         if vni != VXLAN_DEFAULT_VNI:
@@ -3532,7 +3902,7 @@ def run_launcher(update_url=UPDATE_URL):
                     f"addresses, or leave 0.0.0.0 for all interfaces.",
                     parent=root)
                 return
-        peer = vals["peer"]
+        peer = vals["peer"].split(",")[0].strip()  # mesh: check the first
         try:
             socket.inet_aton(peer)      # numeric IPv4: no lookup needed
         except OSError:
@@ -3570,7 +3940,7 @@ def run_launcher(update_url=UPDATE_URL):
     def _tool_target(what):
         """Common peer/ports validation for the one-shot tools."""
         vals = collect()
-        peer = vals["peer"]
+        peer = vals["peer"].split(",")[0].strip()  # tools target one peer
         if not peer:
             messagebox.showerror("Network Vitals",
                                  f"Peer IP is required for a {what}.",
@@ -3627,6 +3997,17 @@ def run_launcher(update_url=UPDATE_URL):
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
+def _peer_list(text):
+    """Parse 'A,B,C' into a list of peer address strings."""
+    peers = [p.strip() for p in text.split(",") if p.strip()]
+    if not peers:
+        raise argparse.ArgumentTypeError(
+            "expected a comma-separated list of peer addresses")
+    if len(set(peers)) != len(peers):
+        raise argparse.ArgumentTypeError("duplicate peer in --peers")
+    return peers
+
+
 def _mbps_list(text):
     """Parse '1,5,25' into a list of per-stage Mbps floats."""
     try:
@@ -3670,6 +4051,18 @@ def parse_args(argv=None):
                         "(default: the netvitals GitHub repo).")
     p.add_argument("--peer", default=None,
                    help="IP address of the other workstation.")
+    p.add_argument("--peers", type=_peer_list, default=None, metavar="A,B,...",
+                   help="Comma-separated peer addresses for a MESH run: this "
+                        "node probes every listed peer at once and the GUI "
+                        "shows a row per pair. Every node runs with its own "
+                        "list of the other nodes. Mutually exclusive with "
+                        "--peer; not yet supported with --vxlan.")
+    p.add_argument("--tcp-pps", type=int, default=None, metavar="N",
+                   help="TCP probes per second per stream (default: same as "
+                        "--pps). The UDP default of 50 pps deliberately "
+                        "matches G.711 voice cadence (20 ms packetization); "
+                        "TCP models an interactive app, so tune it "
+                        "independently if desired.")
     p.add_argument("--bind", default="0.0.0.0",
                    help="Local address to bind/listen on (default: all interfaces).")
     p.add_argument("--udp-ports", type=_port_pair, default=DEFAULT_UDP_PORTS,
@@ -3921,12 +4314,13 @@ def run_burst_test(args, out=print):
                 seq[0] += 1
                 ns = time.monotonic_ns()
                 pkt = build_packet(TYPE_TEST, 0, seq[0], ns, size)
+                pending[seq[0]] = ns  # register first: echoes race the GIL
                 try:
                     sock.sendto(pkt, (peer, port))
                 except (BlockingIOError, OSError):
+                    pending.pop(seq[0], None)
                     carry = min(carry, 1.0)  # local backpressure: don't pile up
                     break
-                pending[seq[0]] = ns
                 sent += 1
                 carry -= 1.0
             drain()
@@ -4011,6 +4405,15 @@ def main(argv=None):
     if args.update or args.check_update:
         return perform_update(args.update_url, apply=args.update)
 
+    # Normalize --peers early: args.peer stays the first peer so every
+    # single-peer code path (footer, sweep/burst targets) keeps working.
+    if args.peers:
+        if args.peer:
+            print("error: use either --peer or --peers, not both",
+                  file=sys.stderr)
+            return 2
+        args.peer = args.peers[0]
+
     if not args.peer:
         # No peer given: open the graphical launcher (the double-click
         # experience) unless it's explicitly disabled or plainly can't work.
@@ -4037,6 +4440,8 @@ def main(argv=None):
     args.size = max(HEADER_LEN, min(args.size, MAX_SIZE))
     if args.pps < 1:
         args.pps = 1
+    if args.tcp_pps is not None and args.tcp_pps < 1:
+        args.tcp_pps = 1
 
     vxlan = None
     if args.vxlan:
@@ -4051,6 +4456,10 @@ def main(argv=None):
                   f"(encap headers must fit in the outer datagram).",
                   file=sys.stderr)
             args.size = VXLAN_MAX_PROBE
+        if args.peers and len(args.peers) > 1:
+            print("error: --vxlan with multiple --peers is not supported yet "
+                  "(roadmap: static-FIB VXLAN mesh).", file=sys.stderr)
+            return 2
         vxlan = {"vni": args.vxlan_vni, "port": args.vxlan_port}
 
     # Apply chosen ports (read as a module global by the engine and UI).
@@ -4076,7 +4485,8 @@ def main(argv=None):
         engine = Engine(args.peer, args.bind, args.size, args.pps, args.window,
                         args.timeout, history_seconds=args.history,
                         loss_deadband=args.loss_deadband,
-                        dont_fragment=args.dont_fragment, vxlan=vxlan)
+                        dont_fragment=args.dont_fragment, vxlan=vxlan,
+                        peers=args.peers, tcp_pps=args.tcp_pps)
         try:
             engine.start()
             last_err = None
@@ -4108,15 +4518,18 @@ def main(argv=None):
             use_gui = False
             print("Tkinter not available - falling back to console UI.", file=sys.stderr)
 
+    mesh = len(engine.peers) > 1
+    gui_fn = run_mesh_gui if mesh else run_gui
+    con_fn = run_console_mesh if mesh else run_console
     try:
         if use_gui:
             try:
-                run_gui(engine, args)
+                gui_fn(engine, args)
             except Exception as e:  # e.g. no display on a headless host
                 print(f"GUI unavailable ({e}) - falling back to console UI.", file=sys.stderr)
-                run_console(engine, args)
+                con_fn(engine, args)
         else:
-            run_console(engine, args)
+            con_fn(engine, args)
     finally:
         engine.shutdown()
         clear_timer_resolution(1)
