@@ -86,6 +86,17 @@ and the loss chart. (The lifetime totals always show the true raw counts.)
 
 ## Hardening & behavior notes
 
+- **The measurement must not disturb the measured** (1.5.1). 1.5.0's one-way
+  drift bookkeeping scanned minutes of samples *while holding the per-stream
+  lock the receive threads need*, and its history sampler did its arithmetic
+  under the chart-history lock. On busy hosts the stalls clumped the echo
+  path into microbursts — visible as slowly growing jitter / p95 band and
+  scattered **return-dominant loss on both ends of a clean path**. 1.5.1
+  makes all hot-lock work O(small-constant) (bucketed minima instead of
+  scans, sampling computed outside the locks, the loss-pattern verdict cached
+  once per second) and decimates the band polygon. If 1.5.0 showed your
+  clean path as lossy, update both ends and re-check before blaming the
+  network.
 - **Start order doesn't matter.** On Windows, probing a peer whose app isn't
   running yet used to kill the UDP receive thread (ICMP Port Unreachable
   surfaces as a socket error); this is now suppressed and either side can be
