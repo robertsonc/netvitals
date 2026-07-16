@@ -86,6 +86,20 @@ and the loss chart. (The lifetime totals always show the true raw counts.)
 
 ## Hardening & behavior notes
 
+- **Echoes can outrun the bookkeeping** (1.6.0). Probes were registered as
+  "in flight" *after* the transmit call - but send syscalls release the GIL,
+  so on a fast path (or under scheduler stalls) the echo could arrive and be
+  processed *before* the sending thread ran again; the unrecognized echo was
+  discarded as a duplicate and the probe read as **return loss** two seconds
+  later. This produced a small, scattered, return-dominant loss trickle on
+  perfectly clean paths - worse on loaded hosts and in mesh mode (every
+  version up to 1.5.2 had it). Probes are now registered before transmit;
+  a three-node loopback mesh measures **0.00%** where it read 1-3% before.
+- **The PQI handshake sampler no longer disrupts the reflector** (1.6.0).
+  The every-15 s throwaway TCP handshake used to be adopted as "the peer
+  reconnected", closing the LIVE reflector connection and killing the probes
+  buffered on it. A connection now becomes the reflector only after it
+  delivers a real probe.
 - **The measurement must not disturb the measured** (1.5.1). 1.5.0's one-way
   drift bookkeeping scanned minutes of samples *while holding the per-stream
   lock the receive threads need*, and its history sampler did its arithmetic
@@ -352,6 +366,11 @@ Bad below.
 ```
 --peer IP          the other workstation's IP (required on the command line;
                    without it the graphical launch window opens instead)
+--peers A,B,...    MESH: probe every listed peer at once (see "Mesh mode");
+                   each node runs with its own list of the other nodes
+--tcp-pps N        TCP probes/s per stream (default: same as --pps; the UDP
+                   50 pps default deliberately matches G.711 voice cadence,
+                   TCP models an interactive app - tune independently)
 --bind ADDR        local address to bind/listen on (default 0.0.0.0)
 --udp-ports A,B    the two UDP ports (default 30201,30202)
 --tcp-ports A,B    the two TCP ports (default 30101,30102)
@@ -629,6 +648,39 @@ Notes:
 - `--mtu-sweep` still measures the *native* path MTU; subtract the overhead
   above to know the largest probe that fits encapsulated.
 
+## Mesh mode (`--peers`)
+
+With three or more endpoints, run every node with a comma-separated list of
+the **other** nodes (the launcher's peer field accepts the same list):
+
+```
+node A:  python netquality.py --peers 10.0.0.2,10.0.0.3
+node B:  python netquality.py --peers 10.0.0.1,10.0.0.3
+node C:  python netquality.py --peers 10.0.0.1,10.0.0.2
+```
+
+Each node probes every listed peer with the full four-stream suite - the
+same ports serve all peers (inbound traffic is demuxed by source address,
+and only configured peers are answered), so the firewall story is unchanged.
+The mesh GUI shows **a row per pair** - score tile, label, RTT, loss,
+jitter, streams-up, and the UDP-silent / loss-pattern flag - with the header
+naming the current **worst pair**. Click a row to point the four charts
+(latency + band, loss, jitter, one-way drift) and the footer at that pair;
+the console UI prints the same table. Loss isolation, size verification and
+scoring are all per pair.
+
+Notes:
+
+- This is each node's **local half** of the full N×N mesh (phase 1); the
+  cross-node matrix and common-endpoint auto-diagnosis are on the roadmap.
+- A **hub/star** layout works today by simply giving the spokes only the
+  hub in their list.
+- `--vxlan` is single-peer for now (the static-FIB VXLAN mesh is roadmap
+  phase 2), and the one-shot tools (MTU sweep, burst test) target the first
+  peer in the list.
+- Probe load scales with the peer count: N peers = N × the usual per-pair
+  rate (at defaults, ~80 KB/s each way per peer).
+
 ## Windows firewall
 
 The first time you run it, Windows may prompt to allow Python through the
@@ -704,9 +756,9 @@ to close that gap, roughly in order:
    qWAVE API (`QOSAddSocketToFlow`), whose non-admin path only offers the
    traffic-type-mapped code points — needs a spike before committing to UX.
 9. **Point-to-multipoint / full mesh** (3-6 endpoints), phased:
-   1. multi-peer engine (per-pair stats, peer-set filters) + an **N×N mesh
-      matrix** view — cells colored by score/loss/RTT, click to drill into
-      the pair's dashboard;
+   1. ~~multi-peer engine (per-pair stats, peer-set filters) + a per-pair
+      mesh view — a row per pair, click to drill into the pair's charts~~
+      — **shipped in 1.6.0** (`--peers`, see *Mesh mode*);
    2. **static-FIB VXLAN mesh** transport: each node's single outer UDP
       socket talks to all peers, demuxed by outer source IP, inner MAC/IP
       per node derived from a node index — a genuine static VXLAN full mesh,
