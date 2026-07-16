@@ -46,7 +46,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.5.0"
+__version__ = "1.5.1"
 
 # Where --update / --check-update look for the latest release of this file.
 # Override with --update-url (or keep a fork's URL here).
@@ -309,12 +309,19 @@ class StreamStats:
         # forward = peer_clock_at_echo - my_clock_at_send, return = my_clock_at
         # _receive - peer_clock_at_echo. Both contain the unknown clock offset
         # (equal and opposite), so only their movement means anything: the
-        # drift of each against its min over this deque shows which DIRECTION
-        # is queueing. The deque spans ~60 s: long enough that a congestion
-        # episode can't drag the baseline up with it, short enough that
-        # relative clock slew (tens of ppm => ~1 ms/min) stays negligible.
-        self.owd_samples = deque()    # (t_mono, fwd_rel_ms, rtn_rel_ms)
+        # drift of each against its min over ~60 s shows which DIRECTION is
+        # queueing (long enough that a congestion episode can't drag the
+        # baseline up with it, short enough that relative clock slew at tens
+        # of ppm => ~1 ms/min stays negligible). Kept as 5 s bucket minima +
+        # a short raw tail, NOT raw samples: this lock is shared with the
+        # receive threads, so snapshot() must never scan minutes of samples
+        # while echoes wait (1.5.0 did, and the stall clumped the echo path
+        # into microbursts that read as return loss on busy hosts).
+        self.owd_recent = deque(maxlen=15)   # last few (fwd_rel, rtn_rel)
+        self.owd_buckets = deque()           # (bucket_end_mono, min_f, min_r)
+        self.owd_bucket_s = 5.0
         self.owd_horizon = max(window, 60.0)
+        self._owd_count = 0
 
         # Loss-pattern diagnostics: when each lost probe was reaped, kept for
         # ~60 s so the engine can classify recent loss as bursty vs scattered
@@ -447,8 +454,20 @@ class StreamStats:
                 self.rtt_samples.append((now_w, rtt))
                 if peer_ns:
                     # Relative one-way delays (offset included; see __init__).
-                    self.owd_samples.append((now_w, (peer_ns - ts_ns) / 1e6,
-                                             (now_ns - peer_ns) / 1e6))
+                    f = (peer_ns - ts_ns) / 1e6
+                    r = (now_ns - peer_ns) / 1e6
+                    self.owd_recent.append((f, r))
+                    self._owd_count += 1
+                    if (not self.owd_buckets
+                            or now_w >= self.owd_buckets[-1][0]):
+                        self.owd_buckets.append(
+                            [now_w + self.owd_bucket_s, f, r])
+                    else:
+                        bkt = self.owd_buckets[-1]
+                        if f < bkt[1]:
+                            bkt[1] = f
+                        if r < bkt[2]:
+                            bkt[2] = r
                 self.cum_recv += 1
                 self.life_recv += 1
                 if self.last_rtt is not None:
@@ -541,20 +560,18 @@ class StreamStats:
             rtn_lost = max(0, self.cum_lost - fwd_lost)
             fwd_pct = (fwd_lost / self.cum_tx * 100.0) if self.cum_tx else 0.0
             rtn_pct = (rtn_lost / self.cum_tx * 100.0) if self.cum_tx else 0.0
-            # One-way drift per direction: median of the last ~1.5 s of
-            # relative delays, above each direction's min over the deque.
-            # The unknown clock offset cancels in the subtraction.
+            # One-way drift per direction: median of the last few relative
+            # delays, above each direction's min over the ~60 s of bucket
+            # minima. The unknown clock offset cancels in the subtraction.
+            # O(few dozen) on purpose - this lock stalls the receive threads.
             owd_fwd = owd_rtn = None
-            if len(self.owd_samples) >= 5:
-                recent_f = sorted(f for t, f, _ in self.owd_samples
-                                  if t > now - 1.5)
-                recent_r = sorted(r for t, _, r in self.owd_samples
-                                  if t > now - 1.5)
-                if recent_f:
-                    base_f = min(f for _, f, _ in self.owd_samples)
-                    base_r = min(r for _, _, r in self.owd_samples)
-                    owd_fwd = max(0.0, recent_f[len(recent_f) // 2] - base_f)
-                    owd_rtn = max(0.0, recent_r[len(recent_r) // 2] - base_r)
+            if self._owd_count >= 5 and self.owd_buckets and self.owd_recent:
+                base_f = min(b[1] for b in self.owd_buckets)
+                base_r = min(b[2] for b in self.owd_buckets)
+                recent_f = sorted(f for f, _ in self.owd_recent)
+                recent_r = sorted(r for _, r in self.owd_recent)
+                owd_fwd = max(0.0, recent_f[len(recent_f) // 2] - base_f)
+                owd_rtn = max(0.0, recent_r[len(recent_r) // 2] - base_r)
             return {
                 "connected": connected,
                 "rtt_avg": avg,
@@ -613,7 +630,9 @@ class StreamStats:
             self.state.clear()
             self.pending.clear()
             self.connect_samples.clear()
-            self.owd_samples.clear()
+            self.owd_recent.clear()
+            self.owd_buckets.clear()
+            self._owd_count = 0
             self.loss_events.clear()
             self.jitter = 0.0
             self.last_rtt = None
@@ -640,8 +659,8 @@ class StreamStats:
             _, seq = self.resolved_order.popleft()
             self.state.pop(seq, None)
         owd_h = now - self.owd_horizon
-        while self.owd_samples and self.owd_samples[0][0] < owd_h:
-            self.owd_samples.popleft()
+        while self.owd_buckets and self.owd_buckets[0][0] < owd_h:
+            self.owd_buckets.popleft()
         diag_h = now - self.diag_horizon
         while self.loss_events and self.loss_events[0] < diag_h:
             self.loss_events.popleft()
@@ -1530,10 +1549,15 @@ class Engine:
         # Per-second history ring buffer per stream, for the live/history charts.
         self.history = {cfg[0]: deque(maxlen=history_seconds + 2) for cfg in STREAMS}
         # Aggregate histories: directional one-way drift (mean over the live
-        # UDP streams) and the pooled-UDP RTT p5-p95 band for the latency chart.
-        self.owd_history = deque(maxlen=history_seconds + 2)
+        # UDP streams, stored per direction ready for the chart) and the
+        # pooled-UDP RTT p5-p95 band for the latency chart.
+        self.owd_hist_f = deque(maxlen=history_seconds + 2)
+        self.owd_hist_r = deque(maxlen=history_seconds + 2)
         self.band_history = deque(maxlen=history_seconds + 2)
         self.history_lock = threading.Lock()
+        # Loss-pattern verdict, recomputed once per second by the sampler so
+        # the GUI's snapshot() calls don't churn the stream locks for it.
+        self._loss_pattern = None
         for cfg in STREAMS:
             sid, proto, port, name = cfg
             st = StreamStats(window=window, timeout=timeout, target_pps=pps)
@@ -1563,57 +1587,74 @@ class Engine:
         return 0.0 if eff < self.loss_deadband else eff
 
     def _sampler(self):
-        """Append one history sample per stream every second."""
+        """Append one history sample per stream every second.
+
+        Everything is computed FIRST and history_lock is taken only for the
+        appends: the GUI thread holds that lock while copying histories, and
+        the per-stream stats locks (taken inside snapshot()) gate the receive
+        threads - neither may wait on this thread's arithmetic."""
         udp_sids = {sid for sid, proto, _p, _n in STREAMS if proto == "UDP"}
         while not self.stop.wait(1.0):
             now = time.monotonic()  # chart X axis; immune to NTP steps
-            fwd_vals, rtn_vals = [], []
             pooled = []
             for sid in udp_sids:
                 pooled.extend(self.stats[sid].window_rtts())
+            fwd_vals, rtn_vals = [], []
+            per_sid = {}
+            for sid, proto, _port, _name in STREAMS:
+                snap = self.stats[sid].snapshot()
+                eff = self.effective_loss(snap["loss"], snap["late"])
+                r, _, _ = quality_score(snap["latency"], eff, snap["jitter"])
+                up = snap["connected"]
+                per_sid[sid] = {
+                    "t": now,
+                    "rtt": snap["rtt_avg"] if up else None,
+                    "loss": eff,
+                    "jitter": snap["jitter"] if up else None,
+                    "score": r if up else None,
+                    "up": up,
+                }
+                if sid in udp_sids and up and snap["owd_fwd"] is not None:
+                    fwd_vals.append(snap["owd_fwd"])
+                    rtn_vals.append(snap["owd_rtn"])
+            owd_up = bool(fwd_vals)
+            fwd_s = {"t": now, "up": owd_up,
+                     "v": sum(fwd_vals) / len(fwd_vals) if fwd_vals else None}
+            rtn_s = {"t": now, "up": owd_up,
+                     "v": sum(rtn_vals) / len(rtn_vals) if rtn_vals else None}
+            # Pooled-UDP RTT band: the percentile of the pooled samples, not
+            # a mix of per-stream percentiles.
+            if len(pooled) >= 20:
+                pooled.sort()
+                band_s = {"t": now, "up": True,
+                          "lo": pooled[int(0.05 * (len(pooled) - 1))],
+                          "hi": pooled[int(0.95 * (len(pooled) - 1))]}
+            else:
+                band_s = {"t": now, "up": False, "lo": None, "hi": None}
+            # Loss-pattern verdict, cached for snapshot(). Bring-up churn
+            # (probes sent before every stream was up) is excluded so it
+            # can't mislabel the first minute of a run.
+            diag_floor = self.start_time + 10.0
+            self._loss_pattern = classify_loss_pattern(
+                {name: [t for t in self.stats[sid].recent_losses()
+                        if t > diag_floor]
+                 for sid, proto, port, name in STREAMS})
             with self.history_lock:
-                for sid in self.history:
-                    snap = self.stats[sid].snapshot()
-                    eff = self.effective_loss(snap["loss"], snap["late"])
-                    r, _, _ = quality_score(snap["latency"], eff, snap["jitter"])
-                    up = snap["connected"]
-                    self.history[sid].append({
-                        "t": now,
-                        "rtt": snap["rtt_avg"] if up else None,
-                        "loss": eff,
-                        "jitter": snap["jitter"] if up else None,
-                        "score": r if up else None,
-                        "up": up,
-                    })
-                    if sid in udp_sids and up and snap["owd_fwd"] is not None:
-                        fwd_vals.append(snap["owd_fwd"])
-                        rtn_vals.append(snap["owd_rtn"])
-                self.owd_history.append({
-                    "t": now, "up": bool(fwd_vals),
-                    "fwd": sum(fwd_vals) / len(fwd_vals) if fwd_vals else None,
-                    "rtn": sum(rtn_vals) / len(rtn_vals) if rtn_vals else None,
-                })
-                # Pooled-UDP RTT band: the percentile of the pooled samples,
-                # not a mix of per-stream percentiles.
-                if len(pooled) >= 20:
-                    pooled.sort()
-                    self.band_history.append({
-                        "t": now, "up": True,
-                        "lo": pooled[int(0.05 * (len(pooled) - 1))],
-                        "hi": pooled[int(0.95 * (len(pooled) - 1))],
-                    })
-                else:
-                    self.band_history.append({"t": now, "up": False,
-                                              "lo": None, "hi": None})
+                for sid, sample in per_sid.items():
+                    self.history[sid].append(sample)
+                self.owd_hist_f.append(fwd_s)
+                self.owd_hist_r.append(rtn_s)
+                self.band_history.append(band_s)
 
     def history_copy(self):
         with self.history_lock:
             return {sid: list(dq) for sid, dq in self.history.items()}
 
     def extra_history_copy(self):
-        """(owd_history, band_history) lists for the aggregate charts."""
+        """(owd_fwd, owd_rtn, band) sample lists for the aggregate charts."""
         with self.history_lock:
-            return list(self.owd_history), list(self.band_history)
+            return (list(self.owd_hist_f), list(self.owd_hist_r),
+                    list(self.band_history))
 
     def snapshot(self):
         """Return per-stream snapshots + overall aggregate quality."""
@@ -1702,16 +1743,10 @@ class Engine:
         udp_up = any(r["proto"] == "UDP" and r["connected"] for r in rows)
         udp_silent = (tcp_up and not udp_up
                       and time.monotonic() - self.start_time > 15.0)
-        # Ignore bring-up churn: probes sent before every stream was up read
-        # as loss and would mislabel the first minute of every run.
-        diag_floor = self.start_time + 10.0
-        loss_pattern = classify_loss_pattern(
-            {name: [t for t in self.stats[sid].recent_losses() if t > diag_floor]
-             for sid, proto, port, name in STREAMS})
         return {
             "rows": rows,
             "udp_silent": udp_silent,
-            "loss_pattern": loss_pattern,
+            "loss_pattern": self._loss_pattern,  # recomputed 1/s by _sampler
             "overall": overall,
             "udp_mos": udp_mos,
             "udp_score": udp_score,
@@ -1737,8 +1772,10 @@ class Engine:
         with self.history_lock:
             for dq in self.history.values():
                 dq.clear()
-            self.owd_history.clear()
+            self.owd_hist_f.clear()
+            self.owd_hist_r.clear()
             self.band_history.clear()
+        self._loss_pattern = None
         self.last_reset = time.monotonic()
 
 
@@ -1850,27 +1887,32 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
 
     # percentile band (behind the series lines; gaps where the link was down)
     if band:
-        seg_top, seg_bot = [], []
-
-        def _flush_band():
-            if len(seg_top) >= 4:
-                bot_xy = list(zip(seg_bot[0::2], seg_bot[1::2]))
-                pts = seg_top + [c for xy in reversed(bot_xy) for c in xy]
-                canvas.create_polygon(*pts, fill=BAND_FILL, outline="",
-                                      stipple="gray50")
-            del seg_top[:], seg_bot[:]
-
+        runs, cur = [], []
         for s in band:
             if s["t"] < t0:
                 continue
             lo, hi = s.get("lo"), s.get("hi")
             if lo is None or hi is None or not s["up"]:
-                _flush_band()
+                if cur:
+                    runs.append(cur)
+                    cur = []
                 continue
-            x = X(s["t"])
-            seg_top.extend((x, Y(hi)))
-            seg_bot.extend((x, Y(lo)))
-        _flush_band()
+            cur.append((s["t"], lo, hi))
+        if cur:
+            runs.append(cur)
+        for run in runs:
+            # Decimate long runs: stippled polygons are the priciest thing on
+            # these canvases and ~200 vertices per edge is visually identical.
+            step = max(1, len(run) // 200)
+            pts = run[::step]
+            if pts[-1] is not run[-1]:
+                pts.append(run[-1])
+            if len(pts) < 2:
+                continue
+            top = [c for tt, lo, hi in pts for c in (X(tt), Y(hi))]
+            bot = [c for tt, lo, hi in reversed(pts) for c in (X(tt), Y(lo))]
+            canvas.create_polygon(*top, *bot, fill=BAND_FILL, outline="",
+                                  stipple="gray50")
 
     # X axis time labels
     for frac, lbl in ((0.0, f"-{int(view_seconds)}s"),
@@ -2408,7 +2450,7 @@ def run_gui(engine, args):
                     size_cell))
 
         hist = engine.history_copy()
-        owd_hist, band_hist = engine.extra_history_copy()
+        owd_f, owd_r, band_hist = engine.extra_history_copy()
         now = time.monotonic()  # history samples are stamped with monotonic time
         _draw_chart(lat_canvas, "Latency (RTT, ms)", "rtt", series, hist,
                     view_seconds, now, ymin_floor=2.0, unit="",
@@ -2425,10 +2467,7 @@ def run_gui(engine, args):
         # clocks' unknown offset cancels, so only the MOVEMENT is meaningful.
         _draw_chart(owd_canvas, "One-way drift (ms)", "v",
                     [("F", HPE_GREEN, "fwd→"), ("R", "#FF8300", "rtn←")],
-                    {"F": [{"t": s["t"], "up": s["up"], "v": s["fwd"]}
-                           for s in owd_hist],
-                     "R": [{"t": s["t"], "up": s["up"], "v": s["rtn"]}
-                           for s in owd_hist]},
+                    {"F": owd_f, "R": owd_r},
                     view_seconds, now, ymin_floor=2.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
 
