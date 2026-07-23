@@ -4,6 +4,7 @@ fail-closed install. Uses an ephemeral key and temp targets; the real netquality
 never touched."""
 import hashlib
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -68,7 +69,10 @@ class TestSignedUpdate(unittest.TestCase):
             sig = sig[:-1] + bytes([sig[-1] ^ 0xFF])
         with open(os.path.join(rel, "manifest.json.sig"), "wb") as fh:
             fh.write(sig)
-        return "file://" + os.path.join(rel, "manifest.json"), art
+        # as_uri() builds a valid file:// URL on every platform (on Windows a
+        # bare "file://" + r"D:\...\manifest.json" makes urllib read the drive
+        # letter as the host and open nothing).
+        return pathlib.Path(os.path.join(rel, "manifest.json")).as_uri(), art
 
     def test_verify_roundtrip(self):
         msg = b"network vitals payload"
