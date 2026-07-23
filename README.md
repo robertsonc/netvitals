@@ -289,6 +289,32 @@ python netquality.py --bind 127.0.0.1 --peer 127.0.0.2 --no-gui
 python netquality.py --bind 127.0.0.2 --peer 127.0.0.1 --no-gui
 ```
 
+### Automated tests
+
+The suite is plain `unittest` (no third-party test deps) and runs headless — no
+peer, no sockets, no display needed:
+
+```
+python -m unittest discover -s tests -v
+```
+
+It covers the three things that can silently break without a running peer:
+
+- **Self-update** (`test_update.py`) — signed-manifest verification, version
+  monotonicity, and fail-closed install (needs `openssl` on `PATH`; those cases
+  skip if it is missing).
+- **Launcher / UI glue** (`test_launcher.py`) — the launch-window form → CLI
+  argv translation, field validators, and settings persistence. This is the
+  testable core of the GUI; the Tk widgets themselves still need the manual
+  smoke run above.
+- **Scoring & wire logic** (`test_scoring.py`) — the E-model/PQI scores and the
+  label/colour bands, loss-pattern and loss-direction diagnostics the dashboard
+  renders, and the packet build/parse round-trip.
+
+CI (GitHub Actions, `.github/workflows/ci.yml`) runs the same suite on every
+push and pull request across Python 3.8–3.12 on Linux plus Windows and macOS,
+with a flake8 lint pass.
+
 ## How it works
 
 Every packet is a fixed-size **probe** carrying a stream id, a sequence number,
