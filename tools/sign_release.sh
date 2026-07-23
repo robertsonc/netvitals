@@ -10,6 +10,10 @@
 # Usage:
 #   tools/sign_release.sh <version> <path/to/netquality.py> <private-key.pem> [outdir]
 #
+# If the private key is passphrase-protected (it should be), openssl prompts for it here.
+# After signing, the result is verified against the matching public key - the sibling
+# *_pub.pem next to the private key, or $NV_RELEASE_PUB.
+#
 # Produces in <outdir> (default: ./release):
 #   netquality.py        the artifact clients download
 #   manifest.json        {version, artifact, sha256}   (canonical, no trailing newline)
@@ -50,11 +54,28 @@ printf '{"version":"%s","artifact":"netquality.py","sha256":"%s"}' "$VERSION" "$
 
 openssl dgst -sha256 -sign "$KEY" -out "$OUT/manifest.json.sig" "$OUT/manifest.json"
 
+# Verify what we just produced, before anyone publishes it. Prefer a public key FILE: it
+# needs no passphrase, and checking against the same key material that is embedded in the
+# app is the property that actually matters. Default to the sibling *_pub.pem next to the
+# private key; override with NV_RELEASE_PUB.
+PUB="${NV_RELEASE_PUB:-${KEY%priv.pem}pub.pem}"
+if [ -f "$PUB" ]; then
+  if ! openssl dgst -sha256 -verify "$PUB" -signature "$OUT/manifest.json.sig" "$OUT/manifest.json"; then
+    rm -f "$OUT/manifest.json.sig"
+    echo "refusing: signature does not verify against $PUB (signature discarded)" >&2
+    exit 1
+  fi
+  echo "  verified against $PUB"
+else
+  echo "note: no public key at $PUB, skipping the self-check. Verify manually:" >&2
+  echo "  openssl dgst -sha256 -verify <(openssl rsa -in $KEY -pubout 2>/dev/null) \\" >&2
+  echo "    -signature $OUT/manifest.json.sig $OUT/manifest.json" >&2
+fi
+
+echo
 echo "Signed release written to $OUT/"
 echo "  version : $VERSION"
 echo "  sha256  : $SHA"
 echo "  files   : netquality.py  manifest.json  manifest.json.sig"
 echo
-echo "Verify locally before publishing:"
-echo "  openssl dgst -sha256 -verify <(openssl rsa -in $KEY -pubout 2>/dev/null) \\"
-echo "    -signature $OUT/manifest.json.sig $OUT/manifest.json"
+echo "Publish all three as the GitHub release assets for v$VERSION."

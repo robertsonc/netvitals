@@ -56,25 +56,46 @@ is a strict comparison against the fully reconstructed padded block. It interope
 
 ## Signing a release
 
-On a trusted, offline machine that holds the private key:
+On the trusted machine that holds the private key:
 
 ```
-tools/sign_release.sh <version> path/to/netquality.py path/to/private-key.pem release/
+tools/sign_release.sh <version> path/to/netquality.py ~/.config/netvitals/netvitals_release_priv.pem release/
 ```
 
-Publish `release/netquality.py`, `release/manifest.json`, and `release/manifest.json.sig`
-as the GitHub release assets for that version.
+openssl prompts for the key passphrase. The script then verifies its own signature against
+the matching public key (the sibling `*_pub.pem`, or `$NV_RELEASE_PUB`) and discards the
+signature if it does not check out. Publish `release/netquality.py`,
+`release/manifest.json`, and `release/manifest.json.sig` as the GitHub release assets for
+that version — the pinned `UPDATE_URL` resolves to the *latest* release, so a release is
+only live for clients once all three assets are attached.
 
 ## Key management
 
-- **Generate** a release keypair once, offline:
+- **Generate** a release keypair once, on a trusted machine, passphrase-protected:
   ```
-  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out netvitals_release_priv.pem
-  openssl rsa -in netvitals_release_priv.pem -pubout -out netvitals_release_pub.pem
+  mkdir -p ~/.config/netvitals && chmod 700 ~/.config/netvitals
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -aes-256-cbc \
+    -out ~/.config/netvitals/netvitals_release_priv.pem
+  chmod 600 ~/.config/netvitals/netvitals_release_priv.pem
+  openssl rsa -in ~/.config/netvitals/netvitals_release_priv.pem \
+    -pubout -out ~/.config/netvitals/netvitals_release_pub.pem
   ```
-- **Embed** the public key: paste `netvitals_release_pub.pem` into `UPDATE_PUBKEY` in
-  `netquality.py`. The public key is safe to commit; **the private key must never be
-  committed.**
-- The value shipped in this repo is a **placeholder/dev key** — replace it with your own
-  before relying on the update channel. Until you do, updates fail closed, which is the
-  safe state.
+  Keep the key **outside the repo** — `.gitignore` also blocks `*.pem` as a backstop, but
+  the real protection is that it never lives in the working tree. Back up the private key
+  and its passphrase separately (password manager / offline media): losing either means you
+  can no longer ship an update that existing installs will accept, and the only recovery is
+  re-installing every client by hand.
+- **Embed** the public key: paste the contents of `netvitals_release_pub.pem` into
+  `UPDATE_PUBKEY` in `netquality.py`. The public key is safe to commit; **the private key
+  must never be committed.**
+- **Rotation / compromise.** Clients trust exactly the key compiled into the copy they are
+  running, so a new key only reaches them via an update signed with the *old* one. To
+  rotate: embed the new public key, sign that release with the old private key, let it roll
+  out, and only then sign with the new key. If the private key leaks there is no revocation
+  path in this design — anyone holding it can sign an update every client will execute, so
+  treat a leak as requiring a manually distributed build.
+- **Verifying what a client will trust**, without the private key:
+  ```
+  openssl dgst -sha256 -verify ~/.config/netvitals/netvitals_release_pub.pem \
+    -signature release/manifest.json.sig release/manifest.json
+  ```
