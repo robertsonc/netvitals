@@ -5,3 +5,9 @@ build/
 *.spec
 lastpeer.txt
 *.bak
+
+# Release signing. The private key must NEVER be committed (see docs/UPDATE_SECURITY.md);
+# the public key ships embedded in netquality.py, not as a file. release/ is sign_release.sh
+# output (artifact + manifest + signature), published as release assets, not tracked here.
+*.pem
+release/

@@ -60,16 +60,20 @@ UPDATE_URL = "https://github.com/robertsonc/netvitals/releases/latest/download/m
 
 # Release manifests are signed offline; this app ships only the PUBLIC key and refuses any
 # update whose manifest signature does not verify against it (fail closed). The private key
-# is never shipped, so until you install your own key every update fails closed - the safe
-# state. Replace with your own key (openssl rsa -pubout). PLACEHOLDER / DEV KEY.
+# is never shipped. A fork must replace this with its own key (openssl rsa -pubout) and
+# repoint UPDATE_URL; until it does, updates fail closed - the safe state.
+#
+# Clients trust exactly the key compiled into the build they are running, so rotating this
+# value requires shipping the change in a release signed with the PREVIOUS key. See the key
+# management section of docs/UPDATE_SECURITY.md before touching it.
 UPDATE_PUBKEY = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAohXeujQKdTKz1X+m40+x
-g2/fdCNZe+bHgUl4ylL/XSvAvjm+LR7GyuQaYDihDSmqZJ/bh3FImw71jIFFCwkV
-iJbQA+OpNUBCuGx4S5cHQQLJRINjmsEuzi+rfPvDfpwdbzUoF3MI/Wlc9XVg33qt
-hSglZ7jDsdAM/ssa+qg4Dx4nT+Gs9WXPReSpLPTKgaaCLpa5OZSRlksEJwkKxlA6
-wvd5rpSu61LDm7U9fLSoCScHFfoBLoffzUMFXOKZ1dAEAvnPWPwaMimtYt7Mw5XL
-d8S039/wTLTjbGklBn2dBT+aM5wefmdsfLs78GjQxZZET5iBa1/rvokUdTByQauO
-MwIDAQAB
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApRakvIgSthqF9tTb3Q1B
+avHYJeuvH4McX59x7L4toEOm2hArGbXRnphH8LdpmTPFYEn7wpt20/KlCzyZQXuH
+18hwFPsEWrPrPJ2a5O67kRd+c6jrGb/g6QaRCZBwAhxAZwuOa3qji/yslLXYgSdV
+TQ+KMJuI24j5+lrpMwzpYjQ0iFDaoqA3UROEIav1rG7ntEns+dDieCwEXpnKeRfN
+46TUrqLMdh7vz1E7MKsveXqNEZj0R0iKIdoFEWiVuey6eo7ryYfdEl1gmJKgtWYd
+5xn1j+354QHobB6JzUj1ZQcj020g/qagGry/zPRLkTwChKUPC++3MahLiDpKoIbW
+rQIDAQAB
 -----END PUBLIC KEY-----
 """
 
