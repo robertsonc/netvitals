@@ -2112,6 +2112,24 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
 # ---------------------------------------------------------------------------
 # Tkinter GUI (HPE-themed, with live + history charts)
 # ---------------------------------------------------------------------------
+def _set_window_icon(root):
+    """Give the window - and, on Windows, the taskbar - the Network Vitals EKG icon. The
+    AppUserModelID makes Windows group the app under its OWN taskbar button/icon instead of
+    a generic pythonw one, so Network Vitals and Security Vitals each show their own logo."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("HPEAruba.NetworkVitals")
+        except Exception:
+            pass
+        ico = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "netvitals.ico")
+        try:
+            if os.path.isfile(ico):
+                root.iconbitmap(default=ico)
+        except Exception:                      # non-fatal: a missing/bad icon just falls back
+            pass
+
+
 def run_gui(engine, args):
     import tkinter as tk
     from tkinter import ttk
@@ -2121,6 +2139,7 @@ def run_gui(engine, args):
               for sid, proto, port, name in STREAMS]
 
     root = tk.Tk()
+    _set_window_icon(root)
     root.title(f"Network Vitals {__version__}  -  peer {args.peer}")
     root.geometry("1000x600")
     root.minsize(480, 320)
@@ -2660,6 +2679,7 @@ def run_mesh_gui(engine, args):
     peers = engine.peers
 
     root = tk.Tk()
+    _set_window_icon(root)
     root.title(f"Network Vitals {__version__}  -  mesh, {len(peers)} peers")
     root.geometry("1150x760")
     root.minsize(700, 500)
@@ -3792,6 +3812,7 @@ def run_launcher(update_url=UPDATE_URL):
         root = tk.Tk()
     except tk.TclError as e:
         raise RuntimeError(str(e)) from e
+    _set_window_icon(root)
 
     root.title(f"Network Vitals {__version__} - launch")
     root.configure(bg=BG)
