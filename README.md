@@ -198,12 +198,16 @@ update.bat                      REM or: python netquality.py --update
 python netquality.py --check-update   REM report only (exit code 3 = update available)
 ```
 
-`--update` downloads the latest `netquality.py`, sanity-checks it (compiles,
-recognisably this app, higher `__version__`), keeps the previous copy as
-`netquality.py.bak`, and swaps the file atomically. A packaged `.exe` can't
-replace itself — rebuild with `build_exe.bat` after updating the source.
-Updates are only ever fetched when explicitly requested (opening the update
-dialog counts as a request); the app never phones home on its own.
+`--update` fetches a **signed release manifest**, verifies its RSA signature against the
+public key built into the app (**fail closed** — an unsigned or wrong-signed update is
+refused), requires a newer `__version__`, downloads the `netquality.py` artifact and checks
+its SHA-256 against the signed manifest, then keeps the previous copy as `netquality.py.bak`
+and swaps the file atomically (re-verifying the bytes on disk first). A packaged `.exe`
+can't replace itself — rebuild with `build_exe.bat` after updating the source. Updates are
+only ever fetched when explicitly requested (opening the update dialog counts as a request);
+the app never phones home on its own. See
+[docs/UPDATE_SECURITY.md](docs/UPDATE_SECURITY.md) for the signing and key model (releases
+must be signed with `tools/sign_release.sh`, or updates fail closed).
 
 **Corporate networks / `unable to get local issuer certificate`:** that error
 is Python's bundled OpenSSL not trusting a TLS-inspecting proxy (whose root

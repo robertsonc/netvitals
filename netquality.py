@@ -34,6 +34,9 @@ Local loopback smoke test (one machine, Linux only - two loopback aliases):
 
 import argparse
 import array
+import base64
+import hashlib
+import hmac
 import json
 import math
 import os
@@ -48,10 +51,27 @@ from collections import deque
 
 __version__ = "1.6.2"
 
-# Where --update / --check-update look for the latest release of this file.
-# Override with --update-url (or keep a fork's URL here).
-UPDATE_URL = ("https://raw.githubusercontent.com/robertsonc/netvitals/"
-              "main/netquality.py")
+# Where --update / --check-update look for the latest SIGNED release manifest. The
+# manifest is verified against UPDATE_PUBKEY before anything is installed (fail closed),
+# so the update channel is not a code-execution hole: a foreign URL cannot serve accepted
+# code without the matching private key. A fork sets its own manifest URL + public key.
+# Override with --update-url. See the self-update section below and UPDATE_SECURITY.md.
+UPDATE_URL = "https://github.com/robertsonc/netvitals/releases/latest/download/manifest.json"
+
+# Release manifests are signed offline; this app ships only the PUBLIC key and refuses any
+# update whose manifest signature does not verify against it (fail closed). The private key
+# is never shipped, so until you install your own key every update fails closed - the safe
+# state. Replace with your own key (openssl rsa -pubout). PLACEHOLDER / DEV KEY.
+UPDATE_PUBKEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAohXeujQKdTKz1X+m40+x
+g2/fdCNZe+bHgUl4ylL/XSvAvjm+LR7GyuQaYDihDSmqZJ/bh3FImw71jIFFCwkV
+iJbQA+OpNUBCuGx4S5cHQQLJRINjmsEuzi+rfPvDfpwdbzUoF3MI/Wlc9XVg33qt
+hSglZ7jDsdAM/ssa+qg4Dx4nT+Gs9WXPReSpLPTKgaaCLpa5OZSRlksEJwkKxlA6
+wvd5rpSu61LDm7U9fLSoCScHFfoBLoffzUMFXOKZ1dAEAvnPWPwaMimtYt7Mw5XL
+d8S039/wTLTjbGklBn2dBT+aM5wefmdsfLs78GjQxZZET5iBa1/rvokUdTByQauO
+MwIDAQAB
+-----END PUBLIC KEY-----
+"""
 
 # ---------------------------------------------------------------------------
 # Wire protocol
@@ -3044,20 +3064,13 @@ def run_console_loop(engine, args, vt):
 
 
 # ---------------------------------------------------------------------------
-# Self-update: fetch the latest release of this file from UPDATE_URL and
-# replace ourselves in place. Only runs when explicitly requested (--update /
-# --check-update / update.bat) — a measurement tool must not phone home on
-# its own, and a surprise fetch would skew the very numbers it reports.
+# Self-update: fetch and VERIFY a signed release manifest from UPDATE_URL, then
+# replace ourselves in place with the artifact it names. Only runs when explicitly
+# requested (--update / --check-update / update.bat) — a measurement tool must not
+# phone home on its own, and a surprise fetch would skew the very numbers it reports.
+# Verification (RSA signature over the manifest + SHA-256 of the artifact) fails
+# closed on any problem; see UPDATE_SECURITY.md.
 # ---------------------------------------------------------------------------
-def _parse_version(text):
-    """Extract __version__ from source text as an int tuple, or None."""
-    m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.MULTILINE)
-    if not m:
-        return None, None
-    nums = tuple(int(x) for x in re.findall(r"\d+", m.group(1))[:3])
-    return (nums or None), m.group(1)
-
-
 def _is_cert_error(exc):
     """True when exc is (or wraps) an SSL certificate-verification failure -
     the 'unable to get local issuer certificate' class of errors."""
@@ -3137,28 +3150,26 @@ def _download_via_windows_tls(url, timeout, _curl=None, _ps="powershell"):
     raise RuntimeError("; ".join(errors) or "no downloader available")
 
 
-def fetch_update(url, timeout=15):
-    """Download the candidate source. Returns (source_text, version_tuple,
-    version_string). Raises RuntimeError with a friendly message on any
-    problem — network, HTTP, or a payload that isn't a plausible newer us."""
+def _download_bytes(url, timeout, max_bytes):
+    """Download `url` (bounded), reusing the Windows certificate-store fallback for
+    corporate TLS-inspecting proxies. Returns raw bytes; raises RuntimeError."""
     import urllib.error
     import urllib.request
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
-            # urllib follows https->http redirects; installing code fetched
-            # over plaintext is where the line is, so refuse the downgrade.
+            # urllib follows https->http redirects; fetching code over plaintext is
+            # where the line is, so refuse the downgrade.
             final = getattr(resp, "url", None) or url
             if (url.lower().startswith("https:")
                     and not final.lower().startswith("https:")):
                 raise RuntimeError(f"refusing redirect to insecure URL {final}")
-            raw = resp.read()
+            raw = resp.read(max_bytes + 1)
     except (urllib.error.URLError, OSError) as e:
         cert_issue = _is_cert_error(e)
         if (cert_issue and sys.platform == "win32"
                 and url.lower().startswith("https:")):
-            # Python's own trust chain failed - retry through the Windows
-            # certificate store (see _download_via_windows_tls). This is the
-            # normal path behind corporate TLS-inspecting proxies.
+            # Python's own trust chain failed - retry through the Windows certificate
+            # store (see _download_via_windows_tls). Normal behind corporate proxies.
             try:
                 raw = _download_via_windows_tls(url, timeout)
             except RuntimeError as e2:
@@ -3174,43 +3185,164 @@ def fetch_update(url, timeout=15):
                         "Python doesn't trust; on Windows the updater retries "
                         "through the system certificate store automatically.")
             raise RuntimeError(msg) from e
-    try:
-        src = raw.decode("utf-8")
-    except UnicodeDecodeError as e:
-        raise RuntimeError(f"payload is not UTF-8 text: {e}") from e
-    # Sanity: it must be valid Python and recognisably this application.
-    try:
-        compile(src, "netquality.py", "exec")
-    except SyntaxError as e:
-        raise RuntimeError(f"payload does not compile: {e}") from e
-    if "MAGIC" not in src or "Network Vitals" not in src:
-        raise RuntimeError("payload doesn't look like Network Vitals — wrong URL?")
-    vtuple, vstr = _parse_version(src)
-    if vtuple is None:
-        raise RuntimeError("payload has no __version__")
-    return src, vtuple, vstr
+    if len(raw) > max_bytes:
+        raise RuntimeError("update response was larger than expected - refusing.")
+    return raw
 
 
-def install_update(src):
-    """Write already-fetched-and-sanity-checked source over this file
-    (previous copy kept as .bak; the swap itself is atomic). Returns the
-    target path. Raises RuntimeError on any failure, including running as a
-    packaged .exe (which cannot replace itself)."""
+# ---------------------------------------------------------------------------
+# Release-manifest signature verification (RSA-2048 / SHA-256 PKCS#1 v1.5), pure
+# stdlib. RSA verify is modular exponentiation with the public exponent; PKCS#1
+# v1.5 verify is a STRICT comparison against the fully reconstructed padded block
+# (no lax parsing -> no forgery). Interoperates with `openssl dgst -sha256 -sign`.
+# ---------------------------------------------------------------------------
+_SHA256_DIGESTINFO = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def _der_read(data, i):
+    """Read one DER TLV. Returns (tag, value_bytes, next_index)."""
+    if i + 2 > len(data):
+        raise RuntimeError("truncated DER")
+    tag = data[i]
+    ln = data[i + 1]
+    i += 2
+    if ln & 0x80:
+        nbytes = ln & 0x7F
+        if nbytes == 0 or i + nbytes > len(data):
+            raise RuntimeError("bad DER length")
+        ln = int.from_bytes(data[i:i + nbytes], "big")
+        i += nbytes
+    if i + ln > len(data):
+        raise RuntimeError("DER value exceeds buffer")
+    return tag, data[i:i + ln], i + ln
+
+
+def _parse_rsa_pub(pem):
+    """Extract (n, e) from an RSA public key PEM (SubjectPublicKeyInfo or PKCS#1)."""
+    body = re.sub(r"-----[^-]+-----", "", pem).replace("\n", "").replace("\r", "").strip()
+    try:
+        der = base64.b64decode(body, validate=True)   # binascii.Error is a ValueError
+    except ValueError as e:
+        raise RuntimeError(f"public key is not valid base64: {e}") from e
+    if "BEGIN RSA PUBLIC KEY" in pem:                  # PKCS#1 RSAPublicKey
+        _, seq, _ = _der_read(der, 0)
+        _, nb, k = _der_read(seq, 0)
+        _, eb, _ = _der_read(seq, k)
+        return int.from_bytes(nb, "big"), int.from_bytes(eb, "big")
+    _, spki, _ = _der_read(der, 0)                     # SubjectPublicKeyInfo
+    _, _alg, j = _der_read(spki, 0)                    # AlgorithmIdentifier
+    tag_bs, bs, _ = _der_read(spki, j)                 # BIT STRING
+    if tag_bs != 0x03 or not bs:
+        raise RuntimeError("malformed public key (expected BIT STRING)")
+    _, seq, _ = _der_read(bs[1:], 0)                   # drop 'unused bits' byte
+    _, nb, k = _der_read(seq, 0)
+    _, eb, _ = _der_read(seq, k)
+    return int.from_bytes(nb, "big"), int.from_bytes(eb, "big")
+
+
+def verify_rsa_sha256(pubkey_pem, message, signature):
+    """True iff `signature` is a valid RSA/SHA-256 PKCS#1 v1.5 signature over `message`
+    under `pubkey_pem`. Never raises for a bad signature - returns False."""
+    try:
+        n, e = _parse_rsa_pub(pubkey_pem)
+    except RuntimeError:
+        return False
+    if n <= 0 or e <= 0:
+        return False
+    k = (n.bit_length() + 7) // 8
+    if k < 64 or len(signature) != k:                  # RSA-2048 => k == 256
+        return False
+    s = int.from_bytes(signature, "big")
+    if s >= n:
+        return False
+    em = pow(s, e, n).to_bytes(k, "big")
+    digest_info = _SHA256_DIGESTINFO + hashlib.sha256(message).digest()
+    ps_len = k - 3 - len(digest_info)
+    if ps_len < 8:
+        return False
+    expected = b"\x00\x01" + b"\xff" * ps_len + b"\x00" + digest_info
+    return hmac.compare_digest(em, expected)
+
+
+def _ver_tuple(s):
+    nums = re.findall(r"\d+", s or "")[:3]
+    return tuple(int(x) for x in nums) if nums else None
+
+
+def _parse_manifest(manifest_bytes):
+    try:
+        m = json.loads(manifest_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise RuntimeError(f"manifest is not valid JSON/UTF-8: {e}") from e
+    if not isinstance(m, dict):
+        raise RuntimeError("manifest is not an object")
+    for key in ("version", "artifact", "sha256"):
+        if not isinstance(m.get(key), str):
+            raise RuntimeError(f"manifest missing string field {key!r}")
+    if m["artifact"] != "netquality.py":
+        raise RuntimeError(f"unexpected artifact name {m['artifact']!r}")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", m["sha256"]):
+        raise RuntimeError("manifest sha256 is not a 64-hex digest")
+    if _ver_tuple(m["version"]) is None:
+        raise RuntimeError("manifest version is not parseable")
+    return m
+
+
+def check_update(url, timeout=15):
+    """Fetch + verify the SIGNED release manifest at `url`. Returns the manifest dict for
+    a strictly newer, correctly-signed release, or None if up to date. Raises RuntimeError
+    and fails closed on any verification failure."""
+    if not UPDATE_PUBKEY or "BEGIN" not in UPDATE_PUBKEY:
+        raise RuntimeError("no update public key configured - refusing to update.")
+    manifest = _download_bytes(url, timeout, 64 * 1024)
+    sig = _download_bytes(url + ".sig", timeout, 4096)
+    if not verify_rsa_sha256(UPDATE_PUBKEY, manifest, sig):
+        raise RuntimeError("manifest signature did not verify - refusing (fail closed).")
+    m = _parse_manifest(manifest)
+    if _ver_tuple(m["version"]) <= _ver_tuple(__version__):
+        return None
+    return m
+
+
+def download_and_install(manifest, url, timeout=30, target=None):
+    """Download the artifact named by an already-verified manifest, check its SHA-256,
+    install atomically (.new -> os.replace, previous copy kept as .bak), and re-verify the
+    on-disk bytes before returning (closes the fetch->exec TOCTOU). Raises RuntimeError;
+    never leaves a partial file. `target` defaults to this file (tests pass a temp path)."""
     if getattr(sys, "frozen", False):
         raise RuntimeError("this is a packaged .exe — it can't replace "
                            "itself. Download the new version (or rebuild "
                            "with build_exe.bat).")
-    target = os.path.abspath(__file__)
+    want = manifest["sha256"].lower()
+    base = url.rsplit("/", 1)[0]
+    data = _download_bytes(base + "/" + manifest["artifact"], timeout, 16 * 1024 * 1024)
+    if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), want):
+        raise RuntimeError("artifact sha256 does not match the signed manifest - refusing.")
+    # Corruption checks (NOT trust - the signature is the trust): valid Python, and ours.
+    try:
+        src = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise RuntimeError(f"artifact is not UTF-8 text: {e}") from e
+    try:
+        compile(src, "netquality.py", "exec")
+    except SyntaxError as e:
+        raise RuntimeError(f"artifact does not compile: {e}") from e
+    if "MAGIC" not in src or "Network Vitals" not in src:
+        raise RuntimeError("artifact doesn't look like Network Vitals - refusing.")
+    target = target or os.path.abspath(__file__)
     backup = target + ".bak"
     tmp = target + ".new"
     try:
-        with open(target, "r", encoding="utf-8") as fh:
+        with open(target, "rb") as fh:
             current = fh.read()
-        with open(backup, "w", encoding="utf-8") as fh:
+        with open(backup, "wb") as fh:
             fh.write(current)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            fh.write(src)
-        os.replace(tmp, target)  # atomic on the same filesystem
+        with open(tmp, "wb") as fh:
+            fh.write(data)
+        with open(tmp, "rb") as fh:      # re-verify the on-disk bytes before the swap
+            if not hmac.compare_digest(hashlib.sha256(fh.read()).hexdigest(), want):
+                raise RuntimeError("on-disk artifact failed re-verification - refusing.")
+        os.replace(tmp, target)          # atomic on the same filesystem
     except OSError as e:
         try:
             os.remove(tmp)
@@ -3240,29 +3372,28 @@ def relaunch(argv=None, delay=1.5):
 
 
 def perform_update(url, apply=True):
-    """Check (and optionally install) the latest version. Returns an exit
-    code: 0 = up to date / updated, 1 = failed, 3 = update available (check
-    mode only, so scripts can branch on it)."""
-    local_v, _ = _parse_version(f'__version__ = "{__version__}"')
+    """Check (and optionally install) the latest SIGNED version. Returns an exit code:
+    0 = up to date / updated, 1 = failed, 3 = update available (check mode only, so
+    scripts can branch on it). Fails closed on any verification failure."""
     print(f"Network Vitals {__version__}")
     print(f"Checking {url} …")
     try:
-        src, remote_v, remote_s = fetch_update(url)
+        m = check_update(url)
     except RuntimeError as e:
         print(f"Update check failed: {e}", file=sys.stderr)
         return 1
-    if remote_v <= local_v:
-        print(f"Already up to date (latest is {remote_s}).")
+    if m is None:
+        print("Already up to date.")
         return 0
-    print(f"New version available: {remote_s}")
+    print(f"New signed version available: {m['version']}")
     if not apply:
         return 3
     try:
-        target = install_update(src)
+        target = download_and_install(m, url)
     except RuntimeError as e:
         print(f"Install failed: {e}", file=sys.stderr)
         return 1
-    print(f"Updated {os.path.basename(target)} {__version__} -> {remote_s}.")
+    print(f"Updated {os.path.basename(target)} {__version__} -> {m['version']}.")
     print(f"(previous version saved as {os.path.basename(target)}.bak)")
     print("Restart the app to run the new version.")
     return 0
@@ -3568,27 +3699,26 @@ def open_update_dialog(root, update_url, relaunch_argv=None):
                          relief="flat", bd=0, highlightthickness=0,
                          padx=12, pady=5, font=(FONT, 9, "bold"), cursor="hand2")
 
-    state = {"src": None, "vstr": None}
+    state = {"manifest": None, "vstr": None}
     outcome = {}  # worker thread -> UI poll loop; workers never touch Tk
 
     def check_worker():
-        # Catch EVERYTHING: fetch_update wraps the expected failures in
-        # RuntimeError, but a scheme-less --update-url raises ValueError and
-        # a misbehaving proxy raises http.client exceptions - any escape
-        # would kill this thread and leave the dialog on "Checking" forever.
+        # Catch EVERYTHING: check_update wraps the expected failures in RuntimeError,
+        # but a scheme-less --update-url raises ValueError and a misbehaving proxy
+        # raises http.client exceptions - any escape would kill this thread and leave
+        # the dialog on "Checking" forever.
         try:
-            src, vt, vs = fetch_update(update_url)
-            local_v, _ = _parse_version(f'__version__ = "{__version__}"')
-            if vt <= local_v:
-                outcome["check"] = ("uptodate", vs)
+            m = check_update(update_url)
+            if m is None:
+                outcome["check"] = ("uptodate", __version__)
             else:
-                outcome["check"] = ("available", (src, vs))
+                outcome["check"] = ("available", m)
         except Exception as e:
             outcome["check"] = ("error", str(e) or e.__class__.__name__)
 
     def install_worker():
         try:
-            install_update(state["src"])
+            download_and_install(state["manifest"], update_url)
             outcome["install"] = ("done", None)
         except Exception as e:
             outcome["install"] = ("error", str(e) or e.__class__.__name__)
@@ -3625,7 +3755,7 @@ def open_update_dialog(root, update_url, relaunch_argv=None):
             if kind == "uptodate":
                 status_var.set(f"You're on the latest version ({val}).")
             elif kind == "available":
-                state["src"], state["vstr"] = val
+                state["manifest"], state["vstr"] = val, val["version"]
                 status_var.set(f"Version {state['vstr']} is available.")
                 install_btn.configure(state="normal")
                 install_btn.pack(side="right", padx=(0, 6))
@@ -4046,14 +4176,15 @@ def parse_args(argv=None):
     p.add_argument("--version", action="version",
                    version=f"Network Vitals {__version__}")
     p.add_argument("--update", action="store_true",
-                   help="Fetch the latest version from the update URL, install "
-                        "it in place, and exit.")
+                   help="Verify and install the latest SIGNED release (fail "
+                        "closed), then exit.")
     p.add_argument("--check-update", action="store_true",
-                   help="Report whether a newer version is available, then exit "
-                        "(exit code 3 = update available).")
+                   help="Report whether a newer SIGNED version is available, then "
+                        "exit (exit code 3 = update available).")
     p.add_argument("--update-url", default=UPDATE_URL,
-                   help="Where --update/--check-update download from "
-                        "(default: the netvitals GitHub repo).")
+                   help="Signed release-manifest URL for --update/--check-update "
+                        "(default: the netvitals GitHub releases). The manifest "
+                        "signature is always verified against the built-in key.")
     p.add_argument("--peer", default=None,
                    help="IP address of the other workstation.")
     p.add_argument("--peers", type=_peer_list, default=None, metavar="A,B,...",
