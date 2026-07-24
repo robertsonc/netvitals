@@ -732,6 +732,11 @@ netquality.exe --peer 10.0.0.2
 
 ## Roadmap — validating the fabric, not just the endpoints
 
+> **See also:** [docs/SDWAN_DEMO_GUIDE.md](docs/SDWAN_DEMO_GUIDE.md) — the
+> SD-WAN demo traffic guide: a solution overview, the full test-case catalog
+> with exact traffic quantities, and the extended feature roadmap organized
+> around known-quantity traffic generation.
+
 *Shipped in 1.5.0:* directional **one-way drift** chart, the latency
 **p5–p95 band**, the **loss pattern** diagnostic, and the **burst test** —
 the host-side measurement tranche of this roadmap.
