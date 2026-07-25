@@ -49,7 +49,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.9.0"
+__version__ = "2.0.0a1"
 
 # Where --update / --check-update look for the latest SIGNED release manifest. The
 # manifest is verified against UPDATE_PUBKEY before anything is installed (fail closed),
@@ -443,6 +443,57 @@ def parse_tos_report(payload):
             and payload[HEADER_LEN] == TOS_REPORT_MAGIC):
         return payload[HEADER_LEN + 1]
     return None
+
+
+# ---------------------------------------------------------------------------
+# ICMP error visibility without raw sockets (R-13, 2.0.0)
+# ---------------------------------------------------------------------------
+def enable_icmp_err(sock):
+    """Linux: deliver ICMP errors for this socket's traffic on the error
+    queue (IP_RECVERR) - lets the MTU sweep distinguish 'ICMP frag-needed
+    (next-hop MTU=N) received' from a silent drop (PMTUD black hole), with
+    no raw socket and no root. Unavailable elsewhere; returns True when on."""
+    if not (hasattr(socket, "IP_RECVERR") and hasattr(sock, "recvmsg")):
+        return False
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_RECVERR, 1)
+        return True
+    except OSError:
+        return False
+
+
+def parse_icmp_err(ancdata):
+    """Extract (icmp_type, icmp_code, info) from a MSG_ERRQUEUE ancillary
+    message (struct sock_extended_err). info carries the next-hop MTU for
+    type 3 / code 4. None when the cmsg isn't an ICMP-origin error."""
+    ip_recverr = getattr(socket, "IP_RECVERR", 11)
+    for level, ctype, data in ancdata or ():
+        if level == socket.IPPROTO_IP and ctype == ip_recverr \
+                and len(data) >= 12:
+            _errno, origin, typ, code, _pad, info = struct.unpack_from(
+                "=IBBBBI", data, 0)
+            if origin == 2:            # SO_EE_ORIGIN_ICMP
+                return typ, code, info
+    return None
+
+
+def parse_ipv4_fragment(pkt, l2_offset=0):
+    """Classify one captured IPv4 packet for the fragment sniffer.
+
+    Returns (is_fragment, is_first_fragment, proto_num, src_ip, dst_ip) or
+    None when the bytes aren't parseable IPv4. A fragment has MF set or a
+    non-zero offset; only the FIRST fragment (offset 0) carries the L4
+    header."""
+    i = l2_offset
+    if len(pkt) < i + 20 or pkt[i] >> 4 != 4:
+        return None
+    flags_frag = int.from_bytes(pkt[i + 6:i + 8], "big")
+    mf = bool(flags_frag & 0x2000)
+    offset = flags_frag & 0x1FFF
+    is_frag = mf or offset > 0
+    src = socket.inet_ntoa(pkt[i + 12:i + 16])
+    dst = socket.inet_ntoa(pkt[i + 16:i + 20])
+    return is_frag, offset == 0, pkt[i + 9], src, dst
 
 
 # ---------------------------------------------------------------------------
@@ -1896,6 +1947,7 @@ class Engine:
         self.markers = deque()
         self.wan = None        # WanCounters or None
         self.scenario = None   # ScenarioRunner or None
+        self.frag = None       # FragmentSniffer or None (2.0.0)
         self.stats = {}      # (peer, sid) -> StreamStats
         self.streams = []
         # In VXLAN mode ALL four streams ride one shared userspace VTEP; the
@@ -1962,6 +2014,8 @@ class Engine:
             self.wan.stop()
         if self.scenario is not None:
             self.scenario.stop()
+        if self.frag is not None:
+            self.frag.stop()
 
     def effective_loss(self, loss, late):
         """Combined loss+late, with a deadband so trivial blips read as zero."""
@@ -2161,6 +2215,14 @@ class Engine:
         udp_up = any(r["proto"] == "UDP" and r["connected"] for r in rows)
         udp_silent = (tcp_up and not udp_up
                       and time.monotonic() - self.start_time > 15.0)
+        # FEC verdict inputs (2.0.0): windowed probe impairment across live
+        # streams vs the WAN counters' drop rate.
+        live = [r for r in rows if r["connected"]]
+        probe_eff = (sum(r["loss"] + r["late"] for r in live) / len(live)
+                     if live else 0.0)
+        udp_slices = max((self.slices_of_sid[r["sid"]] for r in rows
+                          if r["proto"] == "UDP"), default=1)
+        wan_status = self.wan.status() if self.wan else None
         return {
             "peer": peer,
             "rows": rows,
@@ -2195,13 +2257,15 @@ class Engine:
             "profiles_active": self.profiles_active,
             # 1.9.0: measured WAN counters, scenario progress, and the
             # no-fabric-access slicing evidence (loss-ratio law).
-            "wan": self.wan.status() if self.wan else None,
+            "wan": wan_status,
             "scenario": self.scenario.status() if self.scenario else None,
             "slice_evidence": slice_loss_evidence(rows, self.slices_of_sid,
                                                   self.loss_deadband),
             "predicted_wan_pps": sum(
                 r["tx_pps"] * self.slices_of_sid[r["sid"]] * 2
                 for r in rows),
+            "frags": self.frag.status() if self.frag else None,
+            "fec": fec_verdict(wan_status, probe_eff, udp_slices),
         }
 
     def reset(self):
@@ -2559,6 +2623,24 @@ def run_gui(engine, args):
                             font=(FONT, 9, "bold"), cursor="hand2")
     anatomy_btn.pack(side="left", padx=(0, 6))
 
+    topo_shown = {"on": False}
+
+    def do_toggle_topo():
+        topo_shown["on"] = not topo_shown["on"]
+        if topo_shown["on"]:
+            topo_frame.pack(fill="x", side="bottom", before=charts)
+            topo_btn.configure(text="▴  Topology")
+        else:
+            topo_frame.pack_forget()
+            topo_btn.configure(text="≣  Topology")
+
+    topo_btn = tk.Button(btnbar, text="≣  Topology", command=do_toggle_topo,
+                         bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                         activeforeground="white", relief="flat", bd=0,
+                         highlightthickness=0, padx=12, pady=5,
+                         font=(FONT, 9, "bold"), cursor="hand2")
+    topo_btn.pack(side="left", padx=(0, 6))
+
     load_shown = {"on": False}
 
     def do_toggle_load():
@@ -2586,6 +2668,8 @@ def run_gui(engine, args):
             do_toggle_isolate()
         if anatomy_shown["on"]:
             do_toggle_anatomy()
+        if topo_shown["on"]:
+            do_toggle_topo()
         if load_shown["on"]:
             do_toggle_load()
         for c in (lat_canvas, loss_canvas, jit_canvas, owd_canvas):
@@ -2598,6 +2682,25 @@ def run_gui(engine, args):
                         highlightthickness=0, padx=12, pady=5,
                         font=(FONT, 9, "bold"), cursor="hand2")
     fit_btn.pack(side="left")
+
+    def do_report():
+        # The demo's leave-behind: a JSON + self-contained HTML pair.
+        from tkinter import messagebox
+        try:
+            jp, hp = write_report(engine, args)
+        except OSError as e:
+            messagebox.showerror("Network Vitals", f"Report failed: {e}",
+                                 parent=root)
+            return
+        messagebox.showinfo("Network Vitals",
+                            f"Report written:\n{hp}\n{jp}", parent=root)
+
+    rep_btn = tk.Button(btnbar, text="⭳  Report", command=do_report,
+                        bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                        activeforeground="white", relief="flat", bd=0,
+                        highlightthickness=0, padx=12, pady=5,
+                        font=(FONT, 9, "bold"), cursor="hand2")
+    rep_btn.pack(side="left")
 
     def do_update():
         # Explicit user action; a restart re-runs with this exact argv.
@@ -2839,6 +2942,66 @@ def run_gui(engine, args):
     tk.Label(anat_frame, textvariable=anat_wan_var, fg=TXT_DIM, bg=BG,
              font=(FONT, 9), anchor="w").pack(fill="x", pady=(2, 0))
 
+    # ---- topology strip (hidden; Host → EC → fabric → EC → Host with the
+    # measured numbers moving, R-15) ------------------------------------------
+    topo_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
+    # not packed here — do_toggle_topo packs/unpacks the whole frame
+    topo_canvas = tk.Canvas(topo_frame, bg=PANEL, highlightthickness=0,
+                            height=118)
+    topo_canvas.pack(fill="x")
+    topo_state = {"snap": None}
+
+    def draw_topology(_event=None):
+        snap = topo_state["snap"]
+        c = topo_canvas
+        w = c.winfo_width()
+        if w <= 1 or snap is None or not topo_shown["on"]:
+            return
+        c.delete("all")
+        lan_tx = sum(r["tx_pps"] for r in snap["rows"])
+        lan_rx = sum(r["rx_pps"] for r in snap["rows"])
+        pred = snap["predicted_wan_pps"]
+        wan = snap.get("wan")
+        meas = (wan["tx_pps"] if wan and wan["ok"]
+                and wan["tx_pps"] is not None else None)
+        amp = (meas / max(1.0, lan_tx + lan_rx)) if meas is not None else (
+            pred / max(1.0, lan_tx + lan_rx))
+        nodes = [("this host", f"{lan_tx:.0f} pps tx"),
+                 ("EC (local)", f"×{amp:.2f} amplification"),
+                 ("SD-WAN fabric",
+                  (f"{meas:.0f} pps measured" if meas is not None
+                   else f"{pred:.0f} pps predicted")),
+                 ("EC (remote)", "reassembles"),
+                 (f"peer {snap['peer']}", f"{lan_rx:.0f} pps back")]
+        bw, bh, y0 = 150, 44, 22
+        gap = max(24, (w - 28 - bw * len(nodes)) // max(1, len(nodes) - 1))
+        x = 14
+        for i, (name, sub) in enumerate(nodes):
+            fill = PANEL_HI if i != 2 else HPE_GREEN_DK
+            c.create_rectangle(x, y0, x + bw, y0 + bh, fill=fill,
+                               outline=GRID)
+            c.create_text(x + bw / 2, y0 + 15, text=name, fill=TXT,
+                          font=(FONT, 9, "bold"))
+            c.create_text(x + bw / 2, y0 + 31, text=sub, fill=TXT_DIM,
+                          font=(FONT, 8))
+            if i < len(nodes) - 1:
+                ax0, ax1 = x + bw, x + bw + gap
+                ay = y0 + bh / 2
+                c.create_line(ax0, ay, ax1, ay, fill=HPE_GREEN, width=2,
+                              arrow="last")
+                c.create_line(ax0, ay + 8, ax1, ay + 8, fill="#FF8300",
+                              width=2, arrow="first")
+            x += bw + gap
+        wan_txt = ("WAN span: predicted "
+                   f"{pred:.0f} pps"
+                   + (f" · measured {meas:.0f} pps ({wan['kind']})"
+                      if meas is not None else
+                      "  ·  add --wan-counters to measure it"))
+        c.create_text(14, y0 + bh + 26, anchor="w", fill=TXT_DIM,
+                      font=(FONT, 9), text=wan_txt)
+
+    topo_canvas.bind("<Configure>", draw_topology)
+
     # ---- sustained load panel (hidden; the burst generator made resident) --
     # A known-quantity UDP load offered WHILE the scored streams keep
     # measuring, so the charts show what the load does to the path. TEST
@@ -3018,6 +3181,8 @@ def run_gui(engine, args):
             warn_var.set(f"⚠ DSCP rewritten mid-path: {name} sent "
                          f"{dscp_name(req)}, peer received {dscp_name(got)}"
                          f"{more} — bleaching/remap policy in the path")
+        elif snap.get("fec"):
+            warn_var.set(f"⚠ {snap['fec']}")
         elif snap.get("loss_pattern"):
             warn_var.set(f"⚠ loss pattern (last 60 s): {snap['loss_pattern']}")
         elif snap.get("slice_evidence"):
@@ -3077,11 +3242,20 @@ def run_gui(engine, args):
         life = ("" if t["life_tx"] == t["tx"] and t["life_lost"] == t["lost"]
                 else f"  ·  lifetime  sent {t['life_tx']:,}  "
                      f"lost {t['life_lost']:,} ({t['life_loss_pct']:.2f}%)")
+        frags = snap.get("frags")
+        frag_txt = ""
+        if frags:
+            frag_txt = (f"  ·  frags {frags['frags']:,}" if frags["ok"]
+                        else "  ·  frag sniffer off (needs admin)")
         foot_cnt_var.set(
             f"since reset  sent {t['tx']:,}  recv {t['recv']:,}  "
             f"lost {t['lost']:,} ({t['loss_pct']:.2f}%)  "
             f"fwd→ {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%)  "
-            f"rtn← {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%){life}")
+            f"rtn← {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%){life}{frag_txt}")
+
+        if topo_shown["on"]:
+            topo_state["snap"] = snap
+            draw_topology()
 
         if anatomy_shown["on"]:
             wan = snap.get("wan")
@@ -3625,19 +3799,35 @@ def run_console_loop(engine, args, vt):
                 print(f"  scenario {scn['name']}: stage {scn['idx']}/"
                       f"{scn['total']} '{scn['stage']}'  "
                       f"{scn['remaining']:.0f}s left{rep}")
+            frags = snap.get("frags")
+            if frags:
+                print("  frag sniffer: "
+                      + (f"{frags['frags']:,} fragments seen "
+                         f"({frags['firsts']:,} fragmented datagrams)"
+                         if frags["ok"] else frags["error"] or "off"))
             if snap.get("udp_silent"):
                 print("  ! UDP silent while TCP is up: UDP blocked in the path "
                       "(firewall/ACL) or the peer runs an outdated version - "
                       "update BOTH ends.")
+            elif snap.get("fec"):
+                print(f"  ! {snap['fec']}")
             elif snap.get("loss_pattern"):
                 print(f"  ! loss pattern (last 60 s): {snap['loss_pattern']}")
             elif snap.get("slice_evidence"):
                 print(f"  ! {snap['slice_evidence']}")
             if keys.enabled:
-                print("  keys:  [r] reset counters    [q] quit    (Ctrl-C also quits)")
+                print("  keys:  [r] reset counters    [w] write report    "
+                      "[q] quit    (Ctrl-C also quits)")
             key = keys.poll(args.refresh_ms / 1000.0)
             if key == "r":
                 engine.reset()
+            elif key == "w":
+                try:
+                    _jp, hp = write_report(engine, args)
+                    print(f"\n  report written: {hp}")
+                except OSError as e:
+                    print(f"\n  report failed: {e}")
+                time.sleep(1.5)   # visible before the next screen clear
             elif key in ("q", "\x03"):   # 'q', or Ctrl-C swallowed by getwch
                 return
 
@@ -5098,6 +5288,17 @@ def parse_args(argv=None):
                         "load_mbps, square_on_s/off_s and reset, drawn as "
                         "stage markers on the charts. See the demo guide "
                         "for the format.")
+    p.add_argument("--frag-sniffer", action="store_true",
+                   help="Count IPv4 fragments to/from the peer at capture "
+                        "level - proves whole-packet delivery vs kernel "
+                        "reassembly of mid-path fragments. Needs root/"
+                        "admin for the raw socket; reports 'unavailable' "
+                        "otherwise instead of failing.")
+    p.add_argument("--report", default=None, metavar="BASE",
+                   help="On exit, write the demo report to BASE.json and "
+                        "BASE.html. The dashboard's ⭳ Report button and "
+                        "the console 'w' key write one on demand at any "
+                        "time (to the NetVitals config dir).")
     return p.parse_args(argv)
 
 
@@ -5155,7 +5356,26 @@ def run_mtu_sweep(args, out=print):
         out(f"bind failed: {e}")
         return
     sock.settimeout(0.4)
+    # ICMP frag-needed visibility (2.0.0): with IP_RECVERR (Linux) the
+    # sweep can tell a router SAYING 'fragmentation needed, MTU=N' from a
+    # silent drop - a PMTUD black hole - without raw sockets or root.
+    icmp_watch = enable_icmp_err(sock)
+    icmp_seen = {}   # next-hop MTU -> hits
     seq = [0]
+
+    def read_icmp_errs():
+        if not icmp_watch:
+            return
+        dontwait = getattr(socket, "MSG_DONTWAIT", 0x40)
+        for _ in range(8):
+            try:
+                _d, anc, _f, _a = sock.recvmsg(
+                    512, 256, socket.MSG_ERRQUEUE | dontwait)
+            except (BlockingIOError, OSError):
+                return
+            err = parse_icmp_err(anc)
+            if err and err[0] == 3 and err[1] == 4:      # frag needed
+                icmp_seen[err[2]] = icmp_seen.get(err[2], 0) + 1
 
     def round_trips(size):
         """True if a probe of `size` bytes gets an echo back (4 tries)."""
@@ -5166,7 +5386,8 @@ def run_mtu_sweep(args, out=print):
             try:
                 sock.sendto(pkt, (peer, port))
             except OSError:
-                return False  # EMSGSIZE: exceeds the local NIC MTU
+                read_icmp_errs()   # a queued ICMP error surfaces as OSError
+                return False       # or EMSGSIZE: exceeds the local NIC MTU
             deadline = time.monotonic() + 0.4
             while time.monotonic() < deadline:
                 try:
@@ -5174,10 +5395,12 @@ def run_mtu_sweep(args, out=print):
                 except socket.timeout:
                     break
                 except OSError:
-                    return False
+                    read_icmp_errs()
+                    break
                 p = parse_header(data)
                 if p and p[0] == TYPE_ECHO and p[2] == s:
                     return True
+            read_icmp_errs()
         return False
 
     if not round_trips(lo):
@@ -5207,6 +5430,19 @@ def run_mtu_sweep(args, out=print):
             f"(but short of 9000 jumbo).")
     else:
         out("=> Standard 1500-byte MTU; no jumbo on this path.")
+    # ICMP verdict (2.0.0): did anything SAY the frames were too big?
+    dropped_any = best < hi
+    if icmp_seen:
+        mtus = ", ".join(f"MTU={m}" for m in sorted(icmp_seen))
+        out(f"=> ICMP 'fragmentation needed' received ({mtus}) - PMTUD "
+            f"works on this path; endpoints learn the limit.")
+    elif dropped_any and icmp_watch:
+        out("=> Oversized probes were dropped SILENTLY (no ICMP came "
+            "back): a PMTUD black hole - endpoints can't learn the limit, "
+            "they just lose packets.")
+    elif dropped_any:
+        out("   (ICMP frag-needed detection needs Linux/IP_RECVERR; "
+            "unavailable on this platform.)")
 
 
 def detect_slice_boundaries(samples, min_step_ms=0.12):
@@ -5801,16 +6037,20 @@ def _wan_spec(text):
     kind, _, rest = raw.partition(":")
     kind = kind.lower()
     if kind == "sim":
-        noise = 0.0
+        # sim[:NOISE_PPS[:LOSS_PCT]] - LOSS_PCT makes the simulator report
+        # WAN-side drops, so the FEC verdict can be rehearsed hardware-free.
+        noise = loss = 0.0
         if rest:
+            parts = rest.split(":")
             try:
-                noise = float(rest)
+                noise = float(parts[0]) if parts[0] else 0.0
+                loss = float(parts[1]) if len(parts) > 1 and parts[1] else 0.0
             except ValueError:
                 raise argparse.ArgumentTypeError(
-                    f"sim noise must be a number, got {rest!r}")
-            if not (0 <= noise <= 1e6):
-                raise argparse.ArgumentTypeError("sim noise out of range")
-        return {"kind": "sim", "noise_pps": noise}
+                    f"sim spec is sim[:NOISE_PPS[:LOSS_PCT]], got {rest!r}")
+            if not (0 <= noise <= 1e6) or not (0 <= loss <= 100):
+                raise argparse.ArgumentTypeError("sim noise/loss out of range")
+        return {"kind": "sim", "noise_pps": noise, "loss_pct": loss}
     if kind == "snmp":
         parts = [p.strip() for p in rest.split(",")]
         if len(parts) not in (3, 4) or not all(parts):
@@ -5938,6 +6178,8 @@ class SnmpWanSource:
     point it at the appliance's WAN interface."""
     kind = "snmp"
 
+    IF_BASE = "1.3.6.1.2.1.2.2.1"     # classic 32-bit interface table
+
     def __init__(self, host, community, ifindex, port=161, timeout=1.5):
         self.host, self.community = host, community
         self.port, self.timeout = port, timeout
@@ -5947,13 +6189,21 @@ class SnmpWanSource:
             "rx_bytes": f"{IFHC_BASE}.6.{ifindex}",
             "tx_bytes": f"{IFHC_BASE}.10.{ifindex}",
         }
+        # Drop/error counters feed the FEC verdict (2.0.0). Optional: not
+        # every device populates them, so absence is tolerated.
+        self.opt_oids = {
+            "rx_drops": f"{self.IF_BASE}.13.{ifindex}",
+            "rx_errs": f"{self.IF_BASE}.14.{ifindex}",
+            "tx_drops": f"{self.IF_BASE}.19.{ifindex}",
+            "tx_errs": f"{self.IF_BASE}.20.{ifindex}",
+        }
         self._req_id = 1
         self.detail = f"snmp {host} if{ifindex}"
 
     def poll(self):
         self._req_id = (self._req_id + 1) & 0x7FFFFFFF
-        msg = snmp_build_get(self.community, list(self.oids.values()),
-                             self._req_id)
+        oids = list(self.oids.values()) + list(self.opt_oids.values())
+        msg = snmp_build_get(self.community, oids, self._req_id)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(self.timeout)
         try:
@@ -5967,6 +6217,9 @@ class SnmpWanSource:
             if oid not in values:
                 raise RuntimeError(f"SNMP response missing {name} ({oid})")
             out[name] = values[oid]
+        for name, oid in self.opt_oids.items():
+            if oid in values:
+                out[name] = values[oid]
         return out
 
 
@@ -6004,13 +6257,15 @@ class SimWanSource:
     access at all. rates_fn() -> [(tx_pps, slices)] per stream."""
     kind = "sim"
 
-    def __init__(self, rates_fn, noise_pps=0.0):
+    def __init__(self, rates_fn, noise_pps=0.0, loss_pct=0.0):
         self.rates_fn = rates_fn
         self.noise_pps = noise_pps
+        self.loss_pct = loss_pct   # simulated WAN drop rate (FEC rehearsal)
         self.detail = "simulator (EC slicing model)"
         self._last = time.monotonic()
         self._tx = 0.0
         self._rx = 0.0
+        self._drops = 0.0
 
     def poll(self):
         import random
@@ -6021,7 +6276,11 @@ class SimWanSource:
         jitter = 1.0 + random.uniform(-0.02, 0.02)
         self._tx += (wan_pps * jitter + self.noise_pps) * dt
         self._rx += (wan_pps * jitter + self.noise_pps) * dt
-        return {"tx_pkts": int(self._tx), "rx_pkts": int(self._rx)}
+        out = {"tx_pkts": int(self._tx), "rx_pkts": int(self._rx)}
+        if self.loss_pct:
+            self._drops += wan_pps * jitter * dt * self.loss_pct / 100.0
+            out["rx_drops"] = int(self._drops)
+        return out
 
 
 class WanCounters:
@@ -6040,7 +6299,8 @@ class WanCounters:
         self._status = {"kind": source.kind, "ok": False,
                         "detail": getattr(source, "detail", ""),
                         "tx_pps": None, "rx_pps": None,
-                        "tx_mbps": None, "rx_mbps": None, "age": None}
+                        "tx_mbps": None, "rx_mbps": None,
+                        "drop_pps": None, "age": None}
 
     def start(self):
         self.thread = threading.Thread(target=self._run, name="wan-counters",
@@ -6091,6 +6351,10 @@ class WanCounters:
                                      if "tx_bytes" in rates else None)
                     st["rx_mbps"] = (rates.get("rx_bytes", 0) * 8 / 1e6
                                      if "rx_bytes" in rates else None)
+                    drops = [rates[k] for k in ("rx_drops", "rx_errs",
+                                                "tx_drops", "tx_errs")
+                             if k in rates]
+                    st["drop_pps"] = sum(drops) if drops else None
 
 
 def slice_loss_evidence(rows, slices_of_sid, deadband):
@@ -6123,6 +6387,40 @@ def slice_loss_evidence(rows, slices_of_sid, deadband):
     return (f"{large[0]['name']} loses {ratio:.1f}× {small[0]['name']} "
             f"≈ its {n_l}-slice/{n_s}-slice ratio — per-WAN-packet loss "
             f"(slicing amplification measured live)")
+
+
+def fec_verdict(wan, probe_loss_pct, slices):
+    """R-11 (2.0.0): compare WAN-side drop counters with app-level probe
+    loss and name what the fabric's repair machinery is doing.
+
+      * WAN dropping while probes run clean -> FEC is repairing: the only
+        way both can be true is packets being reconstructed after loss.
+      * probe loss >> WAN slice loss -> amplification with no repair: one
+        lost slice kills the whole N-slice packet.
+
+    wan is WanCounters.status() (needs drop_pps + tx_pps: SNMP drop OIDs
+    or the simulator's LOSS_PCT); slices is the sliced stream's WAN packet
+    count. Returns the verdict string or None when there's nothing to say."""
+    if not wan or not wan.get("ok") or wan.get("drop_pps") is None:
+        return None
+    tx = wan.get("tx_pps")
+    if not tx or tx <= 1:
+        return None
+    drops = wan["drop_pps"]
+    wan_loss = drops / (tx + drops) * 100.0
+    if wan_loss < 0.05 and probe_loss_pct < 0.05:
+        return None
+    if wan_loss >= 0.05 and probe_loss_pct < max(0.1, wan_loss / 4.0):
+        return (f"FEC repairing: WAN dropping {wan_loss:.2f}% "
+                f"({drops:.0f} pps) while probes run {probe_loss_pct:.2f}% "
+                f"clean — measured proof of repair")
+    if (wan_loss >= 0.05 and slices > 1
+            and probe_loss_pct >= wan_loss * max(1.5, 0.6 * slices)):
+        return (f"loss amplification: probes lose {probe_loss_pct:.2f}% ≈ "
+                f"{probe_loss_pct / wan_loss:.1f}× the WAN slice loss "
+                f"({wan_loss:.2f}%) — a lost slice kills the whole "
+                f"{slices}-slice packet (no FEC on this path)")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -6259,6 +6557,243 @@ class ScenarioRunner:
         self.engine.add_marker("end")
         with self.lock:
             self._state.update(stage=None, ends_at=None, done=True)
+
+
+class FragmentSniffer:
+    """Count IPv4 fragments to/from the peer (R-13, 2.0.0): app-level size
+    checks can't distinguish the fabric delivering a WHOLE packet from the
+    kernel quietly reassembling mid-path fragments - a capture-level
+    fragment count can. Raw capture needs privileges (AF_PACKET: root/
+    CAP_NET_RAW on Linux; SIO_RCVALL: admin on Windows), so this is
+    best-effort: start() returns an error string instead of raising, and
+    the UI shows 'unavailable' rather than lying with a zero."""
+
+    def __init__(self, peer, bind="0.0.0.0"):
+        self.peer = peer
+        self.bind = bind
+        self.stop_evt = threading.Event()
+        self.thread = None
+        self.sock = None
+        self.l2_offset = 0
+        self.error = None
+        self.lock = threading.Lock()
+        self._frags = 0     # continuation pieces + first fragments
+        self._firsts = 0    # fragmented datagrams (first pieces only)
+
+    def start(self):
+        peer_ip = resolve_peer_ip(self.peer)
+        if peer_ip is None:
+            return "cannot resolve peer"
+        self.peer_ip = peer_ip
+        try:
+            if sys.platform == "win32":
+                s = socket.socket(socket.AF_INET, socket.SOCK_RAW,
+                                  socket.IPPROTO_IP)
+                bind_ip = self.bind if self.bind not in ("", "0.0.0.0") \
+                    else local_ip_toward(self.peer, self.bind)
+                s.bind((bind_ip, 0))
+                s.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
+                self.l2_offset = 0
+            elif hasattr(socket, "AF_PACKET"):
+                s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                                  socket.htons(0x0800))
+                self.l2_offset = 14
+            else:
+                return "raw capture not supported on this platform"
+        except (OSError, PermissionError) as e:
+            return (f"raw capture unavailable ({e}) - needs admin/root; "
+                    f"fragment counting off")
+        s.settimeout(0.5)
+        self.sock = s
+        self.thread = threading.Thread(target=self._run, name="frag-sniffer",
+                                       daemon=True)
+        self.thread.start()
+        return None
+
+    def stop(self):
+        self.stop_evt.set()
+
+    def status(self):
+        with self.lock:
+            return {"ok": self.sock is not None, "error": self.error,
+                    "frags": self._frags, "firsts": self._firsts}
+
+    def _run(self):
+        while not self.stop_evt.is_set():
+            try:
+                pkt = self.sock.recv(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            parsed = parse_ipv4_fragment(pkt, self.l2_offset)
+            if parsed is None:
+                continue
+            is_frag, is_first, _proto, src, dst = parsed
+            if not is_frag or self.peer_ip not in (src, dst):
+                continue
+            with self.lock:
+                self._frags += 1
+                if is_first:
+                    self._firsts += 1
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Results export (R-19, 2.0.0): the demo's leave-behind
+# ---------------------------------------------------------------------------
+def build_report(engine, args):
+    """Everything a POC leave-behind needs, as plain data: config, scores,
+    per-stream stats, totals, diagnostics, WAN counters, scenario state."""
+    snap = engine.snapshot()
+    t = snap["totals"]
+    rows = []
+    for r in snap["rows"]:
+        rows.append({k: r.get(k) for k in (
+            "name", "proto", "port", "connected", "rtt_avg", "latency",
+            "jitter", "loss", "late", "score", "mos", "label", "cum_tx",
+            "cum_recv", "cum_lost", "cum_late", "fwd_lost", "rtn_lost",
+            "peer_rx_max", "rx_echo_max", "expect_size", "dscp_req",
+            "fwd_tos", "rtn_tos", "tx_pps")})
+    return {
+        "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "version": __version__,
+        "peer": snap["peer"],
+        "command_line": " ".join(getattr(args, "_argv", []) or []),
+        "uptime_s": round(snap["uptime"], 1),
+        "since_reset_s": round(snap["since_reset"], 1),
+        "overall": {"score": round(snap["overall"], 1),
+                    "label": snap["overall_label"],
+                    "worst": round(snap["worst"], 1),
+                    "udp_mos": snap["udp_mos"], "tcp_pqi": snap["tcp_pqi"],
+                    "links_up": snap["links_up"]},
+        "offered_mbps": round(snap["offered_mbps"], 3),
+        "target_mbps": snap["target_mbps"],
+        "streams": rows,
+        "totals": t,
+        "diagnostics": {
+            "udp_silent": snap["udp_silent"],
+            "loss_pattern": snap["loss_pattern"],
+            "slice_evidence": snap["slice_evidence"],
+            "fec": snap["fec"],
+            "size_status": snap["size_status"],
+            "frags": snap["frags"],
+        },
+        "wan": snap["wan"],
+        "scenario": snap["scenario"],
+        "vxlan": snap["vxlan"],
+    }
+
+
+def render_report_html(data):
+    """A self-contained single-file HTML report (inline CSS, no scripts):
+    the demo's leave-behind. Tables mirror the dashboard's Totals/Isolate
+    views; verdict lines carry the diagnostics that fired."""
+    def esc(v):
+        return (str(v).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+    def num(v, fmt="{:.2f}"):
+        return fmt.format(v) if isinstance(v, (int, float)) else "-"
+
+    o = data["overall"]
+    rows_html = ""
+    for r in data["streams"]:
+        dscp = "-"
+        if r["dscp_req"] is not None or r["fwd_tos"] is not None:
+            f_ = (dscp_name(r["fwd_tos"] >> 2)
+                  if r["fwd_tos"] is not None else "?")
+            r_ = (dscp_name(r["rtn_tos"] >> 2)
+                  if r["rtn_tos"] is not None else "?")
+            dscp = f"{dscp_name(r['dscp_req'])}→{f_}/{r_}"
+        rows_html += (
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
+            "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
+            "<td>{}</td></tr>\n".format(
+                esc(r["name"]), "UP" if r["connected"] else "DOWN",
+                num(r["rtt_avg"]), num(r["jitter"]), num(r["loss"], "{:.2f}"),
+                num(r["late"], "{:.2f}"), num(r["score"], "{:.0f}"),
+                num(r["mos"]) if r["mos"] is not None else "-",
+                f"{r['cum_tx']:,}", f"{r['cum_lost']:,}", esc(dscp)))
+    t = data["totals"]
+    diags = [(k, v) for k, v in data["diagnostics"].items()
+             if v not in (None, False) and k != "frags"]
+    diag_html = "".join(f"<li><b>{esc(k)}:</b> {esc(v)}</li>"
+                        for k, v in diags) or "<li>all clean</li>"
+    wan = data["wan"]
+    wan_html = ""
+    if wan:
+        wan_html = ("<p><b>WAN counters ({}):</b> tx {} pps · rx {} pps"
+                    "{}</p>".format(
+                        esc(wan["kind"]), num(wan["tx_pps"], "{:.0f}"),
+                        num(wan["rx_pps"], "{:.0f}"),
+                        f" · drops {num(wan['drop_pps'], '{:.1f}')} pps"
+                        if wan.get("drop_pps") is not None else ""))
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Network Vitals report — {esc(data['peer'])}</title>
+<style>
+body {{ font-family: 'Segoe UI', sans-serif; background: #1a1d21;
+       color: #f2f4f5; margin: 2em; }}
+h1 {{ color: #01A982; }} h2 {{ color: #9aa3ad; margin-top: 1.4em; }}
+table {{ border-collapse: collapse; margin: 0.6em 0; }}
+th, td {{ border: 1px solid #363b44; padding: 5px 10px; text-align: right; }}
+th {{ background: #23272e; color: #01A982; }}
+td:first-child, th:first-child {{ text-align: left; }}
+.score {{ font-size: 2.4em; font-weight: bold; color: #01A982; }}
+.meta {{ color: #9aa3ad; font-size: 0.9em; }}
+ul {{ line-height: 1.6; }}
+</style></head><body>
+<h1>Network Vitals — demo report</h1>
+<p class="meta">generated {esc(data['generated'])} · v{esc(data['version'])}
+ · peer {esc(data['peer'])} · uptime {data['uptime_s']} s
+ · <code>{esc(data['command_line'])}</code></p>
+<p><span class="score">{o['score']}</span> {esc(o['label'])}
+ (worst {o['worst']}, {o['links_up']} streams up)
+ · UDP MOS {num(o['udp_mos'])} · TCP PQI {num(o['tcp_pqi'], '{:.0f}')}
+ · offered {data['offered_mbps']} Mbps{
+     ' / target ' + str(data['target_mbps']) if data['target_mbps'] else ''}</p>
+{wan_html}
+<h2>Streams</h2>
+<table><tr><th>Stream</th><th>Status</th><th>RTT ms</th><th>Jitter</th>
+<th>Loss %</th><th>Late %</th><th>Score</th><th>MOS</th><th>Sent</th>
+<th>Lost</th><th>DSCP rq→f/r</th></tr>
+{rows_html}</table>
+<h2>Totals (since reset)</h2>
+<p>sent {t['tx']:,} · received {t['recv']:,} · lost {t['lost']:,}
+ ({t['loss_pct']:.2f}%) · late {t['late']:,} ({t['late_pct']:.2f}%) ·
+ forward {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%) · return {t['rtn_lost']:,}
+ ({t['rtn_pct']:.2f}%)</p>
+<p class="meta">lifetime: sent {t['life_tx']:,} · lost {t['life_lost']:,}
+ ({t['life_loss_pct']:.2f}%) · late {t['life_late']:,}
+ ({t['life_late_pct']:.2f}%)</p>
+<h2>Diagnostics</h2>
+<ul>{diag_html}</ul>
+<p class="meta">Generated by Network Vitals v{esc(data['version'])} —
+the SD-WAN demo traffic instrument.</p>
+</body></html>
+"""
+
+
+def write_report(engine, args, base=None):
+    """Write the JSON + HTML report pair. `base` is a path base (without
+    extension); default: config_dir()/reports/netvitals-<stamp>. Returns
+    (json_path, html_path)."""
+    data = build_report(engine, args)
+    if base is None:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        rep_dir = os.path.join(config_dir(), "reports")
+        os.makedirs(rep_dir, exist_ok=True)
+        base = os.path.join(rep_dir, f"netvitals-{stamp}")
+    jpath, hpath = base + ".json", base + ".html"
+    with open(jpath, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=1)
+    with open(hpath, "w", encoding="utf-8") as fh:
+        fh.write(render_report_html(data))
+    return jpath, hpath
 
 
 def _normalize_peer_args(args):
@@ -6477,7 +7012,8 @@ def main(argv=None):
                         rates.append((pps, len(ec_wire_view(
                             BURST_PROBE_SIZE + 28))))
                 return rates
-            source = SimWanSource(sim_rates, spec["noise_pps"])
+            source = SimWanSource(sim_rates, spec["noise_pps"],
+                                  spec.get("loss_pct", 0.0))
         elif spec["kind"] == "snmp":
             source = SnmpWanSource(spec["host"], spec["community"],
                                    spec["ifindex"], spec["port"])
@@ -6490,6 +7026,13 @@ def main(argv=None):
     if scenario is not None:
         engine.scenario = ScenarioRunner(engine, args, scenario)
         engine.scenario.start()
+
+    if args.frag_sniffer:
+        engine.frag = FragmentSniffer(engine.peer, args.bind)
+        err = engine.frag.start()
+        if err:
+            engine.frag.error = err
+            print(f"note: {err}", file=sys.stderr)
 
     use_gui = not args.no_gui
     if use_gui:
@@ -6514,6 +7057,12 @@ def main(argv=None):
     finally:
         engine.shutdown()
         clear_timer_resolution(1)
+        if args.report:
+            try:
+                _jp, hp = write_report(engine, args, base=args.report)
+                print(f"report written: {hp}")
+            except OSError as e:
+                print(f"error: report failed: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

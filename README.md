@@ -444,10 +444,15 @@ Bad below.
 --slice-scan       one-shot: measure the fabric's REAL slice budget from the
                    RTT-vs-size staircase (see "Measuring the WAN side")
 --wan-counters S   poll WAN-side packet counters and show measured WAN pps:
-                   sim[:NOISE] | snmp:HOST,COMMUNITY,IFINDEX[,PORT] |
-                   rest:URL[|TOKEN[|TXKEY|RXKEY]]
+                   sim[:NOISE[:LOSS%]] | snmp:HOST,COMMUNITY,IFINDEX[,PORT] |
+                   rest:URL[|TOKEN[|TXKEY|RXKEY]]; drop counters feed the
+                   FEC verdict
 --scenario FILE    replay a JSON demo timeline (stages with load/square-wave/
                    reset), drawn as stage markers on the charts
+--frag-sniffer     count IPv4 fragments to/from the peer at capture level
+                   (needs root/admin; reports unavailable otherwise)
+--report BASE      write the demo report (BASE.json + BASE.html) on exit;
+                   the ⭳ Report button / console 'w' key write on demand
 ```
 
 At the defaults each stream is ~50 packets/s × 200 B ≈ 10 KB/s each way, i.e.
@@ -741,6 +746,34 @@ Three ways to turn the Anatomy panel's *prediction* into *measurement*:
   both lose, the app checks whether the loss ratio tracks the slice-count
   ratio — sustained `large ≈ N × small` is live slicing evidence with no
   fabric access, called out in the status line.
+- **FEC verdict (2.0.0)**: when the counter source reports drops (the SNMP
+  discard/error OIDs, or the simulator's `sim:NOISE:LOSS%` knob), the app
+  compares WAN-side loss with app-level probe loss and names the result:
+  **WAN dropping while probes run clean = FEC repairing, measured**; probe
+  loss ≈ N× the WAN slice loss = amplification with no repair. Silent when
+  neither is proven.
+- **Topology strip (2.0.0)**: the **≣ Topology** button draws
+  Host → EC → fabric → EC → peer with the live numbers moving — LAN pps,
+  predicted/measured WAN pps and the amplification ratio on the tunnel
+  span.
+- **PMTUD verdict in the sweep (2.0.0)**: on Linux the MTU sweep also
+  listens for ICMP *fragmentation-needed* on the socket error queue (no
+  raw socket, no root) and reports **"ICMP frag-needed received
+  (MTU=N)"** vs **"dropped silently → PMTUD black hole"**.
+- **Fragment sniffer (2.0.0, `--frag-sniffer`)**: counts IPv4 fragments
+  to/from the peer at capture level — distinguishing the fabric delivering
+  whole packets from the kernel quietly reassembling mid-path fragments.
+  Needs root/admin for the raw socket; degrades to an honest
+  "unavailable".
+
+## Demo report (2.0.0)
+
+One click, one leave-behind: the dashboard's **⭳ Report** button (console:
+the `w` key; CLI: `--report BASE` on exit) writes a timestamped **JSON +
+self-contained HTML** pair — scores, per-stream stats incl. DSCP readback,
+totals, forward/return split, every diagnostic that fired (loss pattern,
+slice evidence, FEC verdict), WAN counters and scenario state. On-demand
+reports land in the NetVitals config dir under `reports/`.
 
 ## Scenario scripting (`--scenario`, 1.9.0)
 
@@ -901,6 +934,14 @@ the host-side measurement tranche of this roadmap.
 readout, the **sustained-load panel** (⚡ Load button, with the square-wave
 calibration schedule), and the **hardened burst test** (optional DF,
 loss-vs-late split in stages and verdicts).
+
+*Shipped in 2.0.0* (Milestone 2.0 — proving the fabric): the **FEC
+verdict** (WAN drop counters vs probe loss: repair proven or amplification
+named), the sweep's **PMTUD verdict** (ICMP frag-needed vs silent black
+hole, via the Linux error queue — no root), the **fragment sniffer**
+(`--frag-sniffer`, capture-level whole-packet-delivery proof), the live
+**topology strip** (≣ button), and the **demo report** (⭳ button /
+`--report`: JSON + self-contained HTML leave-behind).
 
 *Shipped in 1.9.0* (Milestone 1.9 — measuring the WAN side): **WAN counter
 polling** (`--wan-counters`: SNMP / generic REST / a no-hardware simulator)
