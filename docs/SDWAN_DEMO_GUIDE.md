@@ -461,6 +461,42 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
   identical port lists; the mesh GUI and console scale with the stream
   count automatically.
 
+### T18. Measured WAN counters and the calibration diff (1.9.0)
+
+- **Demonstrates:** *measured* WAN pps next to the Anatomy panel's
+  *predicted* pps — 1 LAN packet becoming N WAN packets, observed, not
+  modeled; and on busy fabrics, isolating the demo's footprint by
+  square-waving the load and diffing the counters between on/off windows.
+- **Run:** `--wan-counters snmp:<wan-router>,public,<ifindex>` (any
+  SNMP-capable device), `rest:URL|TOKEN|tx.path|rx.path`, or
+  `--wan-counters sim` for the no-hardware rehearsal. Open **Anatomy** for
+  the measured line; the console prints it too.
+- **Show:** measured tx/rx pps vs predicted pps and the ×N-vs-LAN ratio;
+  with a square-wave stage running, the counters stepping in cadence.
+
+### T19. Slice-budget measurement and live slicing evidence (1.9.0)
+
+- **Demonstrates:** the fabric's real slice budget measured from the wire
+  (RTT-vs-size staircase), and per-WAN-packet loss proven from the loss
+  ratio of a 1-slice vs N-slice stream pair — both with zero EC access.
+- **Run:** one-shot `--slice-scan` against a running native peer; or
+  continuously, `--profiles 200,3000` and watch for the slice-loss-ratio
+  line when loss appears.
+- **Show:** the scan's boundary list and measured budget vs the model
+  constant; the status line naming `N-slice/1-slice` loss amplification.
+
+### T20. Scripted demo arcs (--scenario, 1.9.0)
+
+- **Demonstrates:** a hands-free, repeatable demo: baseline → load →
+  calibration square wave → clean slate, with stage markers on the charts.
+- **Run:** `--scenario demo.json` (format in the README); `repeat: 0`
+  loops for a booth/kiosk demo.
+- **Show:** dashed stage markers (labeled on the latency chart), the
+  footer's stage countdown, and the charts reacting per stage.
+- **Caveats:** load stages need native transport and target the first
+  peer; a stage with `reset: true` wipes the since-reset window (lifetime
+  counters survive, as always).
+
 ## 2.4 Constraint summary (read before scripting a demo)
 
 | Constraint | Detail |
@@ -511,10 +547,10 @@ should dial bandwidth directly, shape it over time, and mix classes.*
   64/576/1500-byte IP packets cycled probe-by-probe) or a custom
   `SIZE`/`SIZExPPS`; `--mbps` composes (sizes kept, per-stream rates
   derived from each stream's own mean wire size).
-- **R-4. Scenario scripting.** A small JSON/YAML timeline (stage, duration,
-  rates, sizes) the app replays — repeatable, hands-free demo arcs
-  ("baseline 60 s → 10 Mbps 30 s → jumbo 30 s"), with stage markers drawn on
-  the charts.
+- **R-4. Scenario scripting.** ✅ **Shipped in 1.9.0**: `--scenario FILE`
+  replays a JSON timeline (per-stage secs, load_mbps, square-wave on/off,
+  reset) with dashed stage markers on all four charts and a live
+  stage/pass countdown in the footer; `repeat: 0` loops a demo forever.
 - **R-5. Burst-test hardening.** ◐ **Partially shipped in 1.7.0**:
   `--dont-fragment` now applies to burst probes (they used to silently
   fragment below 1228-B MTU paths), and stages report **loss vs late**
@@ -553,19 +589,25 @@ the tool should be able to present all of those dimensions deliberately.*
 *Theme: today the WAN middle is predicted by the Anatomy model; tomorrow it
 is measured. (This is the existing README roadmap, carried forward.)*
 
-- **R-10. EC WAN counter polling** *(README #1)*: poll appliance/Orchestrator
-  REST (or SNMP `ifHCIn/OutUcastPkts`) and show **measured** WAN pps next to
-  the Anatomy panel's **predicted** pps — live proof that 1 LAN packet
-  becomes N WAN packets. Open questions: endpoints/auth; path selection
-  (direct EC1↔EC2 first, hub transit later); attribution on busy fabrics
-  (per-tunnel stats + the R-2 calibration burst).
+- **R-10. EC WAN counter polling** *(README #1)*. ◐ **Shipped in 1.9.0**
+  as a pluggable collector: `--wan-counters` polls **SNMP** (stdlib v2c,
+  IF-MIB 64-bit counters — covers EC and any router), a **generic REST**
+  JSON endpoint, or the built-in **simulator** (integrates this instance's
+  own load through the EC slicing model — the no-hardware UAT backend);
+  measured WAN pps renders next to the Anatomy panel's predicted pps, and
+  the square-wave calibration isolates the load's footprint on busy
+  fabrics. Remaining for UAT against real gear: the Orchestrator-specific
+  endpoint/auth preset and hub-transit path selection.
 - **R-11. FEC verdict** *(README #2)*: WAN slice loss vs probe loss — WAN
   counters dropping while probe loss stays 0 % is measured proof FEC is
   repairing; probe loss ≈ N × slice loss quantifies loss amplification.
-- **R-12. Slice-boundary detector** *(README #3)*: sweep size vs RTT/loss
-  discontinuities at slice-budget multiples to measure the real budget
-  empirically; always-on variant: concurrent 1-slice + N-slice streams whose
-  loss ratio is live slicing evidence with no EC access at all.
+- **R-12. Slice-boundary detector** *(README #3)*. ✅ **Shipped in 1.9.0**:
+  `--slice-scan` measures the real slice budget from the RTT-vs-size
+  staircase (and says when the Anatomy model constant needs tuning), and
+  the always-on **slice-loss-ratio evidence** watches any two UDP streams
+  with different slice counts (e.g. `--profiles 200,3000`) and calls out
+  `large ≈ N × small` loss as live per-WAN-packet loss — no EC access
+  needed for either.
 - **R-13. LAN fragment sniffer + ICMP listener** *(README #4, #5)*: raw-
   socket fragment counting to distinguish EC reassembly from kernel
   reassembly, and "ICMP frag-needed (MTU=1500) received" vs "silently
@@ -603,7 +645,7 @@ is measured. (This is the existing README roadmap, carried forward.)*
 |---|---|---|
 | **1.7** ✅ shipped | R-1, R-2, R-5 (DF + late split; TCP/VXLAN burst deferred) | Biggest demo wins, no new privileges/protocols: dial-a-bandwidth + sustained load on the live charts |
 | **1.8** ✅ shipped | R-6, R-3, R-7 + alpha-aware updater | The policy-classification surface: DSCP + multi-class mixes + configurable stream sets |
-| **1.9** | R-10, R-12, R-4 | First measured-WAN loop (counters + calibration burst + scripted scenarios) |
+| **1.9** ✅ shipped (1.9.0a1) | R-10 (collector + simulator; Orchestrator preset at UAT), R-12, R-4 | First measured-WAN loop (counters + calibration burst + scripted scenarios) |
 | **2.0** | R-11, R-13, R-15, R-19 | The full "prove the fabric" story + the leave-behind report |
 | **2.x** | R-8, R-9, R-14, R-16 – R-18, R-20, R-21 | Scale-out, automation, elastic loads |
 

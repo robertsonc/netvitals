@@ -49,7 +49,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.8.0"
+__version__ = "1.9.0a1"
 
 # Where --update / --check-update look for the latest SIGNED release manifest. The
 # manifest is verified against UPDATE_PUBKEY before anything is installed (fail closed),
@@ -1889,6 +1889,13 @@ class Engine:
         self.expect_size = {}  # sid -> largest payload the pattern sends
         self.mean_wire = {}    # sid -> mean IP bytes/probe (offered-load math)
         self.rate_of_sid = {}  # sid -> effective probe rate (pps)
+        self.slices_of_sid = {}  # sid -> predicted WAN packets per probe
+        # Scenario stage markers for the charts: (t_mono, label), trimmed to
+        # the chart horizon by the sampler. wan/scenario are attached by
+        # main() after construction (the sim WAN source needs the engine).
+        self.markers = deque()
+        self.wan = None        # WanCounters or None
+        self.scenario = None   # ScenarioRunner or None
         self.stats = {}      # (peer, sid) -> StreamStats
         self.streams = []
         # In VXLAN mode ALL four streams ride one shared userspace VTEP; the
@@ -1920,6 +1927,8 @@ class Engine:
             self.expect_size[sid] = max(sizes)
             self.mean_wire[sid] = mean_wire_size(sizes, proto)
             self.rate_of_sid[sid] = stream_pps
+            self.slices_of_sid[sid] = len(ec_wire_view(wan_inner_bytes(
+                sum(sizes) / len(sizes), proto, bool(vxlan))))
             stats_of = {}
             for p in self.peers:
                 st = StreamStats(window=window, timeout=timeout,
@@ -1949,6 +1958,10 @@ class Engine:
 
     def shutdown(self):
         self.stop.set()
+        if self.wan is not None:
+            self.wan.stop()
+        if self.scenario is not None:
+            self.scenario.stop()
 
     def effective_loss(self, loss, late):
         """Combined loss+late, with a deadband so trivial blips read as zero."""
@@ -2028,6 +2041,18 @@ class Engine:
                     self.owd_hist_f[peer].append(fwd_s)
                     self.owd_hist_r[peer].append(rtn_s)
                     self.band_history[peer].append(band_s)
+                horizon = now - self.history_seconds - 2
+                while self.markers and self.markers[0][0] < horizon:
+                    self.markers.popleft()
+
+    def add_marker(self, label):
+        """Record a scenario stage boundary for the charts."""
+        with self.history_lock:
+            self.markers.append((time.monotonic(), label))
+
+    def markers_copy(self):
+        with self.history_lock:
+            return list(self.markers)
 
     def history_copy(self, peer=None):
         peer = peer or self.peer
@@ -2168,6 +2193,15 @@ class Engine:
             "offered_mbps": offered_bps / 1e6,
             "target_mbps": self.target_mbps,
             "profiles_active": self.profiles_active,
+            # 1.9.0: measured WAN counters, scenario progress, and the
+            # no-fabric-access slicing evidence (loss-ratio law).
+            "wan": self.wan.status() if self.wan else None,
+            "scenario": self.scenario.status() if self.scenario else None,
+            "slice_evidence": slice_loss_evidence(rows, self.slices_of_sid,
+                                                  self.loss_deadband),
+            "predicted_wan_pps": sum(
+                r["tx_pps"] * self.slices_of_sid[r["sid"]] * 2
+                for r in rows),
         }
 
     def reset(self):
@@ -2248,13 +2282,15 @@ BAND_FILL = "#3a6f7d"   # percentile band (stippled -> reads as translucent)
 
 def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
                 ymin_floor=1.0, unit="", value_fmt=None, band=None,
-                band_label=None):
+                band_label=None, markers=None, mark_labels=False):
     """Render one time-series chart onto a Tk Canvas.
 
     series: list of (sid, color, short_label). samples_by_sid: {sid: [sample]}.
     Each sample is {'t', key..., 'up'}; None values break the line (gap = down).
     band: optional [{'t','lo','hi','up'}] drawn as a shaded region behind the
     series lines (None/down samples break it), labeled `band_label`.
+    markers: optional [(t_mono, label)] scenario stage boundaries, drawn as
+    dashed verticals (labels only when mark_labels, to keep small charts clean).
     """
     if value_fmt is None:
         value_fmt = lambda v: f"{v:.0f}"
@@ -2334,6 +2370,19 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
                       (0.5, f"-{int(view_seconds / 2)}s"), (1.0, "now")):
         canvas.create_text(pad_l + pw * frac, h - 8, text=lbl, anchor="center",
                            fill=TXT_DIM, font=(FONT, 7))
+
+    # scenario stage markers (behind the series lines)
+    if markers:
+        for mt, mlabel in markers:
+            if mt < t0 or mt > now:
+                continue
+            mx = X(mt)
+            canvas.create_line(mx, pad_t, mx, pad_t + ph, fill="#5a6270",
+                               dash=(3, 3))
+            if mark_labels and mlabel:
+                canvas.create_text(min(mx + 3, w - pad_r - 4), pad_t + 8,
+                                   text=mlabel, anchor="w", fill=TXT_DIM,
+                                   font=(FONT, 7))
 
     # series polylines (break on None = stream down)
     for sid, color, _n in series:
@@ -2635,6 +2684,9 @@ def run_gui(engine, args):
     warn_var = tk.StringVar(value="")
     warn_lbl = tk.Label(footer, textvariable=warn_var, fg="#ffd27e", bg=BG,
                         font=(FONT, 9, "bold"), anchor="w")
+    scen_var = tk.StringVar(value="")
+    scen_lbl = tk.Label(footer, textvariable=scen_var, fg=HPE_GREEN, bg=BG,
+                        font=(FONT, 9, "bold"), anchor="w")
     foot_path_var = tk.StringVar(value="")
     foot_path_lbl = tk.Label(footer, textvariable=foot_path_var, fg=TXT_DIM,
                              bg=BG, font=(FONT, 9), anchor="w")
@@ -2781,6 +2833,11 @@ def run_gui(engine, args):
                       text=noec)
 
     anat_canvas.bind("<Configure>", draw_anatomy)
+    # Measured WAN line under the anatomy canvas (1.9.0): live counters
+    # from --wan-counters next to the model's prediction - the loop closer.
+    anat_wan_var = tk.StringVar(value="")
+    tk.Label(anat_frame, textvariable=anat_wan_var, fg=TXT_DIM, bg=BG,
+             font=(FONT, 9), anchor="w").pack(fill="x", pady=(2, 0))
 
     # ---- sustained load panel (hidden; the burst generator made resident) --
     # A known-quantity UDP load offered WHILE the scored streams keep
@@ -2963,6 +3020,8 @@ def run_gui(engine, args):
                          f"{more} — bleaching/remap policy in the path")
         elif snap.get("loss_pattern"):
             warn_var.set(f"⚠ loss pattern (last 60 s): {snap['loss_pattern']}")
+        elif snap.get("slice_evidence"):
+            warn_var.set(f"⚠ {snap['slice_evidence']}")
         else:
             warn_var.set("")
         if warn_var.get():
@@ -2970,6 +3029,23 @@ def run_gui(engine, args):
                 warn_lbl.pack(fill="x", before=foot_path_lbl)
         elif warn_lbl.winfo_ismapped():
             warn_lbl.pack_forget()
+        scn = snap.get("scenario")
+        if scn:
+            if scn["done"]:
+                scen_var.set(f"scenario {scn['name']}: finished")
+            elif scn["stage"] is not None:
+                rep = (f"  ·  pass {scn['pass_n']}"
+                       + (f"/{scn['repeat']}" if scn["repeat"] else " (loop)"))
+                scen_var.set(f"scenario {scn['name']}:  stage {scn['idx']}/"
+                             f"{scn['total']}  “{scn['stage']}”  "
+                             f"{scn['remaining']:.0f} s left{rep}")
+        else:
+            scen_var.set("")
+        if scen_var.get():
+            if not scen_lbl.winfo_ismapped():
+                scen_lbl.pack(fill="x", before=foot_path_lbl)
+        elif scen_lbl.winfo_ismapped():
+            scen_lbl.pack_forget()
         # Offered probe load (this direction, IP level): with --mbps show
         # achieved vs target so the known quantity is verifiable on screen.
         load_txt = f"  ·  probe load {snap['offered_mbps']:.2f} Mbps"
@@ -3007,6 +3083,27 @@ def run_gui(engine, args):
             f"fwd→ {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%)  "
             f"rtn← {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%){life}")
 
+        if anatomy_shown["on"]:
+            wan = snap.get("wan")
+            if wan is None:
+                anat_wan_var.set("measured WAN: no counter source — start "
+                                 "with --wan-counters sim | snmp:... | "
+                                 "rest:... to close the loop")
+            elif wan["ok"] and wan["tx_pps"] is not None:
+                lan_pps = sum(r["tx_pps"] for r in snap["rows"]) * 2
+                anat_wan_var.set(
+                    f"measured WAN ({wan['kind']}):  tx {wan['tx_pps']:.0f} "
+                    f"pps   rx {wan['rx_pps']:.0f} pps   ·   predicted "
+                    f"{snap['predicted_wan_pps']:.0f} pps   ·   ×"
+                    f"{wan['tx_pps'] / max(1.0, lan_pps):.2f} vs LAN "
+                    f"({lan_pps:.0f} pps)")
+            elif wan["ok"]:
+                anat_wan_var.set(f"measured WAN ({wan['kind']}): first "
+                                 f"poll…")
+            else:
+                anat_wan_var.set(f"measured WAN ({wan['kind']}): "
+                                 f"{wan['detail']}")
+
         if isolate_shown["on"]:
             for row in snap["rows"]:
                 where, tag = loss_verdict(row["fwd_lost"], row["rtn_lost"])
@@ -3043,17 +3140,20 @@ def run_gui(engine, args):
 
         hist = engine.history_copy()
         owd_f, owd_r, band_hist = engine.extra_history_copy()
+        marks = engine.markers_copy()
         now = time.monotonic()  # history samples are stamped with monotonic time
         _draw_chart(lat_canvas, "Latency (RTT, ms)", "rtt", series, hist,
                     view_seconds, now, ymin_floor=2.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}",
-                    band=band_hist, band_label="p5–p95 (UDP)")
+                    band=band_hist, band_label="p5–p95 (UDP)",
+                    markers=marks, mark_labels=True)
         _draw_chart(loss_canvas, "Loss + late (%)", "loss", series, hist,
                     view_seconds, now, ymin_floor=2.0, unit="%",
-                    value_fmt=lambda v: f"{v:.0f}")
+                    value_fmt=lambda v: f"{v:.0f}", markers=marks)
         _draw_chart(jit_canvas, "Jitter (ms)", "jitter", series, hist,
                     view_seconds, now, ymin_floor=1.0, unit="",
-                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
+                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}",
+                    markers=marks)
         # Directional one-way drift: two aggregate lines (mean over live UDP
         # streams), each direction's delay growth above its ~60 s best. The
         # clocks' unknown offset cancels, so only the MOVEMENT is meaningful.
@@ -3061,7 +3161,8 @@ def run_gui(engine, args):
                     [("F", HPE_GREEN, "fwd→"), ("R", "#FF8300", "rtn←")],
                     {"F": owd_f, "R": owd_r},
                     view_seconds, now, ymin_floor=2.0, unit="",
-                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
+                    value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}",
+                    markers=marks)
 
     def refresh():
         # One bad tick must not kill the whole update chain: on an unattended
@@ -3506,12 +3607,32 @@ def run_console_loop(engine, args, vt):
                   f"return <- {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%)"
                   + "".join(f"   {r['name'].split('-')[1]}:{loss_verdict(r['fwd_lost'], r['rtn_lost'])[0]}"
                             for r in snap["rows"] if r["fwd_lost"] > 6 or r["rtn_lost"] > 6))
+            wan = snap.get("wan")
+            if wan:
+                if wan["ok"] and wan["tx_pps"] is not None:
+                    print(f"  WAN ({wan['kind']}):  tx {wan['tx_pps']:.0f} pps"
+                          f"   rx {wan['rx_pps']:.0f} pps   predicted "
+                          f"{snap['predicted_wan_pps']:.0f} pps")
+                else:
+                    print(f"  WAN ({wan['kind']}): "
+                          f"{'first poll...' if wan['ok'] else wan['detail']}")
+            scn = snap.get("scenario")
+            if scn and scn["done"]:
+                print(f"  scenario {scn['name']}: finished")
+            elif scn and scn["stage"] is not None:
+                rep = (f"  pass {scn['pass_n']}"
+                       + (f"/{scn['repeat']}" if scn["repeat"] else " (loop)"))
+                print(f"  scenario {scn['name']}: stage {scn['idx']}/"
+                      f"{scn['total']} '{scn['stage']}'  "
+                      f"{scn['remaining']:.0f}s left{rep}")
             if snap.get("udp_silent"):
                 print("  ! UDP silent while TCP is up: UDP blocked in the path "
                       "(firewall/ACL) or the peer runs an outdated version - "
                       "update BOTH ends.")
             elif snap.get("loss_pattern"):
                 print(f"  ! loss pattern (last 60 s): {snap['loss_pattern']}")
+            elif snap.get("slice_evidence"):
+                print(f"  ! {snap['slice_evidence']}")
             if keys.enabled:
                 print("  keys:  [r] reset counters    [q] quit    (Ctrl-C also quits)")
             key = keys.poll(args.refresh_ms / 1000.0)
@@ -4958,6 +5079,25 @@ def parse_args(argv=None):
                         "max 500 each).")
     p.add_argument("--burst-secs", type=float, default=3.0, metavar="S",
                    help="Seconds per burst stage (default 3).")
+    p.add_argument("--slice-scan", action="store_true",
+                   help="One-shot: scan probe size vs RTT/loss and detect "
+                        "the WAN slice-boundary staircase, measuring the "
+                        "fabric's real slice budget against the Anatomy "
+                        "model constant. Peer must be running Network "
+                        "Vitals (native mode).")
+    p.add_argument("--wan-counters", type=_wan_spec, default=None,
+                   metavar="SPEC",
+                   help="Poll WAN-side packet counters and show MEASURED "
+                        "WAN pps next to the predicted pps: 'sim[:NOISE]' "
+                        "(built-in simulator via the EC slicing model), "
+                        "'snmp:HOST,COMMUNITY,IFINDEX[,PORT]' (IF-MIB "
+                        "64-bit counters), or 'rest:URL[|TOKEN[|TXKEY|"
+                        "RXKEY]]' (generic JSON).")
+    p.add_argument("--scenario", default=None, metavar="FILE",
+                   help="Replay a JSON demo timeline: stages with secs, "
+                        "load_mbps, square_on_s/off_s and reset, drawn as "
+                        "stage markers on the charts. See the demo guide "
+                        "for the format.")
     return p.parse_args(argv)
 
 
@@ -5067,6 +5207,160 @@ def run_mtu_sweep(args, out=print):
             f"(but short of 9000 jumbo).")
     else:
         out("=> Standard 1500-byte MTU; no jumbo on this path.")
+
+
+def detect_slice_boundaries(samples, min_step_ms=0.12):
+    """Find WAN slice boundaries in a size-vs-RTT scan (R-12, 1.9.0).
+
+    samples: [(inner_ip_bytes, median_rtt_ms, loss_pct)], ascending sizes.
+    Every extra tunnel packet costs one more serialization + crypto pass,
+    so the RTT-vs-size curve is a staircase: a boundary is a step UP that
+    exceeds both `min_step_ms` and 4x the median step elsewhere, and STAYS
+    up. Returns (boundaries, est_budget): the inner sizes where the steps
+    landed and the median gap between them (the measured slice budget), or
+    ([], None) when the curve is flat - i.e. no slicing fabric in the path."""
+    steps = []
+    for i in range(1, len(samples)):
+        s0, r0, _ = samples[i - 1]
+        s1, r1, _ = samples[i]
+        steps.append((s1, r1 - r0))
+    if not steps:
+        return [], None
+    mags = sorted(abs(d) for _, d in steps)
+    noise = mags[len(mags) // 2]
+    thresh = max(min_step_ms, 4.0 * noise)
+    boundaries = []
+    for i, (size, delta) in enumerate(steps):
+        if delta < thresh:
+            continue
+        # must STAY up: the median of the next few samples doesn't fall back
+        after = [r for _s, r, _l in samples[i + 1:i + 4]]
+        before = samples[i][1]
+        if after and sorted(after)[len(after) // 2] < before + thresh / 2:
+            continue
+        # merge near-duplicates from one boundary spanning two grid points
+        if boundaries and size - boundaries[-1] <= 2 * (samples[1][0]
+                                                        - samples[0][0]):
+            continue
+        boundaries.append(size)
+    if len(boundaries) >= 2:
+        gaps = [b - a for a, b in zip(boundaries, boundaries[1:])]
+        est = sorted(gaps)[len(gaps) // 2]
+    elif len(boundaries) == 1:
+        est = boundaries[0]
+    else:
+        est = None
+    return boundaries, est
+
+
+def run_slice_scan(args, out=print):
+    """One-shot slice-boundary scan (R-12): step the probe size across a
+    uniform grid and measure median RTT + loss at each size, then detect
+    the staircase the fabric's slicing imposes - measuring the REAL slice
+    budget instead of trusting the Anatomy model's constants. Uses the
+    TEST-probe side channel (ephemeral port, excluded from loss isolation)
+    against a peer running Network Vitals in native mode."""
+    peer, port = args.peer, args.udp_ports[0]
+    lo_inner = 900                     # below any plausible slice budget
+    hi_inner = min(int(EC_SLICE_BUDGET * 3.2) + 200, MAX_SIZE - 28)
+    step = 32
+    probes_per_size = 24
+    out(f"Slice scan -> {peer}:{port} (UDP TEST probes, no DF). "
+        f"Peer must be running Network Vitals.")
+    out(f"Sizes {lo_inner}-{hi_inner} B (IP level) in {step} B steps, "
+        f"{probes_per_size} probes each; model budget "
+        f"{EC_SLICE_BUDGET} B for comparison.")
+    out("")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    enlarge_socket_buffers(sock)
+    quench_udp_connreset(sock)
+    try:
+        sock.bind((args.bind, 0))
+    except OSError as e:
+        out(f"bind failed: {e}")
+        return
+    sock.settimeout(0.25)
+    seq = [0]
+
+    def measure(payload):
+        """Median RTT + loss for `probes_per_size` paced probes."""
+        rtts, pending = [], {}
+        for _ in range(probes_per_size):
+            seq[0] += 1
+            s = seq[0]
+            pkt = build_packet(TYPE_TEST, 0, s, time.monotonic_ns(), payload)
+            pending[s] = time.monotonic_ns()
+            try:
+                sock.sendto(pkt, (peer, port))
+            except OSError:
+                pending.pop(s, None)
+            deadline = time.monotonic() + 0.005   # ~200 pps pacing
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                sock.settimeout(left)
+                try:
+                    data, _ = sock.recvfrom(MAX_SIZE)
+                except socket.timeout:
+                    break
+                except OSError:
+                    break
+                p = parse_header(data)
+                if p and p[0] == TYPE_ECHO:
+                    ns = pending.pop(p[2], None)
+                    if ns is not None:
+                        rtts.append((time.monotonic_ns() - ns) / 1e6)
+        t_end = time.monotonic() + 0.25          # drain stragglers
+        while time.monotonic() < t_end and pending:
+            sock.settimeout(0.05)
+            try:
+                data, _ = sock.recvfrom(MAX_SIZE)
+            except (socket.timeout, OSError):
+                continue
+            p = parse_header(data)
+            if p and p[0] == TYPE_ECHO:
+                ns = pending.pop(p[2], None)
+                if ns is not None:
+                    rtts.append((time.monotonic_ns() - ns) / 1e6)
+        loss = len(pending) / probes_per_size * 100.0
+        med = sorted(rtts)[len(rtts) // 2] if rtts else None
+        return med, loss
+
+    samples = []
+    for inner in range(lo_inner, hi_inner + 1, step):
+        med, loss = measure(inner - 28)          # payload = inner IP - 28
+        if med is None:
+            out(f"  {inner:>5} B: no echoes - peer down or UDP blocked; "
+                f"aborting.")
+            sock.close()
+            return
+        samples.append((inner, med, loss))
+    sock.close()
+
+    boundaries, est = detect_slice_boundaries(samples)
+    for inner, med, loss in samples:
+        mark = "  << boundary" if inner in boundaries else ""
+        if boundaries and inner in boundaries or inner % 256 < step:
+            out(f"  {inner:>5} B  RTT med {med:6.2f} ms  loss {loss:4.1f}%"
+                f"{mark}")
+    out("")
+    if not boundaries:
+        out("=> No slice staircase detected: RTT is flat across the size "
+            "range (no slicing fabric in this path, or the step cost is "
+            "below the noise floor).")
+        return
+    out(f"=> RTT steps at inner sizes: "
+        f"{', '.join(str(b) + ' B' for b in boundaries)}")
+    out(f"=> Measured slice budget: ~{est} B  "
+        f"(Anatomy model constant: {EC_SLICE_BUDGET} B)")
+    if est and abs(est - EC_SLICE_BUDGET) > 64:
+        out(f"=> The model constant looks off for THIS fabric - tune "
+            f"EC_SLICE_BUDGET to ~{est} in netquality.py so the Anatomy "
+            f"panel and slice predictions match reality.")
+    else:
+        out("=> Model and measurement agree: the Anatomy panel's slicing "
+            "predictions hold for this fabric.")
 
 
 BURST_PROBE_SIZE = 1200   # fits one EC slice AND a standard 1500 B hop
@@ -5460,6 +5754,513 @@ class LoadGenerator:
         sock.close()
 
 
+# ---------------------------------------------------------------------------
+# Measured WAN counters (R-10, 1.9.0): poll the fabric's WAN-side packet
+# counters and show MEASURED WAN pps next to the Anatomy panel's PREDICTED
+# pps - live proof that 1 LAN packet becomes N WAN packets. Pluggable
+# sources: 'sim' (derives counters from this engine's own offered load
+# through the EC slicing model - the no-hardware UAT backend), 'snmp'
+# (stdlib SNMPv2c GET of the IF-MIB 64-bit counters; covers EdgeConnect and
+# any router), and 'rest' (generic JSON poller; the Orchestrator-specific
+# endpoint/auth is a UAT deliverable, this is its stable integration point).
+# ---------------------------------------------------------------------------
+def wan_inner_bytes(payload_mean, proto, vxlan_on):
+    """IP-level bytes the FABRIC ingests for one probe: native probes are
+    payload + IPv4/L4 headers; in VXLAN mode the fabric sees the outer
+    datagram (payload + encap overhead + outer IPv4/UDP)."""
+    if vxlan_on:
+        ov = VXLAN_OVERHEAD_UDP if proto == "UDP" else VXLAN_OVERHEAD_TCP
+        return payload_mean + ov + 28
+    return payload_mean + (IPV4_UDP_OVERHEAD if proto == "UDP"
+                           else IPV4_TCP_OVERHEAD)
+
+
+def _json_path(obj, path):
+    """Follow a dotted key path ('data.if0.txPkts') into parsed JSON."""
+    cur = obj
+    for part in path.split("."):
+        if isinstance(cur, list):
+            cur = cur[int(part)]
+        elif isinstance(cur, dict):
+            cur = cur[part]
+        else:
+            raise KeyError(path)
+    return cur
+
+
+def _wan_spec(text):
+    """--wan-counters SPEC parser.
+
+      sim[:NOISE_PPS]              simulator (optional background pps noise)
+      snmp:HOST,COMMUNITY,IFINDEX[,PORT]
+      rest:URL[|TOKEN[|TX_KEY|RX_KEY]]   ('|' separators: URLs carry , and :)
+
+    Returns a config dict; raises argparse.ArgumentTypeError on nonsense so
+    a typo dies at the command line, not mid-demo."""
+    raw = (text or "").strip()
+    kind, _, rest = raw.partition(":")
+    kind = kind.lower()
+    if kind == "sim":
+        noise = 0.0
+        if rest:
+            try:
+                noise = float(rest)
+            except ValueError:
+                raise argparse.ArgumentTypeError(
+                    f"sim noise must be a number, got {rest!r}")
+            if not (0 <= noise <= 1e6):
+                raise argparse.ArgumentTypeError("sim noise out of range")
+        return {"kind": "sim", "noise_pps": noise}
+    if kind == "snmp":
+        parts = [p.strip() for p in rest.split(",")]
+        if len(parts) not in (3, 4) or not all(parts):
+            raise argparse.ArgumentTypeError(
+                "snmp spec is HOST,COMMUNITY,IFINDEX[,PORT]")
+        try:
+            ifindex = int(parts[2])
+            port = int(parts[3]) if len(parts) == 4 else 161
+        except ValueError:
+            raise argparse.ArgumentTypeError("snmp IFINDEX/PORT must be integers")
+        if not (1 <= port <= 65535) or ifindex < 1:
+            raise argparse.ArgumentTypeError("snmp IFINDEX/PORT out of range")
+        return {"kind": "snmp", "host": parts[0], "community": parts[1],
+                "ifindex": ifindex, "port": port}
+    if kind == "rest":
+        parts = rest.split("|")
+        if not parts[0].startswith(("http://", "https://")):
+            raise argparse.ArgumentTypeError(
+                "rest spec is URL[|TOKEN[|TX_KEY|RX_KEY]] with an http(s) URL")
+        return {"kind": "rest", "url": parts[0],
+                "token": parts[1] if len(parts) > 1 and parts[1] else None,
+                "tx_key": parts[2] if len(parts) > 2 else "tx_pkts",
+                "rx_key": parts[3] if len(parts) > 3 else "rx_pkts"}
+    raise argparse.ArgumentTypeError(
+        f"unknown WAN counter source {kind!r} (sim / snmp / rest)")
+
+
+# -- minimal SNMPv2c (stdlib BER, just enough for one GET of 4 counters) ----
+def _ber_len(n):
+    if n < 0x80:
+        return bytes([n])
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(body)]) + body
+
+
+def _ber(tag, payload):
+    return bytes([tag]) + _ber_len(len(payload)) + payload
+
+
+def _ber_int(v):
+    body = v.to_bytes(max(1, (v.bit_length() + 8) // 8), "big", signed=True)
+    return _ber(0x02, body)
+
+
+def _ber_oid(oid):
+    parts = [int(x) for x in oid.split(".")]
+    body = bytes([parts[0] * 40 + parts[1]])
+    for p in parts[2:]:
+        chunk = b""
+        chunk = bytes([p & 0x7F])
+        p >>= 7
+        while p:
+            chunk = bytes([0x80 | (p & 0x7F)]) + chunk
+            p >>= 7
+        body += chunk
+    return _ber(0x06, body)
+
+
+def snmp_build_get(community, oids, req_id):
+    """One SNMPv2c GetRequest for `oids` (list of dotted strings)."""
+    binds = b"".join(_ber(0x30, _ber_oid(o) + _ber(0x05, b"")) for o in oids)
+    pdu = _ber(0xA0, _ber_int(req_id) + _ber_int(0) + _ber_int(0)
+               + _ber(0x30, binds))
+    return _ber(0x30, _ber_int(1)                       # version = SNMPv2c
+                + _ber(0x04, community.encode()) + pdu)
+
+
+def _ber_walk(data, i, end):
+    """Yield (tag, start, stop) for each TLV in data[i:end]."""
+    while i < end:
+        tag = data[i]
+        ln = data[i + 1]
+        i += 2
+        if ln & 0x80:
+            n = ln & 0x7F
+            ln = int.from_bytes(data[i:i + n], "big")
+            i += n
+        yield tag, i, i + ln
+        i += ln
+
+
+def snmp_parse_response(data):
+    """Extract {oid_string: int} from a GetResponse. Unknown/absent values
+    are simply missing from the result; the caller decides what's fatal."""
+    def oid_str(body):
+        out = [body[0] // 40, body[0] % 40]
+        val = 0
+        for b in body[1:]:
+            val = (val << 7) | (b & 0x7F)
+            if not (b & 0x80):
+                out.append(val)
+                val = 0
+        return ".".join(map(str, out))
+
+    result = {}
+    try:
+        (_, m0, m1), = ((t, a, b) for t, a, b in _ber_walk(data, 0, len(data)))
+        fields = list(_ber_walk(data, m0, m1))
+        pdu = next((f for f in fields if f[0] == 0xA2), None)
+        if pdu is None:
+            return result
+        pdu_fields = list(_ber_walk(data, pdu[1], pdu[2]))
+        if len(pdu_fields) < 4:
+            return result
+        vb_list = pdu_fields[3]
+        for _tag, v0, v1 in _ber_walk(data, vb_list[1], vb_list[2]):
+            inner = list(_ber_walk(data, v0, v1))
+            if len(inner) != 2 or inner[0][0] != 0x06:
+                continue
+            oid = oid_str(data[inner[0][1]:inner[0][2]])
+            vtag, a, b = inner[1]
+            if vtag in (0x02, 0x41, 0x42, 0x43, 0x46):  # int/ctr32/gauge/ticks/ctr64
+                result[oid] = int.from_bytes(data[a:b], "big")
+    except (ValueError, IndexError):
+        pass
+    return result
+
+
+IFHC_BASE = "1.3.6.1.2.1.31.1.1.1"   # IF-MIB 64-bit interface counters
+
+
+class SnmpWanSource:
+    """Cumulative WAN-interface counters over SNMPv2c: ifHCOutUcastPkts /
+    ifHCInUcastPkts (+ octets). 'tx' is the interface's OUT direction -
+    point it at the appliance's WAN interface."""
+    kind = "snmp"
+
+    def __init__(self, host, community, ifindex, port=161, timeout=1.5):
+        self.host, self.community = host, community
+        self.port, self.timeout = port, timeout
+        self.oids = {
+            "rx_pkts": f"{IFHC_BASE}.7.{ifindex}",
+            "tx_pkts": f"{IFHC_BASE}.11.{ifindex}",
+            "rx_bytes": f"{IFHC_BASE}.6.{ifindex}",
+            "tx_bytes": f"{IFHC_BASE}.10.{ifindex}",
+        }
+        self._req_id = 1
+        self.detail = f"snmp {host} if{ifindex}"
+
+    def poll(self):
+        self._req_id = (self._req_id + 1) & 0x7FFFFFFF
+        msg = snmp_build_get(self.community, list(self.oids.values()),
+                             self._req_id)
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(self.timeout)
+        try:
+            s.sendto(msg, (self.host, self.port))
+            data, _ = s.recvfrom(65535)
+        finally:
+            s.close()
+        values = snmp_parse_response(data)
+        out = {}
+        for name, oid in self.oids.items():
+            if oid not in values:
+                raise RuntimeError(f"SNMP response missing {name} ({oid})")
+            out[name] = values[oid]
+        return out
+
+
+class RestWanSource:
+    """Generic JSON counter poller: GET url, read cumulative packet counts
+    at dotted key paths. Token goes out as both Authorization: Bearer and
+    X-Auth-Token (Orchestrator-style); the exact EC endpoint is chosen at
+    UAT against real gear - this class is the stable integration point."""
+    kind = "rest"
+
+    def __init__(self, url, token=None, tx_key="tx_pkts", rx_key="rx_pkts",
+                 timeout=3.0):
+        self.url, self.token = url, token
+        self.tx_key, self.rx_key = tx_key, rx_key
+        self.timeout = timeout
+        self.detail = url
+
+    def poll(self):
+        import urllib.request
+        req = urllib.request.Request(self.url)
+        if self.token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+            req.add_header("X-Auth-Token", self.token)
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            doc = json.loads(resp.read().decode("utf-8"))
+        return {"tx_pkts": int(_json_path(doc, self.tx_key)),
+                "rx_pkts": int(_json_path(doc, self.rx_key))}
+
+
+class SimWanSource:
+    """Simulated WAN counters: integrates the engine's own offered load
+    through the EC slicing model (probes + reflected echoes, symmetric
+    config) plus optional background noise. Proves the measured-vs-
+    predicted workflow - and the square-wave calibration - with no fabric
+    access at all. rates_fn() -> [(tx_pps, slices)] per stream."""
+    kind = "sim"
+
+    def __init__(self, rates_fn, noise_pps=0.0):
+        self.rates_fn = rates_fn
+        self.noise_pps = noise_pps
+        self.detail = "simulator (EC slicing model)"
+        self._last = time.monotonic()
+        self._tx = 0.0
+        self._rx = 0.0
+
+    def poll(self):
+        import random
+        now = time.monotonic()
+        dt = max(0.0, now - self._last)
+        self._last = now
+        wan_pps = sum(pps * slices * 2 for pps, slices in self.rates_fn())
+        jitter = 1.0 + random.uniform(-0.02, 0.02)
+        self._tx += (wan_pps * jitter + self.noise_pps) * dt
+        self._rx += (wan_pps * jitter + self.noise_pps) * dt
+        return {"tx_pkts": int(self._tx), "rx_pkts": int(self._rx)}
+
+
+class WanCounters:
+    """Poll thread + rate derivation over a WAN counter source. Rates come
+    from diffing successive cumulative polls; a counter going backwards
+    (device reboot, 32-bit wrap) re-baselines instead of spiking."""
+
+    POLL_S = 1.0
+
+    def __init__(self, source):
+        self.source = source
+        self.lock = threading.Lock()
+        self.stop_evt = threading.Event()
+        self.thread = None
+        self._prev = None      # (t, counters)
+        self._status = {"kind": source.kind, "ok": False,
+                        "detail": getattr(source, "detail", ""),
+                        "tx_pps": None, "rx_pps": None,
+                        "tx_mbps": None, "rx_mbps": None, "age": None}
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, name="wan-counters",
+                                       daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_evt.set()
+
+    def status(self):
+        with self.lock:
+            st = dict(self._status)
+        if st["age"] is not None:
+            st["age"] = time.monotonic() - st["age"]
+        return st
+
+    def _run(self):
+        while not self.stop_evt.wait(self.POLL_S):
+            try:
+                cum = self.source.poll()
+            except Exception as e:
+                with self.lock:
+                    self._status["ok"] = False
+                    self._status["detail"] = f"{self.source.kind}: {e}"
+                self._prev = None
+                continue
+            now = time.monotonic()
+            rates = {}
+            if self._prev is not None:
+                pt, pcum = self._prev
+                dt = max(1e-3, now - pt)
+                for k in cum:
+                    d = cum[k] - pcum.get(k, 0)
+                    if d < 0:        # reboot / wrap: re-baseline this poll
+                        rates = {}
+                        break
+                    rates[k] = d / dt
+            self._prev = (now, cum)
+            with self.lock:
+                st = self._status
+                st["ok"] = True
+                st["detail"] = getattr(self.source, "detail", "")
+                st["age"] = now
+                if rates:
+                    st["tx_pps"] = rates.get("tx_pkts")
+                    st["rx_pps"] = rates.get("rx_pkts")
+                    st["tx_mbps"] = (rates.get("tx_bytes", 0) * 8 / 1e6
+                                     if "tx_bytes" in rates else None)
+                    st["rx_mbps"] = (rates.get("rx_bytes", 0) * 8 / 1e6
+                                     if "rx_bytes" in rates else None)
+
+
+def slice_loss_evidence(rows, slices_of_sid, deadband):
+    """Live slicing evidence with NO fabric access (R-12 always-on variant):
+    when two UDP streams whose probes slice into DIFFERENT WAN packet
+    counts both lose, and the loss ratio tracks the slice-count ratio, the
+    loss is happening per WAN packet - i.e. after slicing. Returns the
+    verdict string, or None while the evidence isn't statistically there."""
+    udp = [(r, slices_of_sid.get(r["sid"], 1)) for r in rows
+           if r["proto"] == "UDP" and r["connected"]]
+    if len(udp) < 2:
+        return None
+    small = min(udp, key=lambda x: x[1])
+    large = max(udp, key=lambda x: x[1])
+    n_s, n_l = small[1], large[1]
+    if n_s == n_l:
+        return None
+    loss_s = small[0]["loss"] + small[0]["late"]
+    loss_l = large[0]["loss"] + large[0]["late"]
+    # Both must be real loss (above deadband), the small stream non-zero,
+    # and enough decided probes behind each figure to mean something.
+    if loss_s <= max(deadband, 0.2) or loss_l <= deadband:
+        return None
+    if small[0]["cum_tx"] < 200 or large[0]["cum_tx"] < 200:
+        return None
+    ratio = loss_l / loss_s
+    expect = n_l / n_s
+    if abs(ratio - expect) / expect > 0.35:
+        return None
+    return (f"{large[0]['name']} loses {ratio:.1f}× {small[0]['name']} "
+            f"≈ its {n_l}-slice/{n_s}-slice ratio — per-WAN-packet loss "
+            f"(slicing amplification measured live)")
+
+
+# ---------------------------------------------------------------------------
+# Scenario scripting (R-4, 1.9.0): a JSON timeline the app replays, so a
+# demo arc is one file instead of a memorized click sequence.
+# ---------------------------------------------------------------------------
+def parse_scenario(text):
+    """Validate a scenario document -> (name, stages, repeat).
+
+    {"name": "policy-demo", "repeat": 1, "stages": [
+        {"name": "baseline", "secs": 60},
+        {"name": "load", "secs": 30, "load_mbps": 10},
+        {"name": "calibrate", "secs": 60, "load_mbps": 10,
+         "square_on_s": 5, "square_off_s": 5},
+        {"name": "clean slate", "secs": 5, "reset": true}]}
+
+    repeat 0 = loop until the app closes. Raises ValueError with a
+    user-facing message on any problem."""
+    try:
+        doc = json.loads(text)
+    except ValueError as e:
+        raise ValueError(f"scenario is not valid JSON: {e}")
+    if not isinstance(doc, dict):
+        raise ValueError("scenario must be a JSON object")
+    name = doc.get("name", "scenario")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("scenario 'name' must be a non-empty string")
+    repeat = doc.get("repeat", 1)
+    if not isinstance(repeat, int) or isinstance(repeat, bool) or repeat < 0:
+        raise ValueError("'repeat' must be an integer >= 0 (0 = loop forever)")
+    raw = doc.get("stages")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("scenario needs a non-empty 'stages' list")
+    stages = []
+    for i, s in enumerate(raw, 1):
+        if not isinstance(s, dict):
+            raise ValueError(f"stage {i} must be an object")
+        st = {"name": str(s.get("name") or f"stage {i}")}
+        secs = s.get("secs")
+        if not isinstance(secs, (int, float)) or isinstance(secs, bool) \
+                or secs <= 0:
+            raise ValueError(f"stage {i} ({st['name']}): 'secs' must be > 0")
+        st["secs"] = float(secs)
+        mbps = s.get("load_mbps", 0)
+        if not isinstance(mbps, (int, float)) or isinstance(mbps, bool) \
+                or not (0 <= mbps <= 1000):
+            raise ValueError(f"stage {i} ({st['name']}): 'load_mbps' must be "
+                             f"in [0, 1000]")
+        st["load_mbps"] = float(mbps)
+        on_s = s.get("square_on_s", 0)
+        off_s = s.get("square_off_s", 0)
+        if bool(on_s) != bool(off_s):
+            raise ValueError(f"stage {i} ({st['name']}): square_on_s and "
+                             f"square_off_s go together")
+        if on_s and not st["load_mbps"]:
+            raise ValueError(f"stage {i} ({st['name']}): a square wave needs "
+                             f"load_mbps > 0")
+        for k, v in (("square_on_s", on_s), ("square_off_s", off_s)):
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0:
+                raise ValueError(f"stage {i} ({st['name']}): '{k}' must be "
+                                 f">= 0")
+            st[k] = float(v)
+        st["reset"] = bool(s.get("reset", False))
+        stages.append(st)
+    return name.strip(), stages, repeat
+
+
+class ScenarioRunner:
+    """Replay a parsed scenario against a running engine: stage markers on
+    the charts, optional per-stage sustained load (its own LoadGenerator,
+    native transport only), optional stat reset at a stage boundary."""
+
+    def __init__(self, engine, args, scenario):
+        self.engine = engine
+        self.name, self.stages, self.repeat = scenario
+        self.load = LoadGenerator(engine.peer, args.udp_ports[0],
+                                  bind=args.bind,
+                                  dont_fragment=args.dont_fragment,
+                                  timeout=args.timeout)
+        self.stop_evt = threading.Event()
+        self.lock = threading.Lock()
+        self._state = {"name": self.name, "stage": None, "idx": 0,
+                       "total": len(self.stages), "pass_n": 1,
+                       "repeat": self.repeat, "ends_at": None, "done": False}
+        self.thread = threading.Thread(target=self._run, name="scenario",
+                                       daemon=True)
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stop_evt.set()
+        self.load.stop()
+
+    def status(self):
+        with self.lock:
+            st = dict(self._state)
+        if st["ends_at"] is not None:
+            st["remaining"] = max(0.0, st["ends_at"] - time.monotonic())
+        else:
+            st["remaining"] = None
+        return st
+
+    def _swap_load(self, mbps, on_s, off_s):
+        self.load.stop()
+        for _ in range(100):            # let the old pacing thread exit
+            if not self.load.running:
+                break
+            time.sleep(0.02)
+        if mbps > 0:
+            self.load.start(mbps, on_s, off_s)
+
+    def _run(self):
+        pass_n = 1
+        while not self.stop_evt.is_set():
+            for i, st in enumerate(self.stages):
+                if self.stop_evt.is_set():
+                    break
+                with self.lock:
+                    self._state.update(stage=st["name"], idx=i + 1,
+                                       pass_n=pass_n,
+                                       ends_at=time.monotonic() + st["secs"])
+                self.engine.add_marker(st["name"])
+                if st["reset"]:
+                    self.engine.reset()
+                self._swap_load(st["load_mbps"], st["square_on_s"],
+                                st["square_off_s"])
+                self.stop_evt.wait(st["secs"])
+            if self.stop_evt.is_set() or (self.repeat
+                                          and pass_n >= self.repeat):
+                break
+            pass_n += 1
+        self.load.stop()
+        self.engine.add_marker("end")
+        with self.lock:
+            self._state.update(stage=None, ends_at=None, done=True)
+
+
 def _normalize_peer_args(args):
     """Reconcile --peer/--peers so args.peer is always the first peer (every
     single-peer code path - footer, sweep/burst targets - keys off it).
@@ -5563,6 +6364,28 @@ def main(argv=None):
         run_burst_test(args)
         return
 
+    if args.slice_scan:
+        run_slice_scan(args)
+        return
+
+    # Scenario: parse early so a bad file dies at the command line.
+    scenario = None
+    if args.scenario:
+        try:
+            with open(args.scenario, "r", encoding="utf-8") as fh:
+                scenario = parse_scenario(fh.read())
+        except OSError as e:
+            print(f"error: cannot read scenario file: {e}", file=sys.stderr)
+            return 2
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        if args.vxlan and any(s["load_mbps"] for s in scenario[1]):
+            print("error: scenario load stages need native transport - a "
+                  "--vxlan peer has no native UDP listener to echo them.",
+                  file=sys.stderr)
+            return 2
+
     # Per-stream profiles / DSCP lists resolve against the FINAL stream
     # catalogue (ports may add or drop streams) and the final probe size.
     profiles = None
@@ -5636,6 +6459,37 @@ def main(argv=None):
         print(f"error: {msg}", file=sys.stderr)
         _alert_gui_error(msg)
         return 2
+
+    # 1.9.0: measured-WAN poller and scenario runner ride on the engine.
+    if args.wan_counters is not None:
+        spec = args.wan_counters
+        if spec["kind"] == "sim":
+            def sim_rates(e=engine):
+                rows = e.snapshot()["rows"]
+                rates = [(r["tx_pps"], e.slices_of_sid[r["sid"]])
+                         for r in rows]
+                scn = e.scenario
+                if scn is not None:
+                    st = scn.load.status()
+                    if st["running"]:
+                        pps = (st["achieved_mbps"] * 1e6 / 8.0
+                               / (BURST_PROBE_SIZE + IPV4_UDP_OVERHEAD))
+                        rates.append((pps, len(ec_wire_view(
+                            BURST_PROBE_SIZE + 28))))
+                return rates
+            source = SimWanSource(sim_rates, spec["noise_pps"])
+        elif spec["kind"] == "snmp":
+            source = SnmpWanSource(spec["host"], spec["community"],
+                                   spec["ifindex"], spec["port"])
+        else:
+            source = RestWanSource(spec["url"], spec["token"],
+                                   spec["tx_key"], spec["rx_key"])
+        engine.wan = WanCounters(source)
+        engine.wan.start()
+
+    if scenario is not None:
+        engine.scenario = ScenarioRunner(engine, args, scenario)
+        engine.scenario.start()
 
     use_gui = not args.no_gui
     if use_gui:
