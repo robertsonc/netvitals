@@ -425,14 +425,50 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
   the mesh GUI); DF on the load probes follows the session's
   `--dont-fragment`.
 
+### T16. Per-class DSCP marking and bleaching detection (1.8.0)
+
+- **Demonstrates:** business-intent overlay / per-class QoS steering with
+  differently-marked probe classes side by side — and *proof* of what code
+  point actually crossed, catching DSCP bleaching/remap policies live.
+- **Run:** `--dscp EF,AF41,-,BE` (one entry per stream in order; launcher
+  field under Advanced). Pair with profiles for realistic classes:
+  `--profiles voice,video --dscp EF,AF41`.
+- **Traffic:** identical probe machinery, per-stream code points. POSIX
+  marks exactly (`IP_TOS`); Windows maps through qWAVE traffic types
+  without admin (request EF → the stack sends CS7 — the UI reports the
+  truth). VXLAN mode marks the **inner** header.
+- **Show:** Totals column `DSCP rq→f/r` per stream (`EF→EF/EF` clean;
+  `EF→BE/...` bleached, which also raises the *DSCP rewritten mid-path*
+  warning line); per-class latency/loss lines diverging as the fabric
+  treats classes differently.
+- **Caveats:** forward/return readback needs a POSIX receiver for native
+  UDP; VXLAN mode reads back on all streams and platforms; native TCP
+  streams show `?`. Both ends should run 1.8.0+ for the report (older
+  reflectors are compatible but report nothing).
+
+### T17. Stream sets and mixed application classes (1.8.0)
+
+- **Demonstrates:** a one-box multi-application load matrix — flows on the
+  exact ports a policy matches, each shaped like a different app.
+- **Run:** e.g. `--udp-ports 5060,30201,30202 --tcp-ports 30101
+  --profiles voice,imix,default,bulk` (1–8 UDP + 0–8 TCP streams; `none`
+  drops TCP entirely). `--mbps X` still holds the box at a known total —
+  each stream's rate derives from its own mean wire size.
+- **Show:** per-stream chart lines (one color per stream, up to 16),
+  Totals rows with per-stream expected sizes (IMIX verifies at 1472 B),
+  the footer's `frames per profile` tag and offered-vs-target readout.
+- **Caveats:** at least one UDP stream always required; both ends must run
+  identical port lists; the mesh GUI and console scale with the stream
+  count automatically.
+
 ## 2.4 Constraint summary (read before scripting a demo)
 
 | Constraint | Detail |
 |---|---|
 | IPv4 only | DF handling and VXLAN inner packets are IPv4 |
-| One `--size` / rate for all streams | `--mbps` names the box total and `--tcp-pps` splits TCP from UDP, but there are no per-stream sizes, no IMIX, no ramps in the continuous engine |
-| Exactly 2 UDP + 2 TCP streams per pair | port values movable, count fixed |
-| No DSCP/ToS marking anywhere today | inner VXLAN TOS hard-coded 0; Windows needs qWAVE for non-admin DSCP (Roadmap R-6) |
+| Per-stream sizes/rates via `--profiles` (1.8.0) | named profiles + IMIX shipped; still no time-varying ramps in the continuous engine (Roadmap R-4) |
+| Stream count: 1–8 UDP + 0–8 TCP (1.8.0) | at least one UDP stream always required; both ends must run identical port lists |
+| DSCP marking shipped (1.8.0) | exact on POSIX; Windows non-admin goes through qWAVE traffic types (EF request → CS7 on the wire, reported honestly); native-UDP readback needs a POSIX receiver, VXLAN readback works everywhere, native TCP shows `?` |
 | One-shot tools (sweep/burst) and the Load panel | UDP-only, native-mode peers only, tool host must be a configured peer on the target; Load panel is single-pair GUI only |
 | Version parity | both ends ≥ 1.5.0; VXLAN both-ends-or-neither, same VNI/port |
 | Burst test / Load | both directions carry the offered load (echoes are full-size); burst DF is opt-in via `--dont-fragment` |
@@ -469,11 +505,12 @@ should dial bandwidth directly, shape it over time, and mix classes.*
   charts show its impact, including the **square-wave scheduler** (N s on /
   N s off) — the "calibration burst" needed to attribute WAN-side counters
   on busy fabrics (pairs with R-12). Native-mode, single-pair dashboard.
-- **R-3. Per-stream profiles and IMIX.** Per-stream `--size`/`--pps`
-  overrides and named mixes (e.g. `voice` 200 B @ 50 pps, `video` 1200 B @
-  90 pps, `bulk` 1400 B max-rate, `imix` 7:4:1 of 64/576/1500) so one
-  session offers a realistic multi-class load matrix instead of four
-  identical flows.
+- **R-3. Per-stream profiles and IMIX.** ✅ **Shipped in 1.8.0**:
+  `--profiles` assigns each stream a named mix (`voice` 200 B @ 50 pps,
+  `video` 1200 B @ 90 pps, `bulk` 1400 B @ 200 pps, `imix` 7:4:1 of
+  64/576/1500-byte IP packets cycled probe-by-probe) or a custom
+  `SIZE`/`SIZExPPS`; `--mbps` composes (sizes kept, per-stream rates
+  derived from each stream's own mean wire size).
 - **R-4. Scenario scripting.** A small JSON/YAML timeline (stage, duration,
   rates, sizes) the app replays — repeatable, hands-free demo arcs
   ("baseline 60 s → 10 Mbps 30 s → jumbo 30 s"), with stage markers drawn on
@@ -490,16 +527,17 @@ should dial bandwidth directly, shape it over time, and mix classes.*
 *Theme: SD-WAN policies match on DSCP, ports, protocols and app signatures;
 the tool should be able to present all of those dimensions deliberately.*
 
-- **R-6. Per-DSCP probe classes** *(README #8)*. Parallel probe sets marked
-  EF vs AF vs BE, charted side by side — directly exercises business-intent
-  overlays and per-class queueing; reading the received TOS back also
-  catches **DSCP bleaching** mid-path. Known constraint to spike first:
-  Windows ignores `IP_TOS` on ordinary sockets; the non-admin path is the
-  qWAVE API (`QOSAddSocketToFlow`) with its traffic-type-mapped code points.
-- **R-7. Configurable stream sets.** N streams per protocol with arbitrary
-  port lists (`--udp-ports 5060,30202,...`) so a session can present flows
-  on the exact ports a customer's policy matches (443, 5060, 3389, …), with
-  per-stream labels in the UI.
+- **R-6. Per-DSCP probe classes** *(README #8)*. ✅ **Shipped in 1.8.0**:
+  `--dscp` marks each stream (exact `IP_TOS` on POSIX; qWAVE traffic types
+  on Windows without admin, with the applied code point reported honestly),
+  the reflector reports the received TOS back (wire-compatible echo-padding
+  stamp), and the Totals table + warning line surface **bleaching/remap**
+  per stream in both directions. VXLAN mode marks and reads the inner
+  header on all platforms.
+- **R-7. Configurable stream sets.** ✅ **Shipped in 1.8.0**: `--udp-ports`
+  takes 1–8 ports and `--tcp-ports` 0–8 (`none` = UDP-only), one stream per
+  port, so a session presents flows on the exact ports a customer's policy
+  matches (443, 5060, 3389, …); charts, tables, mesh and console all scale.
 - **R-8. Elastic (real-TCP) load stream.** An optional kernel-TCP bulk
   transfer stream (congestion-controlled, like iperf) alongside the fixed-
   rate probes — shows shapers/QoS acting on elastic traffic while the
@@ -564,7 +602,7 @@ is measured. (This is the existing README roadmap, carried forward.)*
 | Milestone | Contents | Rationale |
 |---|---|---|
 | **1.7** ✅ shipped | R-1, R-2, R-5 (DF + late split; TCP/VXLAN burst deferred) | Biggest demo wins, no new privileges/protocols: dial-a-bandwidth + sustained load on the live charts |
-| **1.8** | R-6 (after qWAVE spike), R-3, R-7 | The policy-classification surface: DSCP + multi-class mixes |
+| **1.8** ✅ shipped (1.8.0a1) | R-6, R-3, R-7 + alpha-aware updater | The policy-classification surface: DSCP + multi-class mixes + configurable stream sets |
 | **1.9** | R-10, R-12, R-4 | First measured-WAN loop (counters + calibration burst + scripted scenarios) |
 | **2.0** | R-11, R-13, R-15, R-19 | The full "prove the fabric" story + the leave-behind report |
 | **2.x** | R-8, R-9, R-14, R-16 – R-18, R-20, R-21 | Scale-out, automation, elastic loads |
