@@ -49,7 +49,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.6.2"
+__version__ = "1.7.0"
 
 # Where --update / --check-update look for the latest SIGNED release manifest. The
 # manifest is verified against UPDATE_PUBKEY before anything is installed (fail closed),
@@ -129,6 +129,13 @@ TYPE_TEST = 3
 # port, which made Wireshark misparse our packets as iPerf3 traffic).
 DEFAULT_UDP_PORTS = (30201, 30202)
 DEFAULT_TCP_PORTS = (30101, 30102)
+
+# On-wire IPv4 header cost per probe, used wherever a rate in Mbps is
+# converted to/from a rate in packets (--mbps, the offered-load readout).
+# Ethernet framing is deliberately excluded: it varies by media (VLAN tags,
+# FCS) while the IP-level figure is what shapers/policers meter.
+IPV4_UDP_OVERHEAD = 28   # IPv4 20 + UDP 8
+IPV4_TCP_OVERHEAD = 40   # IPv4 20 + TCP 20
 
 
 def build_streams(udp_ports, tcp_ports):
@@ -1635,7 +1642,8 @@ class VXStream:
 class Engine:
     def __init__(self, peer=None, bind="0.0.0.0", size=200, pps=50, window=10.0,
                  timeout=2.0, history_seconds=300, loss_deadband=0.5,
-                 dont_fragment=False, vxlan=None, peers=None, tcp_pps=None):
+                 dont_fragment=False, vxlan=None, peers=None, tcp_pps=None,
+                 target_mbps=None):
         # `peers` (a list) is the mesh form; `peer` is the classic 1:1 form.
         # Everything below is keyed per (peer, sid) pair; single-peer callers
         # keep using the peer-defaulted accessors and see no difference.
@@ -1656,6 +1664,7 @@ class Engine:
         self.last_reset = time.monotonic()
         self.history_seconds = history_seconds
         self.loss_deadband = loss_deadband  # combined loss+late below this reads as 0
+        self.target_mbps = target_mbps      # --mbps target, or None (pps mode)
         # The 50 pps / ~200 B UDP default deliberately matches a G.711 voice
         # stream (20 ms packetization); TCP models an interactive app, not
         # media, so its rate is independently tunable via --tcp-pps.
@@ -1816,8 +1825,11 @@ class Engine:
         tot_tx = tot_recv = tot_lost = tot_late = 0
         tot_fwd = tot_rtn = 0
         life_tx = life_recv = life_lost = life_late = 0
+        offered_bps = 0.0  # achieved probe TX rate, IP level, this direction
         for sid, proto, port, name in STREAMS:
             snap = self.stats[(peer, sid)].snapshot()
+            overhead = IPV4_TCP_OVERHEAD if proto == "TCP" else IPV4_UDP_OVERHEAD
+            offered_bps += snap["tx_pps"] * (self.size + overhead) * 8.0
             eff = self.effective_loss(snap["loss"], snap["late"])  # deadbanded impairment
             if proto == "TCP":
                 # TCP gets a Path Quality Index, not MOS: retransmissions show
@@ -1918,6 +1930,13 @@ class Engine:
             "dont_fragment": self.dont_fragment,
             "vxlan": self.vxlan,
             "size_status": size_status,
+            # Offered probe load, this pair, this direction, IP level (probe
+            # + IPv4/UDP-or-TCP headers). Echoes mirror probes, so the wire
+            # carries roughly double at steady state. target_mbps is the
+            # --mbps ask (None in pps mode) - showing both makes the offered
+            # load a verifiable known quantity, not a computed hope.
+            "offered_mbps": offered_bps / 1e6,
+            "target_mbps": self.target_mbps,
         }
 
     def reset(self):
@@ -2252,6 +2271,24 @@ def run_gui(engine, args):
                             font=(FONT, 9, "bold"), cursor="hand2")
     anatomy_btn.pack(side="left", padx=(0, 6))
 
+    load_shown = {"on": False}
+
+    def do_toggle_load():
+        load_shown["on"] = not load_shown["on"]
+        if load_shown["on"]:
+            load_frame.pack(fill="x", side="bottom", before=charts)
+            load_btn.configure(text="▴  Load")
+        else:
+            load_frame.pack_forget()
+            load_btn.configure(text="⚡  Load")
+
+    load_btn = tk.Button(btnbar, text="⚡  Load", command=do_toggle_load,
+                         bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
+                         activeforeground="white", relief="flat", bd=0,
+                         highlightthickness=0, padx=12, pady=5,
+                         font=(FONT, 9, "bold"), cursor="hand2")
+    load_btn.pack(side="left", padx=(0, 6))
+
     def do_fit_charts():
         """Collapse the bottom tables and force a fresh geometry pass so the
         charts reclaim the full current window space."""
@@ -2261,6 +2298,8 @@ def run_gui(engine, args):
             do_toggle_isolate()
         if anatomy_shown["on"]:
             do_toggle_anatomy()
+        if load_shown["on"]:
+            do_toggle_load()
         for c in (lat_canvas, loss_canvas, jit_canvas, owd_canvas):
             c.configure(width=100, height=80)
         root.update_idletasks()
@@ -2487,8 +2526,8 @@ def run_gui(engine, args):
                            f"{wan_total:,} B on the wire · +{tax:.1f}% overhead"
                            f" · ×{n} packet amplification")
         c.create_text(x0, y4 + 18, anchor="w", fill=TXT_DIM, font=(FONT, 9),
-                      text=f"predicted per UDP stream: {args.pps} pps LAN → "
-                           f"{args.pps * n} pps WAN, each direction "
+                      text=f"predicted per UDP stream: {args.pps:g} pps LAN → "
+                           f"{args.pps * n:g} pps WAN, each direction "
                            f"(echoes are full-size)")
         if inner > 1500:
             frags = -(-(inner - 20) // 1480)  # RFC 791: 1480 B payload per frag
@@ -2501,6 +2540,102 @@ def run_gui(engine, args):
                       text=noec)
 
     anat_canvas.bind("<Configure>", draw_anatomy)
+
+    # ---- sustained load panel (hidden; the burst generator made resident) --
+    # A known-quantity UDP load offered WHILE the scored streams keep
+    # measuring, so the charts show what the load does to the path. TEST
+    # probes are excluded from loss isolation on both ends; the optional
+    # square wave is the calibration pattern for diffing WAN-side counters.
+    load_gen = LoadGenerator(engine.peer, args.udp_ports[0], bind=args.bind,
+                             dont_fragment=args.dont_fragment,
+                             timeout=args.timeout)
+    load_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
+    # not packed here — do_toggle_load packs/unpacks the whole frame
+    load_inner = tk.Frame(load_frame, bg=PANEL, padx=10, pady=8)
+    load_inner.pack(fill="x")
+    load_mbps_var = tk.StringVar(value="5")
+    load_sq_var = tk.BooleanVar(value=False)
+    load_on_var = tk.StringVar(value="10")
+    load_off_var = tk.StringVar(value="10")
+    load_status_var = tk.StringVar(value="idle")
+    load_hdr = tk.Frame(load_inner, bg=PANEL)
+    load_hdr.pack(fill="x")
+    tk.Label(load_hdr, text="Sustained load", fg=TXT, bg=PANEL,
+             font=(FONT, 10, "bold")).pack(side="left")
+    tk.Label(load_hdr, text=f"UDP {BURST_PROBE_SIZE} B TEST probes → "
+                            f"{engine.peer}:{args.udp_ports[0]} · echoes "
+                            f"double the wire load · excluded from loss "
+                            f"isolation",
+             fg=TXT_DIM, bg=PANEL, font=(FONT, 8)).pack(side="left",
+                                                        padx=(10, 0))
+    ctl = tk.Frame(load_inner, bg=PANEL)
+    ctl.pack(fill="x", pady=(6, 0))
+
+    def _load_entry(var, width):
+        e = tk.Entry(ctl, textvariable=var, width=width, bg=PANEL_HI, fg=TXT,
+                     insertbackground=TXT, relief="flat", highlightthickness=1,
+                     highlightbackground=GRID, highlightcolor=HPE_GREEN,
+                     font=(FONT, 10), justify="right")
+        return e
+
+    tk.Label(ctl, text="Mbps", fg=TXT_DIM, bg=PANEL,
+             font=(FONT, 9)).pack(side="left")
+    _load_entry(load_mbps_var, 6).pack(side="left", padx=(4, 12), ipady=1)
+    tk.Checkbutton(ctl, text="square wave", variable=load_sq_var, bg=PANEL,
+                   fg=TXT, activebackground=PANEL, activeforeground=TXT,
+                   selectcolor=PANEL_HI, font=(FONT, 9), highlightthickness=0,
+                   cursor="hand2").pack(side="left")
+    tk.Label(ctl, text="on s", fg=TXT_DIM, bg=PANEL,
+             font=(FONT, 9)).pack(side="left", padx=(8, 0))
+    _load_entry(load_on_var, 4).pack(side="left", padx=(4, 0), ipady=1)
+    tk.Label(ctl, text="off s", fg=TXT_DIM, bg=PANEL,
+             font=(FONT, 9)).pack(side="left", padx=(8, 0))
+    _load_entry(load_off_var, 4).pack(side="left", padx=(4, 12), ipady=1)
+
+    def do_load_start():
+        if load_gen.running:
+            load_gen.stop()
+            load_start_btn.configure(text="▶  Start load")
+            load_status_var.set("stopped")
+            return
+        try:
+            mbps = float(load_mbps_var.get().strip())
+            if not (0 < mbps <= 1000):
+                raise ValueError
+        except ValueError:
+            load_status_var.set("enter a load in Mbps (0 < X ≤ 1000)")
+            return
+        on_s = off_s = 0.0
+        if load_sq_var.get():
+            try:
+                on_s = float(load_on_var.get().strip())
+                off_s = float(load_off_var.get().strip())
+                if on_s <= 0 or off_s <= 0:
+                    raise ValueError
+            except ValueError:
+                load_status_var.set("square wave needs positive on/off seconds")
+                return
+        err = load_gen.start(mbps, on_s, off_s)
+        if err:
+            load_status_var.set(err)
+        else:
+            load_start_btn.configure(text="■  Stop load")
+
+    load_start_btn = tk.Button(ctl, text="▶  Start load", command=do_load_start,
+                               bg=PANEL_HI, fg=TXT,
+                               activebackground=HPE_GREEN_DK,
+                               activeforeground="white", relief="flat", bd=0,
+                               highlightthickness=0, padx=12, pady=3,
+                               font=(FONT, 9, "bold"), cursor="hand2")
+    load_start_btn.pack(side="left")
+    tk.Label(ctl, textvariable=load_status_var, fg=TXT_DIM, bg=PANEL,
+             font=(FONT, 9), anchor="w").pack(side="left", padx=(12, 0))
+    if engine.vxlan:
+        # A VXLAN-mode peer opens no native UDP listener, so there is
+        # nothing to echo the load probes - don't offer a dead button.
+        load_start_btn.configure(state="disabled")
+        load_status_var.set("unavailable in VXLAN mode (the peer has no "
+                            "native UDP listener to echo the load)")
 
     # ---- charts: latency (top, full width), loss + jitter (bottom row) ----
     # Laid out with grid + row weights, NOT pack: pack hands the space freed
@@ -2584,10 +2719,30 @@ def run_gui(engine, args):
                 warn_lbl.pack(fill="x", before=foot_path_lbl)
         elif warn_lbl.winfo_ismapped():
             warn_lbl.pack_forget()
+        # Offered probe load (this direction, IP level): with --mbps show
+        # achieved vs target so the known quantity is verifiable on screen.
+        load_txt = f"  ·  probe load {snap['offered_mbps']:.2f} Mbps"
+        if snap.get("target_mbps"):
+            load_txt += f" / target {_fmt_num(snap['target_mbps'])}"
         foot_path_var.set(
             f"peer {args.peer}  ·  {ports_summary()}  ·  "
-            f"frame {snap['frame_size']} B  DF {df}  size {size_tag}{vx}  ·  "
+            f"frame {snap['frame_size']} B  DF {df}  size {size_tag}{vx}"
+            f"{load_txt}  ·  "
             f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}")
+        if load_shown["on"] or load_gen.running:
+            st = load_gen.status()
+            if st["running"]:
+                phase = ("" if not st["square"]
+                         else ("  [wave: ON]" if st["phase_on"]
+                               else "  [wave: off]"))
+                load_status_var.set(
+                    f"offering {st['mbps']:g} Mbps{phase}  ·  achieved "
+                    f"{st['achieved_mbps']:.2f} Mbps  ·  loss "
+                    f"{st['loss_pct']:.1f}%  late {st['late_pct']:.1f}%")
+            elif str(load_start_btn.cget("text")).startswith("■"):
+                # the generator died on its own (peer gone, socket error)
+                load_start_btn.configure(text="▶  Start load")
+                load_status_var.set(st["error"] or "stopped")
         # lifetime repeats since-reset until the first reset — show it only
         # once it actually says something different
         life = ("" if t["life_tx"] == t["tx"] and t["life_lost"] == t["lost"]
@@ -2663,6 +2818,7 @@ def run_gui(engine, args):
             pass
 
     def on_close():
+        load_gen.stop()
         engine.shutdown()
         root.destroy()
 
@@ -3005,7 +3161,7 @@ def _hms(seconds):
 def run_console(engine, args):
     vt = enable_vt_mode()
     print(f"Network Vitals {__version__}  peer={args.peer}  bind={args.bind}  "
-          f"{ports_summary()}  {args.pps} probes/s/stream")
+          f"{ports_summary()}  {args.pps:g} probes/s/stream")
     print("Ctrl-C to stop.\n")
     try:
         run_console_loop(engine, args, vt)
@@ -3051,9 +3207,12 @@ def run_console_loop(engine, args, vt):
                         "pending": "pending"}[snap["size_status"]]
             vx = (f"   VXLAN vni {snap['vxlan']['vni']} udp/{snap['vxlan']['port']}"
                   if snap["vxlan"] else "")
+            load_txt = f"   probe load {snap['offered_mbps']:.2f} Mbps"
+            if snap.get("target_mbps"):
+                load_txt += f" / target {_fmt_num(snap['target_mbps'])}"
             print("  " + "-" * 100)
             print(f"  frame {snap['frame_size']} B   DF {df}   size {size_tag}{vx}"
-                  f"   (UDP peer-RX / my-RX per stream:"
+                  f"{load_txt}   (UDP peer-RX / my-RX per stream:"
                   + "".join(f"  {r['name'].split('-')[1]} {r['peer_rx_max']}/{r['rx_echo_max']}"
                             for r in snap["rows"] if r["proto"] == "UDP") + ")")
             # Two totals lines: the resettable demo window and the lifetime
@@ -3588,6 +3747,10 @@ def _launcher_argv(vals):
     pps = num("Probes/sec", vals["pps"], int, 1, 100000)
     if pps != 50:
         argv += ["--pps", str(pps)]
+    mbps_raw = str(vals.get("mbps") or "").strip()
+    if mbps_raw:
+        mbps = num("Target Mbps", mbps_raw, float, 0.001, 1000.0)
+        argv += ["--mbps", _fmt_num(mbps)]
     if vals["dont_fragment"]:
         argv += ["--dont-fragment"]
 
@@ -3899,6 +4062,7 @@ def run_launcher(update_url=UPDATE_URL):
     recent = [p for p in s.get("recent_peers", []) if isinstance(p, str)]
     size_var = tk.StringVar(value=sstr("size", "200"))
     pps_var = tk.StringVar(value=sstr("pps", "50"))
+    mbps_var = tk.StringVar(value=sstr("mbps", ""))
     df_var = tk.BooleanVar(value=sbool("dont_fragment", False))
 
     mklabel(body, "Peer IP / host", 0)
@@ -3915,8 +4079,13 @@ def run_launcher(update_url=UPDATE_URL):
     mkentry(body, pps_var, 2)
     mkhint(body, "per stream (default 50)", 2)
 
+    mklabel(body, "Target Mbps", 3)
+    mkentry(body, mbps_var, 3)
+    mkhint(body, "total probe Mbps for the box - overrides Probes/sec "
+                 "(blank = off)", 3)
+
     mkcheck(body, "Don't fragment - drop oversized probes instead of "
-                  "splitting them (jumbo testing)", df_var, 3)
+                  "splitting them (jumbo testing)", df_var, 4)
 
     # ---- advanced options (collapsed by default) ----------------------------
     adv_btn = tk.Button(root, bg=BG, fg=TXT_DIM, activebackground=BG,
@@ -4007,6 +4176,7 @@ def run_launcher(update_url=UPDATE_URL):
         return {
             "peer": peer_var.get().strip(),
             "size": size_var.get(), "pps": pps_var.get(),
+            "mbps": mbps_var.get(),
             "dont_fragment": bool(df_var.get()),
             "bind": bind_var.get(), "udp_ports": udp_var.get(),
             "tcp_ports": tcp_var.get(), "window": window_var.get(),
@@ -4113,13 +4283,13 @@ def run_launcher(update_url=UPDATE_URL):
             messagebox.showerror("Network Vitals", f"UDP ports: {e}",
                                  parent=root)
             return None
-        return peer, vals["bind"].strip() or "0.0.0.0", ports
+        return peer, vals["bind"].strip() or "0.0.0.0", ports, vals
 
     def do_sweep():
         target = _tool_target("MTU sweep")
         if target is None:
             return
-        peer, bind, ports = target
+        peer, bind, ports, _vals = target
         ns = argparse.Namespace(peer=peer, bind=bind, udp_ports=ports,
                                 sweep_min=1400, sweep_max=9000)
         _open_tool_window(root, f"MTU sweep -> {peer}",
@@ -4129,9 +4299,12 @@ def run_launcher(update_url=UPDATE_URL):
         target = _tool_target("burst test")
         if target is None:
             return
-        peer, bind, ports = target
+        peer, bind, ports, vals = target
+        # The form's DF choice rides along so a jumbo/DF demo setup bursts
+        # the way it probes (run_burst_test defaults the rest).
         ns = argparse.Namespace(peer=peer, bind=bind, udp_ports=ports,
-                                burst_mbps=[1, 2, 5, 10, 25], burst_secs=3.0)
+                                burst_mbps=[1, 2, 5, 10, 25], burst_secs=3.0,
+                                dont_fragment=bool(vals["dont_fragment"]))
         _open_tool_window(root, f"Burst test -> {peer}",
                           lambda out: run_burst_test(ns, out=out), "burst-test")
 
@@ -4195,6 +4368,23 @@ def _port_pair(text):
     return ports
 
 
+def pps_from_mbps(mbps, size, udp_streams=2, tcp_streams=2):
+    """Derive per-stream probe rates from a target offered load (--mbps).
+
+    `mbps` is the box's total offered PROBE bandwidth per direction at the
+    IP level (probe + IPv4/UDP-or-TCP headers, Ethernet excluded), split
+    evenly across the streams; echoes mirror probes, so the wire carries
+    roughly double per direction at steady state. Returns (udp_pps,
+    tcp_pps) as floats - fractional rates are real rates, not rounding
+    errors, so they are preserved. Each is floored at 0.1 pps (one probe
+    per 10 s) so a tiny target with a big probe still measures something.
+    """
+    share = mbps * 1e6 / (udp_streams + tcp_streams) / 8.0  # bytes/s/stream
+    udp_pps = share / (size + IPV4_UDP_OVERHEAD)
+    tcp_pps = share / (size + IPV4_TCP_OVERHEAD)
+    return max(0.1, udp_pps), max(0.1, tcp_pps)
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Bidirectional UDP/TCP network quality probe between two workstations.")
@@ -4234,6 +4424,13 @@ def parse_args(argv=None):
                    help="The two TCP ports (default %d,%d)." % DEFAULT_TCP_PORTS)
     p.add_argument("--pps", type=int, default=50,
                    help="Probe packets per second, per stream (default 50).")
+    p.add_argument("--mbps", type=float, default=None, metavar="X",
+                   help="Target offered probe load for the box in Mbps (IP "
+                        "level, per direction, probes only - echoes double "
+                        "the wire load; max 1000). Splits evenly across the "
+                        "four streams and derives each stream's rate from "
+                        "--size, overriding --pps/--tcp-pps. The dashboard "
+                        "footer shows offered vs target.")
     p.add_argument("--size", type=int, default=200,
                    help="Probe packet size in bytes (default 200, min %d, max %d; "
                         "e.g. 8972 to fill a 9000-byte jumbo frame)."
@@ -4403,6 +4600,47 @@ def run_mtu_sweep(args, out=print):
 BURST_PROBE_SIZE = 1200   # fits one EC slice AND a standard 1500 B hop
 
 
+def burst_verdicts(results, base_med, base_p95):
+    """Name the SHAPE of a burst-test response (the table carries the exact
+    numbers; thresholds are deliberately blunt). `results` rows are
+    (mbps, loss_pct, late_pct, rtt_med_ms, rtt_p95_ms): loss counts echoes
+    that never returned at all, late the ones that returned past the probe
+    timeout - a policer's drops never arrive, so late echoes don't trigger
+    the rate-cap verdicts, but they do disqualify a stage from "clean".
+    Returns the verdict lines, without the leading '=> '."""
+    clean = [m for m, loss, late, med, p95 in results
+             if loss + late < 1.0 and p95 is not None
+             and p95 < base_p95 + 30.0]
+    bloated = [(m, p95) for m, loss, late, med, p95 in results
+               if loss + late < 2.0 and p95 is not None
+               and p95 > base_p95 + 100.0]
+    capped = [(m, loss, med) for m, loss, late, med, p95 in results
+              if loss >= 5.0 and med is not None]
+    lines = []
+    if clean:
+        lines.append(f"Clean up to {max(clean):g} Mbps offered "
+                     f"(loss+late <1%, p95 RTT within +30 ms of idle).")
+    if bloated:
+        m, p95 = bloated[0]
+        lines.append(f"Deep queue (bufferbloat-like): at {m:g} Mbps p95 RTT "
+                     f"hit {p95:.0f} ms (idle {base_p95:.1f} ms) before any "
+                     f"real loss.")
+    if capped:
+        m, loss, med = capped[0]
+        if med < base_med + 20.0:
+            lines.append(f"Policer-like: {loss:.0f}% loss at {m:g} Mbps with "
+                         f"RTT still flat ({med:.1f} ms) - a hard rate cap "
+                         f"that drops, not queues.")
+        else:
+            lines.append(f"Shaper-like: {loss:.0f}% loss at {m:g} Mbps after "
+                         f"RTT grew to {med:.0f} ms - a queue that fills, "
+                         f"then drops.")
+    if not lines:
+        lines.append("No stage ran clean and none showed a clear queue/cap "
+                     "signature - see the table.")
+    return lines
+
+
 def run_burst_test(args, out=print):
     """Responsiveness under load: staged UDP rate ramp against a running peer.
 
@@ -4424,7 +4662,13 @@ def run_burst_test(args, out=print):
     size = BURST_PROBE_SIZE
     stages = args.burst_mbps
     dur = args.burst_secs
-    out(f"Burst test -> {peer}:{port} (UDP, {size} B probes). "
+    # The launcher's tool window builds a minimal Namespace, so read the
+    # session-wide options defensively.
+    df_on = getattr(args, "dont_fragment", False)
+    timeout_s = getattr(args, "timeout", None) or 2.0
+    timeout_ms = timeout_s * 1000.0
+    out(f"Burst test -> {peer}:{port} (UDP, {size} B probes, "
+        f"DF {'on' if df_on else 'off'}). "
         f"Peer must be running Network Vitals.")
     out(f"Stages: {', '.join(f'{m:g}' for m in stages)} Mbps, {dur:g} s each. "
         f"This is real traffic, and echoes double it.")
@@ -4432,6 +4676,11 @@ def run_burst_test(args, out=print):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     enlarge_socket_buffers(sock)
     quench_udp_connreset(sock)
+    if df_on:
+        # Without DF a sub-1228-MTU hop silently fragments the 1200 B probes
+        # (2 wire packets per probe) and the pps/rate math no longer means
+        # what the table says.
+        set_dont_fragment(sock)
     try:
         sock.bind((args.bind, 0))  # ephemeral source port
     except OSError as e:
@@ -4441,9 +4690,14 @@ def run_burst_test(args, out=print):
     seq = [0]
 
     def run_stage(pps, seconds):
-        """Send paced probes for `seconds`; return (sent, rtts_ms)."""
+        """Send paced probes for `seconds`; return (sent, rtts_ms, late_ms).
+
+        Same loss-vs-late split as the continuous engine: an echo within the
+        probe timeout is on-time, one beyond it is LATE (reordered or
+        over-buffered, but the path did deliver it), and only a probe that
+        never returns at all counts as lost."""
         pending = {}
-        rtts = []
+        rtts, late = [], []
 
         def drain():
             while True:
@@ -4457,7 +4711,8 @@ def run_burst_test(args, out=print):
                 if p and p[0] == TYPE_ECHO:
                     ns = pending.pop(p[2], None)
                     if ns is not None:
-                        rtts.append((time.monotonic_ns() - ns) / 1e6)
+                        rtt = (time.monotonic_ns() - ns) / 1e6
+                        (late if rtt >= timeout_ms else rtts).append(rtt)
 
         sent = 0
         # Accumulator pacing in ~2 ms ticks: sleep-per-packet can't pace
@@ -4486,76 +4741,251 @@ def run_burst_test(args, out=print):
                 carry -= 1.0
             drain()
             time.sleep(0.002)
-        t_drain = time.monotonic() + 0.6  # let stragglers arrive
-        while time.monotonic() < t_drain:
+        # Let stragglers arrive so they can be counted LATE instead of lost:
+        # drain up to the probe timeout (bounded), stopping early once every
+        # in-flight probe is accounted for.
+        t_drain = time.monotonic() + max(0.6, min(timeout_s, 2.0))
+        while time.monotonic() < t_drain and pending:
             drain()
             time.sleep(0.005)
-        return sent, rtts
+        drain()
+        return sent, rtts, late
 
     def pctl(sorted_vals, q):
         return sorted_vals[int(q * (len(sorted_vals) - 1))]
 
     # Baseline: the idle path, so stage RTTs have something to move against.
-    base_sent, base_rtts = run_stage(20, 1.5)
-    if len(base_rtts) < 10:
-        out(f"  baseline got {len(base_rtts)}/{base_sent} echoes - peer down, "
+    base_sent, base_rtts, base_late = run_stage(20, 1.5)
+    base_got = sorted(base_rtts + base_late)
+    if len(base_got) < 10:
+        out(f"  baseline got {len(base_got)}/{base_sent} echoes - peer down, "
             f"UDP {port} blocked, or both ends aren't on this version.")
         sock.close()
         return
-    base_rtts.sort()
-    base_med, base_p95 = pctl(base_rtts, 0.5), pctl(base_rtts, 0.95)
+    base_med, base_p95 = pctl(base_got, 0.5), pctl(base_got, 0.95)
     out(f"  baseline (idle): RTT median {base_med:.1f} ms  p95 {base_p95:.1f} ms")
     out("")
 
     results = []
     for mbps in stages:
         pps = max(20, int(mbps * 1e6 / 8 / size))
-        sent, rtts = run_stage(pps, dur)
+        sent, rtts, late_l = run_stage(pps, dur)
         if not sent:
             out(f"  {mbps:6g} Mbps: could not send (local socket error)")
             continue
-        loss = (sent - len(rtts)) / sent * 100.0
+        loss = (sent - len(rtts) - len(late_l)) / sent * 100.0
+        late_pct = len(late_l) / sent * 100.0
         offered = sent * size * 8 / dur / 1e6
-        if rtts:
-            rtts.sort()
-            med, p95 = pctl(rtts, 0.5), pctl(rtts, 0.95)
+        got = sorted(rtts + late_l)  # late echoes are real RTT samples: the
+        if got:                      # queue they sat in belongs in the p95
+            med, p95 = pctl(got, 0.5), pctl(got, 0.95)
             out(f"  {mbps:6g} Mbps offered ({offered:5.1f} achieved, {pps} pps): "
-                f"loss {loss:5.1f}%   RTT med {med:6.1f} ms  p95 {p95:6.1f} ms")
+                f"loss {loss:5.1f}%  late {late_pct:4.1f}%   "
+                f"RTT med {med:6.1f} ms  p95 {p95:6.1f} ms")
         else:
             med = p95 = None
             out(f"  {mbps:6g} Mbps offered ({offered:5.1f} achieved, {pps} pps): "
                 f"loss 100.0%   no echoes")
-        results.append((mbps, loss, med, p95))
+        results.append((mbps, loss, late_pct, med, p95))
     sock.close()
     out("")
 
-    # Verdicts. Thresholds are deliberately blunt: this names the SHAPE of
-    # the response, the table above carries the exact numbers.
-    clean = [m for m, loss, med, p95 in results
-             if loss < 1.0 and p95 is not None and p95 < base_p95 + 30.0]
-    bloated = [(m, p95) for m, loss, med, p95 in results
-               if loss < 2.0 and p95 is not None and p95 > base_p95 + 100.0]
-    capped = [(m, loss, med) for m, loss, med, p95 in results
-              if loss >= 5.0 and med is not None]
-    if clean:
-        out(f"=> Clean up to {max(clean):g} Mbps offered "
-            f"(loss <1%, p95 RTT within +30 ms of idle).")
-    if bloated:
-        m, p95 = bloated[0]
-        out(f"=> Deep queue (bufferbloat-like): at {m:g} Mbps p95 RTT hit "
-            f"{p95:.0f} ms (idle {base_p95:.1f} ms) before any real loss.")
-    if capped:
-        m, loss, med = capped[0]
-        if med < base_med + 20.0:
-            out(f"=> Policer-like: {loss:.0f}% loss at {m:g} Mbps with RTT "
-                f"still flat ({med:.1f} ms) - a hard rate cap that drops, "
-                f"not queues.")
-        else:
-            out(f"=> Shaper-like: {loss:.0f}% loss at {m:g} Mbps after RTT "
-                f"grew to {med:.0f} ms - a queue that fills, then drops.")
-    if not (clean or bloated or capped):
-        out("=> No stage ran clean and none showed a clear queue/cap "
-            "signature - see the table.")
+    for line in burst_verdicts(results, base_med, base_p95):
+        out(f"=> {line}")
+
+
+def square_phase(elapsed, on_s, off_s):
+    """True while a square-wave load schedule is in its ON half.
+
+    `off_s` <= 0 (or None) means no square wave: always on. The wave starts
+    in the ON half at elapsed 0 and repeats every on_s + off_s seconds."""
+    if not off_s or off_s <= 0:
+        return True
+    period = on_s + off_s
+    if period <= 0 or on_s <= 0:
+        return False
+    return (elapsed % period) < on_s
+
+
+class LoadGenerator:
+    """Continuous paced UDP load against one peer, driven from the dashboard.
+
+    The burst test's machinery made resident: TYPE_TEST probes (echoed by
+    the peer but excluded from its loss-isolation bookkeeping) from an
+    ephemeral source port, accumulator-paced in ~2 ms ticks, so a sustained
+    known-quantity load can run WHILE the live charts show what it does to
+    the scored streams. An optional square wave (on_s/off_s) turns the load
+    on and off on a fixed cadence - the calibration pattern for diffing
+    WAN-side counters against background traffic. Native transport only: a
+    VXLAN-mode peer opens no native UDP listener to echo the probes.
+    Echoes are full-size, so the offered load rides both directions."""
+
+    STATS_WINDOW = 5.0  # seconds of history behind achieved-rate/loss
+
+    def __init__(self, peer, port, bind="0.0.0.0", size=BURST_PROBE_SIZE,
+                 dont_fragment=False, timeout=2.0):
+        self.peer = peer
+        self.port = port
+        self.bind = bind
+        self.size = size
+        self.dont_fragment = dont_fragment
+        self.timeout = timeout or 2.0
+        self.lock = threading.Lock()
+        self.stop_evt = None
+        self.thread = None
+        self.sock = None
+        self.mbps = 0.0
+        self.on_s = 0.0
+        self.off_s = 0.0
+        self.error = None
+        # rolling stats, trimmed to STATS_WINDOW (guarded by self.lock)
+        self._sent = deque()   # send times
+        self._ok = deque()     # (arrival time, rtt_ms) - echo within timeout
+        self._late = deque()   # (arrival time, rtt_ms) - echo past timeout
+        self._lost = deque()   # reap times of probes that never returned
+        self._phase_on = True
+        self._t0 = None        # start time of the current run
+
+    @property
+    def running(self):
+        return self.thread is not None and self.thread.is_alive()
+
+    def start(self, mbps, on_s=0.0, off_s=0.0):
+        """Begin offering `mbps` (probes only; echoes double the wire load).
+        Returns None, or a user-facing error string on failure."""
+        if self.running:
+            return "already running"
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        enlarge_socket_buffers(sock)
+        quench_udp_connreset(sock)
+        if self.dont_fragment:
+            set_dont_fragment(sock)
+        try:
+            sock.bind((self.bind, 0))  # ephemeral: coexists with the session
+        except OSError as e:
+            sock.close()
+            return f"bind failed: {e}"
+        sock.setblocking(False)
+        self.sock = sock
+        self.mbps = float(mbps)
+        self.on_s, self.off_s = float(on_s or 0.0), float(off_s or 0.0)
+        self.error = None
+        with self.lock:
+            for dq in (self._sent, self._ok, self._late, self._lost):
+                dq.clear()
+        self._t0 = time.monotonic()
+        self.stop_evt = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="load-gen",
+                                       daemon=True)
+        self.thread.start()
+        return None
+
+    def stop(self):
+        if self.stop_evt is not None:
+            self.stop_evt.set()
+
+    def status(self):
+        """Rolling view over the last STATS_WINDOW seconds."""
+        now = time.monotonic()
+        floor = now - self.STATS_WINDOW
+        with self.lock:
+            for dq in (self._sent, self._lost):
+                while dq and dq[0] < floor:
+                    dq.popleft()
+            for dq in (self._ok, self._late):
+                while dq and dq[0][0] < floor:
+                    dq.popleft()
+            sent, ok, late, lost = (len(self._sent), len(self._ok),
+                                    len(self._late), len(self._lost))
+            phase_on = self._phase_on
+        elapsed = now - self._t0 if self._t0 is not None else self.STATS_WINDOW
+        span = min(self.STATS_WINDOW, max(0.5, elapsed))
+        achieved = sent * (self.size + IPV4_UDP_OVERHEAD) * 8.0 / span / 1e6
+        decided = ok + late + lost
+        return {
+            "running": self.running, "mbps": self.mbps,
+            "square": self.off_s > 0, "phase_on": phase_on,
+            "achieved_mbps": achieved,
+            "loss_pct": (lost / decided * 100.0) if decided else 0.0,
+            "late_pct": (late / decided * 100.0) if decided else 0.0,
+            "error": self.error,
+        }
+
+    def _run(self):
+        sock, stop = self.sock, self.stop_evt
+        pps = max(1.0, self.mbps * 1e6 / 8.0 / self.size)
+        timeout_ns = int(self.timeout * 1e9)
+        pending = {}   # seq -> send monotonic_ns
+        seq = 0
+        t0 = time.monotonic()
+        last = t0
+        carry = 0.0
+
+        def drain(now):
+            while True:
+                try:
+                    data, _addr = sock.recvfrom(MAX_SIZE)
+                except (BlockingIOError, InterruptedError):
+                    return
+                except (ConnectionResetError, OSError):
+                    return
+                p = parse_header(data)
+                if p and p[0] == TYPE_ECHO:
+                    ns = pending.pop(p[2], None)
+                    if ns is not None:
+                        rtt = (time.monotonic_ns() - ns) / 1e6
+                        with self.lock:
+                            if rtt >= self.timeout * 1000.0:
+                                self._late.append((now, rtt))
+                            else:
+                                self._ok.append((now, rtt))
+
+        def reap(now):
+            """Probes past the timeout with no echo -> lost (a late echo can
+            no longer match them; the burst tool tolerates that skew, and a
+            sustained generator must not leak `pending` forever)."""
+            if not pending:
+                return
+            cutoff = time.monotonic_ns() - timeout_ns - int(0.5e9)
+            dead = [s for s, ns in pending.items() if ns < cutoff]
+            if dead:
+                with self.lock:
+                    for s in dead:
+                        del pending[s]
+                        self._lost.append(now)
+
+        while not stop.is_set():
+            now = time.monotonic()
+            on = square_phase(now - t0, self.on_s, self.off_s)
+            with self.lock:
+                self._phase_on = on
+            if not on:
+                drain(now)
+                reap(now)
+                carry = 0.0
+                last = now
+                time.sleep(0.02)
+                continue
+            carry += (now - last) * pps
+            last = now
+            for _ in range(min(int(carry), 500)):
+                seq += 1
+                ns = time.monotonic_ns()
+                pkt = build_packet(TYPE_TEST, 0, seq, ns, self.size)
+                pending[seq] = ns  # register first: echoes race the GIL
+                try:
+                    sock.sendto(pkt, (self.peer, self.port))
+                except (BlockingIOError, OSError):
+                    pending.pop(seq, None)
+                    carry = min(carry, 1.0)  # local backpressure
+                    break
+                with self.lock:
+                    self._sent.append(now)
+                carry -= 1.0
+            drain(now)
+            reap(now)
+            time.sleep(0.002)
+        sock.close()
 
 
 def _normalize_peer_args(args):
@@ -4661,6 +5091,18 @@ def main(argv=None):
         run_burst_test(args)
         return
 
+    # --mbps: derive the per-stream rates from the FINAL probe size (after
+    # the clamps above, so the offered-load math matches what is sent).
+    if args.mbps is not None:
+        if not (0 < args.mbps <= 1000):
+            print("error: --mbps must be in (0, 1000]", file=sys.stderr)
+            return 2
+        args.pps, args.tcp_pps = pps_from_mbps(args.mbps, args.size)
+        print(f"note: --mbps {_fmt_num(args.mbps)} -> {args.pps:.1f} pps per "
+              f"UDP stream + {args.tcp_pps:.1f} pps per TCP stream at "
+              f"{args.size} B probes (probes only; echoes double the wire "
+              f"load).", file=sys.stderr)
+
     set_timer_resolution(1)  # smooth pacing on Windows -> fewer microburst drops
     # Binding can transiently fail right after an in-app update restart (the
     # replaced instance is still letting go of the ports), so retry briefly
@@ -4673,7 +5115,8 @@ def main(argv=None):
                         args.timeout, history_seconds=args.history,
                         loss_deadband=args.loss_deadband,
                         dont_fragment=args.dont_fragment, vxlan=vxlan,
-                        peers=args.peers, tcp_pps=args.tcp_pps)
+                        peers=args.peers, tcp_pps=args.tcp_pps,
+                        target_mbps=args.mbps)
         try:
             engine.start()
             last_err = None

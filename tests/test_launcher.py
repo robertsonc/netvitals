@@ -20,7 +20,7 @@ def launcher_defaults(**overrides):
     Pass overrides to model a user editing a field."""
     vals = {
         "peer": "10.0.0.2",
-        "size": "200", "pps": "50", "dont_fragment": False,
+        "size": "200", "pps": "50", "mbps": "", "dont_fragment": False,
         "bind": "0.0.0.0", "udp_ports": "", "tcp_ports": "",
         "window": "10", "timeout": "2", "loss_deadband": "0.5",
         "history": "300", "refresh_ms": "500",
@@ -100,6 +100,25 @@ class TestLauncherArgv(unittest.TestCase):
     def test_bind_non_default_emitted(self):
         argv = nq._launcher_argv(launcher_defaults(bind="192.168.1.10"))
         self.assertEqual(argv[argv.index("--bind") + 1], "192.168.1.10")
+
+    def test_target_mbps_emitted_and_round_trips(self):
+        argv = nq._launcher_argv(launcher_defaults(mbps="8"))
+        self.assertEqual(argv[argv.index("--mbps") + 1], "8")
+        self.assertEqual(nq.parse_args(argv).mbps, 8.0)
+        # Blank field (the default) stays off the command line.
+        self.assertNotIn("--mbps", nq._launcher_argv(launcher_defaults()))
+
+    def test_target_mbps_out_of_range_reports_field_name(self):
+        for bad in ("0", "1001", "x"):
+            with self.assertRaises(ValueError) as cm:
+                nq._launcher_argv(launcher_defaults(mbps=bad))
+            self.assertIn("Target Mbps", str(cm.exception))
+
+    def test_saved_settings_without_mbps_key_still_work(self):
+        # Settings persisted by a pre-1.7.0 launcher have no "mbps" key.
+        vals = launcher_defaults()
+        del vals["mbps"]
+        self.assertEqual(nq._launcher_argv(vals), ["--peer", "10.0.0.2"])
 
 
 class TestFieldParsers(unittest.TestCase):

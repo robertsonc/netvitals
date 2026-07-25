@@ -76,6 +76,10 @@ plus, in the header:
   predicted tunnel packets (slices + encapsulation overhead) below, with the
   packet amplification factor and predicted WAN pps — see *Wire anatomy*
   below.
+- a **Load** button that toggles a sustained-load panel: a known-quantity
+  UDP load (in Mbps, optionally square-waved on/off) offered *while* the
+  scored streams keep measuring, so the charts show what the load does to
+  the path — see *Sustained load* below.
 
 Charts keep a rolling history (default 5 minutes, `--history`). The window
 resizes freely; the charts grow and shrink with it.
@@ -231,9 +235,10 @@ python netquality.py
 ```
 
 A launch window opens where everything is a field instead of a flag: peer IP
-(with a history of recent peers), probe size, rate, Don't-Fragment, and under
-*Advanced options* the bind address, ports, window/timeout/deadband, chart
-history, VXLAN encapsulation and console mode. It also shows this machine's
+(with a history of recent peers), probe size, rate (probes/sec or a target
+Mbps for the box), Don't-Fragment, and under *Advanced options* the bind
+address, ports, window/timeout/deadband, chart history, VXLAN encapsulation
+and console mode. It also shows this machine's
 IP (to type into the *other* machine), can run the **MTU sweep** from a
 button, and checks for updates. Every choice is remembered for next time in
 `%APPDATA%\NetVitals\settings.json` (Linux: `~/.config/netvitals/`).
@@ -405,6 +410,11 @@ Bad below.
 --udp-ports A,B    the two UDP ports (default 30201,30202)
 --tcp-ports A,B    the two TCP ports (default 30101,30102)
 --pps N            probes per second per stream (default 50)
+--mbps X           target offered probe load for the box in Mbps (IP level,
+                   per direction, probes only - echoes double the wire load;
+                   max 1000): splits evenly across the four streams, derives
+                   each stream's rate from --size and overrides --pps /
+                   --tcp-pps; the UI footer shows offered vs target
 --size N           probe packet size in bytes (default 200; e.g. 8972 for jumbo)
 --dont-fragment    set the DF bit on UDP (oversized probes dropped, not split);
                    with --vxlan it applies to the OUTER packet
@@ -430,7 +440,19 @@ Bad below.
 
 At the defaults each stream is ~50 packets/s × 200 B ≈ 10 KB/s each way, i.e.
 ~80 KB/s total for the box — light enough to leave running, dense enough to
-resolve loss and jitter well. Bump `--pps` / `--size` for a heavier load test.
+resolve loss and jitter well. Bump `--pps` / `--size` for a heavier load test,
+or skip the arithmetic and name the load directly:
+
+```
+python netquality.py --peer 10.0.0.2 --mbps 8
+```
+
+`--mbps` splits the target evenly across the four streams and derives each
+stream's rate from `--size` (the launcher has a *Target Mbps* field for the
+same thing). The dashboard footer then shows **`probe load 7.98 Mbps /
+target 8`** — the offered load is measured back, not assumed, so the demo's
+known quantity is verifiable on screen. The figure is IP-level, per
+direction, probes only; echoes double what's on the wire.
 
 ## Locating loss
 
@@ -559,8 +581,18 @@ against a peer that is running Network Vitals, and reads the response:
 - **Loss appears above some rate with RTT flat** → a policer (hard rate cap
   that drops instead of queueing).
 - **RTT grows first, then loss** → a shaper (queue fills, then drops).
-- Otherwise it reports the highest **clean** stage (loss <1%, p95 RTT within
-  +30 ms of idle).
+- Otherwise it reports the highest **clean** stage (loss+late <1%, p95 RTT
+  within +30 ms of idle).
+
+Each stage reports **loss and late separately** (1.7.0), with the same
+semantics as the continuous engine: an echo back within the probe
+`--timeout` is on-time, one beyond it is *late* (the path delivered it, too
+slowly to use), and only a probe that never returns is *loss*. A policer's
+drops never arrive, so late echoes can't fake the rate-cap verdicts — but
+they do disqualify a stage from "clean". Pass `--dont-fragment` to set DF on
+the burst probes too (1.7.0; the launcher's checkbox rides along): without
+it, a sub-1228-MTU hop silently fragments the 1200 B probes and the pps
+math no longer means what the table says.
 
 Also available as the **Burst test** button in the launch window, next to the
 MTU sweep. Like the sweep it binds an ephemeral port and runs fine alongside
@@ -568,6 +600,29 @@ a live session — test probes are excluded from the loss-isolation bookkeeping
 on both ends, so they don't skew the session's forward/return split. Echoes
 are full-size: the offered load is carried **in both directions at once**,
 and it is real traffic, so mind shared links at the higher stages.
+
+## Sustained load (the Load button)
+
+The burst test made resident (1.7.0): the dashboard's **⚡ Load** button
+opens a panel that offers a continuous, known-quantity UDP load — same
+1200 B TEST probes, same ephemeral port, same exclusion from the
+loss-isolation bookkeeping — **while the four scored streams keep
+measuring**. The charts become the story: start 20 Mbps and watch the
+latency band, jitter and one-way drift react in real time; stop it and watch
+them recover.
+
+- **Mbps field**: the offered rate (probes only; echoes are full-size, so
+  both directions carry it at once).
+- **Square wave**: on/off seconds (default 10/10) turn the load into a
+  calibration pattern — square-wave the rate and diff WAN-side counters
+  between the on and off windows to attribute tunnel packets on a busy
+  fabric (the measurement half of this is roadmap item 1).
+- The panel shows **offered vs achieved** Mbps plus the load stream's own
+  loss/late over the last ~5 s.
+
+Native transport only (a VXLAN-mode peer opens no native UDP listener to
+echo the probes — the button says so instead of failing silently), and
+single-pair dashboards only for now (the mesh GUI doesn't carry the panel).
 
 ## Wire anatomy (EdgeConnect slicing model)
 
@@ -740,6 +795,12 @@ netquality.exe --peer 10.0.0.2
 *Shipped in 1.5.0:* directional **one-way drift** chart, the latency
 **p5–p95 band**, the **loss pattern** diagnostic, and the **burst test** —
 the host-side measurement tranche of this roadmap.
+
+*Shipped in 1.7.0* (the guide's Milestone 1.7 — known-quantity controls):
+**`--mbps` target-bandwidth mode** with the offered-vs-target footer
+readout, the **sustained-load panel** (⚡ Load button, with the square-wave
+calibration schedule), and the **hardened burst test** (optional DF,
+loss-vs-late split in stages and verdicts).
 
 The app measures the **host view** (the "LAN row" of the anatomy panel); the
 WAN middle is currently *predicted* by the model, not observed. Planned work

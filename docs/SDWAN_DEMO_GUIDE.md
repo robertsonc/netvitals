@@ -54,7 +54,10 @@ Every dimension of the offered load is deterministic and operator-set:
 
 - **Rate**: `--pps` probes/s per stream (default 50 = one probe every 20 ms,
   deliberately matching G.711 voice packetization); `--tcp-pps` splits the
-  TCP rate from the UDP rate.
+  TCP rate from the UDP rate; or name the bandwidth directly with
+  `--mbps X` (1.7.0) — the target splits evenly across the streams, the
+  rates derive from `--size`, and the footer shows **offered vs target** so
+  the known quantity is verified on screen, not assumed.
 - **Size**: `--size` bytes per probe (default 200; 34 min, 65535 max), one
   knob for all streams. Echoes mirror the probe size, so **every stream's
   load is symmetric in both directions**.
@@ -162,6 +165,7 @@ Generating load is half the story; every packet is also a measurement:
 |---|---|---|
 | `--pps N` | 50 | probes/s per stream (UDP; TCP too unless `--tcp-pps`) |
 | `--tcp-pps N` | = `--pps` | independent TCP cadence |
+| `--mbps X` | off | target offered probe load for the box (IP level, per direction, probes only; echoes double the wire); derives rates from `--size`, overrides `--pps`/`--tcp-pps` |
 | `--size N` | 200 | bytes per probe, all streams (34–65535) |
 | `--dont-fragment` | off | DF bit: oversized probes drop instead of fragment |
 | `--udp-ports A,B` / `--tcp-ports A,B` | 30201,30202 / 30101,30102 | the match-rule surface |
@@ -198,11 +202,16 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
 
 - **Demonstrates:** a precise, sustained offered load (e.g. to sit just
   under/over a policer or to fill a small circuit) that can run for hours.
-- **Run:** raise the dials, e.g. `--pps 250 --size 1000` ≈ 4.1 Mbps per
-  direction per UDP stream (formula in §1.2).
+- **Run:** name the load directly — `--mbps 8` (1.7.0) offers exactly 8 Mbps
+  of probes per direction for the box, split evenly across the four streams
+  with the rates derived from `--size`; or raise the dials by hand, e.g.
+  `--pps 250 --size 1000` ≈ 4.1 Mbps per direction per UDP stream (formula
+  in §1.2). The launcher's *Target Mbps* field does the same as `--mbps`.
 - **Traffic:** exactly what the formula says — pacing is accumulator-based
   and the Windows 1 ms timer keeps it smooth rather than bursty.
-- **Show:** Totals table (sent/received/lost/late per stream) reconciling
+- **Show:** the footer's `probe load X.XX Mbps / target Y` readout — the
+  offered load is measured back, so the known quantity is verifiable on
+  screen; Totals table (sent/received/lost/late per stream) reconciling
   against the far end; lifetime vs since-reset counters.
 
 ### T3. QoS / policy classification targets (port-based steering)
@@ -269,17 +278,22 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
   pps: `pps = Mbps × 10⁶ / 8 / 1200` → 1 Mbps = 104 pps, 5 = 520, 10 = 1041,
   25 = 2604 (cap 500 Mbps/stage). Echoes are full-size: **the offered load
   rides both directions at once**. A 1.5-s idle baseline precedes the ladder.
-- **Show:** the per-stage table (offered vs achieved Mbps, loss, RTT
-  median/p95) and the verdict:
+- **Show:** the per-stage table (offered vs achieved Mbps, loss *and late*,
+  RTT median/p95) and the verdict:
   - RTT grows, loss low → **deep queue (bufferbloat)** (p95 > idle + 100 ms);
-  - loss ≥ 5 % with RTT flat → **policer** (drops, doesn't queue);
-  - RTT grows *then* loss → **shaper**;
-  - otherwise → highest **clean** stage (loss < 1 %, p95 within +30 ms of
-    idle).
+  - hard loss ≥ 5 % with RTT flat → **policer** (drops, doesn't queue);
+  - RTT grows *then* hard loss → **shaper**;
+  - otherwise → highest **clean** stage (loss+late < 1 %, p95 within +30 ms
+    of idle).
+- **1.7.0 hardening:** stages split **loss vs late** with the continuous
+  engine's semantics (echo past `--timeout` = late, never returned = loss),
+  so a policer's hard drops and a deep queue's stragglers are no longer
+  conflated — late echoes can't fake a rate-cap verdict, but they do
+  disqualify "clean". `--dont-fragment` now applies to burst probes too
+  (the launcher's DF checkbox rides along); without it a sub-1228-MTU hop
+  silently fragments the 1200 B probes and the pps math changes.
 - **Caveats:** same reachability rules as the sweep (native-mode peer,
-  tool host must be a configured peer). DF is *not* set — on a path with MTU
-  < 1228 the probes fragment and the pps math changes. Stage loss counts
-  echoes missing after stage end + 0.6 s drain (no late reclassification).
+  tool host must be a configured peer).
 
 ### T8. VXLAN encapsulation and transparent fragmentation
 
@@ -390,17 +404,38 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
 - **Single instance per port**: a second accidental launch fails loudly.
 - **Start-order freedom**: either side can start/stop/reboot at any time.
 
+### T15. Sustained load with the charts watching (⚡ Load, 1.7.0)
+
+- **Demonstrates:** what a known load does to the path *while the scored
+  streams keep measuring* — start the load, watch latency band / jitter /
+  one-way drift react on the live charts, stop it, watch them recover. The
+  square wave is the calibration pattern for WAN-side counter attribution.
+- **Run:** dashboard → **⚡ Load** → enter Mbps (and optionally square-wave
+  on/off seconds, default 10/10) → *Start load*.
+- **Traffic:** continuous paced 1200-byte UDP TEST probes from an ephemeral
+  port to the peer's first UDP port — the burst-test machinery made
+  resident. Echoes are full-size, so the load rides both directions;
+  excluded from loss isolation on both ends. The panel shows **offered vs
+  achieved** Mbps plus the load stream's own loss/late over the last ~5 s.
+- **Show:** the panel's achieved rate against the charts' reaction; with
+  the square wave, the on/off periods lining up with drift/jitter swings —
+  and, on the fabric side, WAN counters stepping in the same cadence.
+- **Caveats:** native mode only (a VXLAN peer has no native UDP listener to
+  echo the probes — the panel says so); single-pair dashboard only (not in
+  the mesh GUI); DF on the load probes follows the session's
+  `--dont-fragment`.
+
 ## 2.4 Constraint summary (read before scripting a demo)
 
 | Constraint | Detail |
 |---|---|
 | IPv4 only | DF handling and VXLAN inner packets are IPv4 |
-| One `--size` / `--pps` for all streams | only TCP-vs-UDP rate splits (`--tcp-pps`); no per-stream sizes, no IMIX, no ramps in the continuous engine |
+| One `--size` / rate for all streams | `--mbps` names the box total and `--tcp-pps` splits TCP from UDP, but there are no per-stream sizes, no IMIX, no ramps in the continuous engine |
 | Exactly 2 UDP + 2 TCP streams per pair | port values movable, count fixed |
 | No DSCP/ToS marking anywhere today | inner VXLAN TOS hard-coded 0; Windows needs qWAVE for non-admin DSCP (Roadmap R-6) |
-| One-shot tools (sweep/burst) | UDP-only, native-mode peers only, tool host must be a configured peer on the target |
+| One-shot tools (sweep/burst) and the Load panel | UDP-only, native-mode peers only, tool host must be a configured peer on the target; Load panel is single-pair GUI only |
 | Version parity | both ends ≥ 1.5.0; VXLAN both-ends-or-neither, same VNI/port |
-| Burst test | no DF; loss has no late-reclassification; both directions carry the load |
+| Burst test / Load | both directions carry the offered load (echoes are full-size); burst DF is opt-in via `--dont-fragment` |
 
 ---
 
@@ -423,16 +458,17 @@ roadmap items are folded in and renumbered (`R-n`).
 *Theme: today the operator computes bandwidth from pps × size; tomorrow they
 should dial bandwidth directly, shape it over time, and mix classes.*
 
-- **R-1. Target-bandwidth mode.** `--mbps X` (per stream or per box) as an
-  alternative to `--pps`: the engine derives and holds the pacing, and the
-  header shows **offered vs achieved** continuously. Turns every demo
-  request ("give me exactly 8 Mbps of voice-like traffic") into one flag.
-- **R-2. Sustained-load mode in the dashboard.** Promote the burst-test
-  machinery to a toggleable continuous load stream (start/stop button, rate
-  field) with its RTT/loss impact drawn on the live charts — today load
-  testing is a one-shot console tool. Includes a **square-wave scheduler**
-  (N s on / N s off) — the "calibration burst" needed to attribute WAN-side
-  counters on busy fabrics (pairs with R-12).
+- **R-1. Target-bandwidth mode.** ✅ **Shipped in 1.7.0**: `--mbps X` (and
+  the launcher's *Target Mbps* field) splits the target across the four
+  streams, derives the rates from `--size`, and the footer shows **offered
+  vs target** continuously. Turns every demo request ("give me exactly
+  8 Mbps of voice-like traffic") into one flag.
+- **R-2. Sustained-load mode in the dashboard.** ✅ **Shipped in 1.7.0**:
+  the **⚡ Load** button offers a continuous known-quantity UDP load
+  (start/stop, rate field, offered-vs-achieved readout) while the live
+  charts show its impact, including the **square-wave scheduler** (N s on /
+  N s off) — the "calibration burst" needed to attribute WAN-side counters
+  on busy fabrics (pairs with R-12). Native-mode, single-pair dashboard.
 - **R-3. Per-stream profiles and IMIX.** Per-stream `--size`/`--pps`
   overrides and named mixes (e.g. `voice` 200 B @ 50 pps, `video` 1200 B @
   90 pps, `bulk` 1400 B max-rate, `imix` 7:4:1 of 64/576/1500) so one
@@ -442,10 +478,12 @@ should dial bandwidth directly, shape it over time, and mix classes.*
   rates, sizes) the app replays — repeatable, hands-free demo arcs
   ("baseline 60 s → 10 Mbps 30 s → jumbo 30 s"), with stage markers drawn on
   the charts.
-- **R-5. Burst-test hardening.** Optional `--dont-fragment` on burst probes
-  (today they silently fragment below 1228-B MTU paths); late-vs-lost
-  accounting in stage results; optional TCP burst stage; run against a
-  VXLAN-mode peer.
+- **R-5. Burst-test hardening.** ◐ **Partially shipped in 1.7.0**:
+  `--dont-fragment` now applies to burst probes (they used to silently
+  fragment below 1228-B MTU paths), and stages report **loss vs late**
+  separately with the continuous engine's semantics (late echoes can't fake
+  a rate-cap verdict). Remaining: an optional TCP burst stage, and running
+  the burst/sweep tools against a VXLAN-mode peer.
 
 ## Phase 2 — Exercise the policy classification surface
 
@@ -525,7 +563,7 @@ is measured. (This is the existing README roadmap, carried forward.)*
 
 | Milestone | Contents | Rationale |
 |---|---|---|
-| **1.7** | R-1, R-2, R-5 | Biggest demo wins, no new privileges/protocols: dial-a-bandwidth + sustained load on the live charts |
+| **1.7** ✅ shipped | R-1, R-2, R-5 (DF + late split; TCP/VXLAN burst deferred) | Biggest demo wins, no new privileges/protocols: dial-a-bandwidth + sustained load on the live charts |
 | **1.8** | R-6 (after qWAVE spike), R-3, R-7 | The policy-classification surface: DSCP + multi-class mixes |
 | **1.9** | R-10, R-12, R-4 | First measured-WAN loop (counters + calibration burst + scripted scenarios) |
 | **2.0** | R-11, R-13, R-15, R-19 | The full "prove the fabric" story + the leave-behind report |
