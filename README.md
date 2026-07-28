@@ -407,8 +407,13 @@ Bad below.
                    50 pps default deliberately matches G.711 voice cadence,
                    TCP models an interactive app - tune independently)
 --bind ADDR        local address to bind/listen on (default 0.0.0.0)
---udp-ports A,B    the two UDP ports (default 30201,30202)
---tcp-ports A,B    the two TCP ports (default 30101,30102)
+--udp-ports LIST   1-8 UDP ports, one stream per port (default 30201,30202)
+--tcp-ports LIST   0-8 TCP ports, one stream per port (default 30101,30102;
+                   'none' runs UDP-only)
+--profiles LIST    per-stream traffic profiles in stream order: voice, video,
+                   bulk, imix, SIZE or SIZExPPS (see "Traffic classes")
+--dscp LIST        per-stream DSCP marking in stream order: EF, AF41, CS5,
+                   BE, 0-63 or '-' (see "Traffic classes")
 --pps N            probes per second per stream (default 50)
 --mbps X           target offered probe load for the box in Mbps (IP level,
                    per direction, probes only - echoes double the wire load;
@@ -624,6 +629,41 @@ Native transport only (a VXLAN-mode peer opens no native UDP listener to
 echo the probes — the button says so instead of failing silently), and
 single-pair dashboards only for now (the mesh GUI doesn't carry the panel).
 
+## Traffic classes & profiles (1.8.0)
+
+The stream set itself is now a policy-matching instrument:
+
+- **Port lists.** `--udp-ports` takes 1–8 ports and `--tcp-ports` 0–8
+  (`none` = UDP-only), one stream per port — so the session can present
+  flows on exactly the ports a customer's match rules key on
+  (`--udp-ports 5060,30201,30202`). At least one UDP stream is always
+  required (the latency band, one-way drift and the one-shot tools ride
+  UDP). Both ends must run the same lists.
+- **Per-stream profiles** (`--profiles`, launcher field under *Advanced*):
+  one entry per stream in order — `voice` (200 B @ 50 pps), `video`
+  (1200 B @ 90 pps), `bulk` (1400 B @ 200 pps), `imix` (the classic 7:4:1
+  mix of 64/576/1500-byte IP packets, cycled probe-by-probe), a plain
+  `SIZE`, or `SIZExPPS` (e.g. `1200x90`). Streams beyond the list keep
+  `--size` at the base rate. `--mbps` composes with profiles: sizes are
+  kept, and each stream's rate is derived from its own mean wire size so
+  the box still offers exactly the target.
+- **Per-stream DSCP** (`--dscp`, launcher field): `EF`, `AF41`, `CS5`,
+  `BE`, a number 0–63, or `-` per stream. On Linux/macOS the exact code
+  point is set (`IP_TOS`). On Windows plain IP_TOS is ignored, so the app
+  uses the **qWAVE** API (no admin needed) — which only offers traffic
+  *types*; the UI reports the code point the stack actually applies
+  (e.g. requesting EF sends CS7). In VXLAN mode the **inner** IPv4 header
+  carries the class.
+- **Bleaching detection.** The reflector reports the TOS byte it actually
+  received (stamped into the echo's padding — wire-compatible with older
+  peers, which simply don't report), and each end also observes the TOS on
+  arriving echoes. The **Totals** table shows `requested → forward/return`
+  per stream (e.g. `EF→EF/EF`, or `EF→BE` when a mid-path policy rewrites
+  it — which raises an explicit *DSCP rewritten mid-path* warning). ToS
+  readback needs a POSIX receiver for native UDP streams; in VXLAN mode it
+  works for all streams on every platform (the inner header is read
+  directly), and native TCP streams show `?` (no per-segment readback).
+
 ## Wire anatomy (EdgeConnect slicing model)
 
 When the two hosts sit behind **EdgeConnect** appliances, a large DF=1 probe
@@ -801,6 +841,13 @@ the host-side measurement tranche of this roadmap.
 readout, the **sustained-load panel** (⚡ Load button, with the square-wave
 calibration schedule), and the **hardened burst test** (optional DF,
 loss-vs-late split in stages and verdicts).
+
+*Shipped in 1.8.0* (Milestone 1.8 — the policy-classification surface):
+**configurable stream sets** (1–8 UDP + 0–8 TCP port lists), **per-stream
+traffic profiles** incl. IMIX, **per-stream DSCP marking** (exact on POSIX,
+qWAVE traffic types on Windows) with **forward/return ToS readback and
+bleaching detection** — see *Traffic classes & profiles*. Alpha releases
+(`1.8.0a1`) now order correctly in the signed updater for UAT flows.
 
 The app measures the **host view** (the "LAN row" of the anatomy panel); the
 WAN middle is currently *predicted* by the model, not observed. Planned work

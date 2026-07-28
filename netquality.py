@@ -49,7 +49,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 # Where --update / --check-update look for the latest SIGNED release manifest. The
 # manifest is verified against UPDATE_PUBKEY before anything is installed (fail closed),
@@ -295,6 +295,157 @@ def set_dont_fragment(sock):
 
 
 # ---------------------------------------------------------------------------
+# DSCP / ToS marking (R-6, 1.8.0): per-stream traffic classes
+# ---------------------------------------------------------------------------
+DSCP_NAMES = {
+    "be": 0, "cs0": 0, "df": 0,
+    "cs1": 8, "af11": 10, "af12": 12, "af13": 14,
+    "cs2": 16, "af21": 18, "af22": 20, "af23": 22,
+    "cs3": 24, "af31": 26, "af32": 28, "af33": 30,
+    "cs4": 32, "af41": 34, "af42": 36, "af43": 38,
+    "cs5": 40, "va": 44, "ef": 46, "cs6": 48, "cs7": 56,
+}
+
+
+def dscp_name(dscp):
+    """Preferred display name for a DSCP value ('EF', 'AF41', '17', '-')."""
+    if dscp is None:
+        return "-"
+    for name, v in DSCP_NAMES.items():
+        if v == dscp and name not in ("cs0", "df"):
+            return name.upper()
+    return str(dscp)
+
+
+def qwave_traffic_type(dscp):
+    """Windows non-admin DSCP: qWAVE offers traffic TYPES, not code points,
+    and the stack picks the DSCP per type (exact values need admin via
+    QOSSetOutgoingDSCPValue). Map a requested DSCP to the nearest type and
+    return (traffic_type, dscp_the_stack_applies) so the UI can report the
+    wire truth instead of pretending the request was honored."""
+    if dscp <= 0:
+        return 0, 0      # BestEffort -> 0
+    if dscp <= 8:
+        return 1, 8      # Background -> CS1
+    if dscp <= 31:
+        return 2, 28     # ExcellentEffort -> AF32
+    if dscp <= 40:
+        return 3, 40     # AudioVideo -> CS5
+    return 4, 56         # Voice -> CS7 (46/EF and up)
+
+
+def _qwave_mark(sock, dscp, peer, port):
+    """Add the socket to a qWAVE flow (Windows). Returns 'qwave:NN' with the
+    DSCP the stack applies, or 'failed'. Never raises."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class QOS_VERSION(ctypes.Structure):
+            _fields_ = [("MajorVersion", wintypes.USHORT),
+                        ("MinorVersion", wintypes.USHORT)]
+
+        class SOCKADDR_IN(ctypes.Structure):
+            _fields_ = [("sin_family", ctypes.c_short),
+                        ("sin_port", ctypes.c_ushort),
+                        ("sin_addr", ctypes.c_ubyte * 4),
+                        ("sin_zero", ctypes.c_char * 8)]
+
+        qwave = ctypes.windll.qwave
+        handle = wintypes.HANDLE()
+        if not qwave.QOSCreateHandle(ctypes.byref(QOS_VERSION(1, 0)),
+                                     ctypes.byref(handle)):
+            return "failed"
+        ttype, applied = qwave_traffic_type(dscp)
+        ip = socket.inet_aton(resolve_peer_ip(peer) or "0.0.0.0")
+        dest = SOCKADDR_IN(socket.AF_INET, socket.htons(port),
+                           (ctypes.c_ubyte * 4).from_buffer_copy(ip), b"")
+        flow_id = wintypes.DWORD(0)
+        QOS_NON_ADAPTIVE_FLOW = 2
+        ok = qwave.QOSAddSocketToFlow(handle, sock.fileno(),
+                                      ctypes.byref(dest), ttype,
+                                      QOS_NON_ADAPTIVE_FLOW,
+                                      ctypes.byref(flow_id))
+        return f"qwave:{applied}" if ok else "failed"
+    except Exception:
+        return "failed"
+
+
+def set_dscp(sock, dscp, peer=None, port=0):
+    """Best-effort per-socket DSCP marking. Returns a status string:
+
+      None        - no marking requested
+      'os'        - IP_TOS accepted (POSIX: the kernel marks every packet
+                    with exactly the requested code point)
+      'qwave:NN'  - Windows qWAVE flow added; NN is the code point the
+                    stack actually applies for the mapped traffic type
+      'failed'    - nothing stuck; packets leave unmarked
+
+    Windows silently ignores plain IP_TOS on ordinary sockets, hence the
+    qWAVE path - the README roadmap's long-standing caveat, implemented."""
+    if dscp is None:
+        return None
+    if sys.platform != "win32":
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, dscp << 2)
+            return "os"
+        except OSError:
+            return "failed"
+    return _qwave_mark(sock, dscp, peer, port)
+
+
+def enable_tos_readback(sock):
+    """Ask the OS to deliver each received datagram's TOS byte (IP_RECVTOS)
+    so recvmsg() can report it - the DSCP-bleaching detector's input. POSIX
+    only: Windows exposes neither IP_RECVTOS nor socket.recvmsg, so a
+    Windows reflector reports nothing (shown as '?' on the other end)."""
+    if not (hasattr(socket, "IP_RECVTOS") and hasattr(sock, "recvmsg")):
+        return False
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_RECVTOS, 1)
+        return True
+    except OSError:
+        return False
+
+
+def tos_from_ancdata(ancdata):
+    """Extract the received TOS byte from recvmsg() ancillary data (Linux
+    delivers cmsg IP_TOS, macOS IP_RECVTOS)."""
+    for level, ctype, data in ancdata or ():
+        if level == socket.IPPROTO_IP and data and ctype in (
+                getattr(socket, "IP_TOS", -1),
+                getattr(socket, "IP_RECVTOS", -1)):
+            return data[0]
+    return None
+
+
+# The reflector reports the TOS byte it observed on the arriving probe by
+# stamping two bytes of the echo's zero padding: a marker + the raw TOS.
+# Wire-compatible with pre-1.8 peers, which leave the padding zeroed (reads
+# as "no report"); needs >= 2 bytes of padding, so size-34 probes carry none.
+TOS_REPORT_MAGIC = 0xD5
+
+
+def stamp_tos_report(echo, tos):
+    """Write the received-TOS report into an echo's padding bytes."""
+    if tos is None or len(echo) < HEADER_LEN + 2:
+        return echo
+    b = bytearray(echo)
+    b[HEADER_LEN] = TOS_REPORT_MAGIC
+    b[HEADER_LEN + 1] = tos & 0xFF
+    return bytes(b)
+
+
+def parse_tos_report(payload):
+    """Read a stamp_tos_report() report back out of an echo, or None when
+    the peer didn't report (old version, minimal size, or no TOS seen)."""
+    if (len(payload) >= HEADER_LEN + 2
+            and payload[HEADER_LEN] == TOS_REPORT_MAGIC):
+        return payload[HEADER_LEN + 1]
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Per-stream statistics (thread-safe, sliding window)
 # ---------------------------------------------------------------------------
 class StreamStats:
@@ -359,6 +510,12 @@ class StreamStats:
         # and correlated-across-streams vs port-specific.
         self.loss_events = deque()    # t_mono of each probe declared lost
         self.diag_horizon = 60.0
+
+        # DSCP readback (1.8.0): the TOS byte the peer reported seeing on
+        # our probes (forward path) and the TOS observed locally on the
+        # peer's echoes (return path). None = not (yet) reported.
+        self.fwd_tos = None
+        self.rtn_tos = None
 
         # cumulative session counters (for the footer / totals)
         self.cum_tx = 0
@@ -465,12 +622,16 @@ class StreamStats:
                     self.tx_events.pop()
 
     def on_echo(self, seq, ts_ns, now_ns, rx_len=0, psize=0, peer_rx=0,
-                peer_fwd=0, peer_ns=0):
+                peer_fwd=0, peer_ns=0, peer_tos=None, rx_tos=None):
         with self.lock:
             rtt = (now_ns - ts_ns) / 1e6
             if rtt < 0:
                 rtt = 0.0
             now_w = time.monotonic()
+            if peer_tos is not None:
+                self.fwd_tos = peer_tos
+            if rx_tos is not None:
+                self.rtn_tos = rx_tos
             # Size verification: rx_len = echo we got back (return path), peer_rx
             # = bytes the reflector reported (forward path). psize = intended.
             if rx_len > self.rx_echo_max:
@@ -654,6 +815,8 @@ class StreamStats:
                 "rtn_pct": rtn_pct,
                 "owd_fwd": owd_fwd,
                 "owd_rtn": owd_rtn,
+                "fwd_tos": self.fwd_tos,
+                "rtn_tos": self.rtn_tos,
             }
 
     def window_rtts(self):
@@ -684,6 +847,8 @@ class StreamStats:
             self.jitter = 0.0
             self.last_rtt = None
             self.last_echo_t = 0.0
+            self.fwd_tos = None
+            self.rtn_tos = None
             self.window_start = time.monotonic()
             self.cum_tx = self.cum_recv = self.cum_lost = self.cum_late = 0
             self.rx_echo_max = self.peer_rx_max = self.size_mismatch = 0
@@ -882,16 +1047,21 @@ class UDPStream:
     peer on its own sequence/stats, and inbound packets demux by source
     address. A single peer is just the one-element case."""
 
-    def __init__(self, cfg, peers, bind, size, interval, stats_of, stop,
-                 dont_fragment=False):
+    def __init__(self, cfg, peers, bind, sizes, interval, stats_of, stop,
+                 dont_fragment=False, dscp=None):
         self.sid, _, self.port, self.name = cfg
         self.peers = list(peers)
         self.bind = bind
-        self.size = size
+        # Probe size pattern: one entry = fixed size (the classic case),
+        # several = cycled probe-by-probe (IMIX-style profiles, 1.8.0).
+        self.sizes = tuple(sizes)
         self.interval = interval
         self.stats_of = stats_of   # {peer: StreamStats}
         self.stop = stop
         self.dont_fragment = dont_fragment
+        self.dscp = dscp
+        self.mark_status = None
+        self.tos_readback = False
         self.sock = None
         self.ip_of = {}            # resolved source IP -> peer
         self.threads = []
@@ -903,6 +1073,14 @@ class UDPStream:
         quench_udp_connreset(s)    # peer not started yet must not error the socket
         if self.dont_fragment:
             set_dont_fragment(s)   # jumbo probes that don't fit are dropped, not split
+        # One socket per stream, so a per-socket mark IS a per-stream class;
+        # echoes ride the same socket and carry the same code point.
+        self.mark_status = set_dscp(s, self.dscp, peer=self.peers[0],
+                                    port=self.port)
+        # Deliver each datagram's TOS byte when the OS can: feeds both the
+        # peer's forward-path report (we reflect what we saw) and our own
+        # return-path observation - the DSCP bleaching detector.
+        self.tos_readback = enable_tos_readback(s)
         s.bind((self.bind, self.port))
         s.settimeout(0.5)
         self.sock = s
@@ -934,7 +1112,8 @@ class UDPStream:
             for p in self.peers:
                 seqs[p] += 1
                 ns = time.monotonic_ns()
-                pkt = build_packet(TYPE_PROBE, self.sid, seqs[p], ns, self.size)
+                size = self.sizes[(seqs[p] - 1) % len(self.sizes)]
+                pkt = build_packet(TYPE_PROBE, self.sid, seqs[p], ns, size)
                 st = self.stats_of[p]
                 # Register BEFORE transmitting: sendto releases the GIL and
                 # on a fast path the echo can be processed before this thread
@@ -954,8 +1133,13 @@ class UDPStream:
 
     def _recv_loop(self):
         while not self.stop.is_set():
+            tos = None
             try:
-                data, addr = self.sock.recvfrom(65535)
+                if self.tos_readback:
+                    data, ancdata, _flags, addr = self.sock.recvmsg(65535, 256)
+                    tos = tos_from_ancdata(ancdata)
+                else:
+                    data, addr = self.sock.recvfrom(65535)
             except socket.timeout:
                 continue
             except ConnectionResetError:
@@ -978,7 +1162,8 @@ class UDPStream:
             if ptype in (TYPE_PROBE, TYPE_TEST):
                 # Reflect back, stamping the bytes and cumulative probe count we
                 # received so the originator can verify size and split loss by
-                # direction, plus our clock for one-way-delay drift. TEST
+                # direction, plus our clock for one-way-delay drift (and the
+                # TOS byte we observed, for the DSCP bleaching detector). TEST
                 # probes (MTU sweep / burst test side-channels) are echoed but
                 # kept out of the gap tracking.
                 rxlen = len(data)
@@ -986,6 +1171,7 @@ class UDPStream:
                 echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, rxlen,
                                     rxsize=rxlen, rxcount=fwd,
                                     peer_ns=time.monotonic_ns())
+                echo = stamp_tos_report(echo, tos)
                 try:
                     self.sock.sendto(echo, addr)
                 except OSError:
@@ -993,7 +1179,8 @@ class UDPStream:
             elif ptype == TYPE_ECHO:
                 stats.on_echo(seq, ts_ns, time.monotonic_ns(),
                               rx_len=len(data), psize=psize, peer_rx=rxsize,
-                              peer_fwd=rxcount, peer_ns=peer_ns)
+                              peer_fwd=rxcount, peer_ns=peer_ns,
+                              peer_tos=parse_tos_report(data), rx_tos=tos)
 
 
 # ---------------------------------------------------------------------------
@@ -1057,11 +1244,13 @@ class TCPStream:
     each peer on its own connection/stats, and one client (plus handshake
     sampler) runs per peer. A single peer is just the one-element case."""
 
-    def __init__(self, cfg, peers, bind, size, interval, stats_of, stop):
+    def __init__(self, cfg, peers, bind, sizes, interval, stats_of, stop,
+                 dscp=None):
         self.sid, _, self.port, self.name = cfg
         self.peers = list(peers)
         self.bind = bind
-        self.size = max(size, HEADER_LEN)
+        self.sizes = tuple(max(s, HEADER_LEN) for s in sizes)
+        self.dscp = dscp
         self.interval = interval
         self.stats_of = stats_of   # {peer: StreamStats}
         self.stop = stop
@@ -1155,6 +1344,9 @@ class TCPStream:
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
+        # Echoes carry this stream's class too, so the RETURN path of the
+        # peer's probes is policy-matched the same way (symmetric config).
+        set_dscp(conn, self.dscp, peer=peer, port=self.port)
         # A new connection does NOT displace the live one until it delivers a
         # real probe. The connect-time PQI sampler opens a throwaway
         # handshake every ~15 s, and adopting on accept made that handshake
@@ -1245,6 +1437,7 @@ class TCPStream:
                 cs.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
+            set_dscp(cs, self.dscp, peer=peer, port=self.port)
             rx = threading.Thread(target=self._client_recv, args=(cs, stats),
                                   daemon=True)
             rx.start()
@@ -1268,7 +1461,8 @@ class TCPStream:
             self._tx_seq[peer] += 1
             seq = self._tx_seq[peer]
             ns = time.monotonic_ns()
-            pkt = build_packet(TYPE_PROBE, self.sid, seq, ns, self.size)
+            size = self.sizes[(seq - 1) % len(self.sizes)]
+            pkt = build_packet(TYPE_PROBE, self.sid, seq, ns, size)
             # Register BEFORE transmitting (see StreamStats.cancel_send).
             stats.on_send(seq, ns)
             try:
@@ -1445,7 +1639,8 @@ class VXLANTunnel:
         self.thread = None
 
     def register(self, proto, port, handler):
-        """Route decapsulated payloads for (proto, inner dst port) to handler."""
+        """Route decapsulated payloads for (proto, inner dst port) to
+        handler(payload, inner_tos)."""
         self.handlers[(proto, port)] = handler
 
     def start(self):
@@ -1467,11 +1662,13 @@ class VXLANTunnel:
         self.thread.start()
 
     # -- encapsulation ------------------------------------------------------
-    def send(self, proto, port, payload):
+    def send(self, proto, port, payload, tos=0):
         """Encapsulate one probe/echo message and send it to the peer's VXLAN
-        port. Returns True if the datagram left the socket."""
+        port. `tos` marks the INNER IPv4 header (per-stream DSCP inside the
+        tunnel; the shared outer socket stays unmarked). Returns True if the
+        datagram left the socket."""
         try:
-            self.sock.sendto(self._encap(proto, port, payload),
+            self.sock.sendto(self._encap(proto, port, payload, tos),
                              (self.peer, self.port))
             return True
         except OSError:
@@ -1482,7 +1679,7 @@ class VXLANTunnel:
         pseudo = src + dst + struct.pack("!BBH", 0, proto_num, len(segment))
         return _inet_checksum(pseudo + segment)
 
-    def _encap(self, proto, port, payload):
+    def _encap(self, proto, port, payload, tos=0):
         src = socket.inet_aton(self.local_ip or "0.0.0.0")
         dst = socket.inet_aton(self.peer_ip or "0.0.0.0")
         if proto == "TCP":
@@ -1505,7 +1702,7 @@ class VXLANTunnel:
         with self._lock:
             self._ip_id = (self._ip_id + 1) & 0xFFFF
             ip_id = self._ip_id
-        ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, ip_id, 0, 64,
+        ip = struct.pack("!BBHHHBBH4s4s", 0x45, tos & 0xFF, total, ip_id, 0, 64,
                          proto_num, 0, src, dst)
         ip = ip[:10] + struct.pack("!H", _inet_checksum(ip)) + ip[12:]
         eth = self.peer_mac + self.local_mac + b"\x08\x00"
@@ -1534,10 +1731,11 @@ class VXLANTunnel:
         end = min(len(data), ip + total)               # ignore trailing padding
         proto_num = data[ip + 9]
         l4 = ip + ihl
+        tos = data[ip + 1]
         if proto_num == 17 and end >= l4 + 8:
             dport = int.from_bytes(data[l4 + 2:l4 + 4], "big")
             ulen = int.from_bytes(data[l4 + 4:l4 + 6], "big")
-            return "UDP", dport, data[l4 + 8:min(end, l4 + ulen)]
+            return "UDP", dport, data[l4 + 8:min(end, l4 + ulen)], tos
         if proto_num == 6 and end >= l4 + 20:
             dport = int.from_bytes(data[l4 + 2:l4 + 4], "big")
             seq = int.from_bytes(data[l4 + 4:l4 + 8], "big")
@@ -1545,7 +1743,7 @@ class VXLANTunnel:
             payload = data[l4 + doff:end]
             with self._lock:   # our next segment ACKs what we just received
                 self._tcp_ack[dport] = (seq + len(payload)) & 0xFFFFFFFF
-            return "TCP", dport, payload
+            return "TCP", dport, payload, tos
         return None
 
     def _recv_loop(self):
@@ -1568,10 +1766,10 @@ class VXLANTunnel:
             decap = self._decap(data)
             if decap is None:
                 continue
-            proto, port, payload = decap
+            proto, port, payload, tos = decap
             handler = self.handlers.get((proto, port))
             if handler is not None:
-                handler(payload)
+                handler(payload, tos)
 
 
 class VXStream:
@@ -1583,13 +1781,15 @@ class VXStream:
     probe even for the TCP streams, so the probe/echo state machine (and all
     loss/size accounting) is identical across all four streams."""
 
-    def __init__(self, cfg, tunnel, size, interval, stats, stop):
+    def __init__(self, cfg, tunnel, sizes, interval, stats, stop, dscp=None):
         self.sid, self.proto, self.port, self.name = cfg
         self.tunnel = tunnel
-        self.size = size
+        self.sizes = tuple(sizes)
         self.interval = interval
         self.stats = stats
         self.stop = stop
+        self.dscp = dscp
+        self.tos = (dscp << 2) if dscp else 0  # inner IPv4 TOS for this stream
         self.threads = []
         tunnel.register(self.proto, self.port, self._on_payload)
 
@@ -1605,10 +1805,11 @@ class VXStream:
         while not self.stop.is_set():
             seq += 1
             ns = time.monotonic_ns()
-            pkt = build_packet(TYPE_PROBE, self.sid, seq, ns, self.size)
+            size = self.sizes[(seq - 1) % len(self.sizes)]
+            pkt = build_packet(TYPE_PROBE, self.sid, seq, ns, size)
             # Register BEFORE transmitting (see StreamStats.cancel_send).
             self.stats.on_send(seq, ns)
-            if not self.tunnel.send(self.proto, self.port, pkt):
+            if not self.tunnel.send(self.proto, self.port, pkt, tos=self.tos):
                 self.stats.cancel_send(seq)
             self.stats.reap()
             next_t += self.interval
@@ -1618,7 +1819,7 @@ class VXStream:
             else:
                 next_t = time.monotonic()
 
-    def _on_payload(self, payload):
+    def _on_payload(self, payload, tos=None):
         parsed = parse_header(payload)
         if parsed is None:
             return
@@ -1629,11 +1830,15 @@ class VXStream:
             echo = build_packet(TYPE_ECHO, sid, seq, ts_ns, rxlen,
                                 rxsize=rxlen, rxcount=fwd,
                                 peer_ns=time.monotonic_ns())
-            self.tunnel.send(self.proto, self.port, echo)
+            # Report the inner TOS we observed (bleaching detector), and
+            # mark the echo with OUR class for this stream - symmetric.
+            echo = stamp_tos_report(echo, tos)
+            self.tunnel.send(self.proto, self.port, echo, tos=self.tos)
         elif ptype == TYPE_ECHO:
             self.stats.on_echo(seq, ts_ns, time.monotonic_ns(),
                                rx_len=len(payload), psize=psize, peer_rx=rxsize,
-                               peer_fwd=rxcount, peer_ns=peer_ns)
+                               peer_fwd=rxcount, peer_ns=peer_ns,
+                               peer_tos=parse_tos_report(payload), rx_tos=tos)
 
 
 # ---------------------------------------------------------------------------
@@ -1643,7 +1848,7 @@ class Engine:
     def __init__(self, peer=None, bind="0.0.0.0", size=200, pps=50, window=10.0,
                  timeout=2.0, history_seconds=300, loss_deadband=0.5,
                  dont_fragment=False, vxlan=None, peers=None, tcp_pps=None,
-                 target_mbps=None):
+                 target_mbps=None, profiles=None, dscp=None):
         # `peers` (a list) is the mesh form; `peer` is the classic 1:1 form.
         # Everything below is keyed per (peer, sid) pair; single-peer callers
         # keep using the peer-defaulted accessors and see no difference.
@@ -1669,6 +1874,21 @@ class Engine:
         # stream (20 ms packetization); TCP models an interactive app, not
         # media, so its rate is independently tunable via --tcp-pps.
         rate_of = {"UDP": pps, "TCP": tcp_pps or pps}
+        # Per-stream traffic profiles (1.8.0): one (size pattern, pps or
+        # None=base rate) per sid. None -> every stream at --size/--pps,
+        # exactly the pre-profile behavior.
+        if profiles is None:
+            profiles = [((size,), None)] * len(STREAMS)
+        self.profiles = list(profiles)
+        # "profiles" tag in the UI only when SIZES vary: an --mbps-derived
+        # rate override alone is already reported via offered/target.
+        self.profiles_active = any(s != (size,) for s, _p in self.profiles)
+        # Per-stream DSCP marking (1.8.0): requested code point per sid, or
+        # None = unmarked. Application is best-effort per platform.
+        self.dscp = list(dscp) if dscp else [None] * len(STREAMS)
+        self.expect_size = {}  # sid -> largest payload the pattern sends
+        self.mean_wire = {}    # sid -> mean IP bytes/probe (offered-load math)
+        self.rate_of_sid = {}  # sid -> effective probe rate (pps)
         self.stats = {}      # (peer, sid) -> StreamStats
         self.streams = []
         # In VXLAN mode ALL four streams ride one shared userspace VTEP; the
@@ -1694,23 +1914,31 @@ class Engine:
         self._loss_pattern = dict.fromkeys(self.peers)
         for cfg in STREAMS:
             sid, proto, port, name = cfg
-            interval = 1.0 / rate_of[proto]
+            sizes, prof_pps = self.profiles[sid]
+            stream_pps = prof_pps or rate_of[proto]
+            interval = 1.0 / stream_pps
+            self.expect_size[sid] = max(sizes)
+            self.mean_wire[sid] = mean_wire_size(sizes, proto)
+            self.rate_of_sid[sid] = stream_pps
             stats_of = {}
             for p in self.peers:
                 st = StreamStats(window=window, timeout=timeout,
-                                 target_pps=rate_of[proto])
+                                 target_pps=stream_pps)
                 self.stats[(p, sid)] = st
                 stats_of[p] = st
             if self.tunnel is not None:
-                self.streams.append(VXStream(cfg, self.tunnel, size, interval,
-                                             stats_of[self.peer], self.stop))
+                self.streams.append(VXStream(cfg, self.tunnel, sizes, interval,
+                                             stats_of[self.peer], self.stop,
+                                             dscp=self.dscp[sid]))
             elif proto == "UDP":
-                self.streams.append(UDPStream(cfg, self.peers, bind, size,
+                self.streams.append(UDPStream(cfg, self.peers, bind, sizes,
                                               interval, stats_of, self.stop,
-                                              dont_fragment=dont_fragment))
+                                              dont_fragment=dont_fragment,
+                                              dscp=self.dscp[sid]))
             else:
-                self.streams.append(TCPStream(cfg, self.peers, bind, size,
-                                              interval, stats_of, self.stop))
+                self.streams.append(TCPStream(cfg, self.peers, bind, sizes,
+                                              interval, stats_of, self.stop,
+                                              dscp=self.dscp[sid]))
 
     def start(self):
         if self.tunnel is not None:
@@ -1828,8 +2056,7 @@ class Engine:
         offered_bps = 0.0  # achieved probe TX rate, IP level, this direction
         for sid, proto, port, name in STREAMS:
             snap = self.stats[(peer, sid)].snapshot()
-            overhead = IPV4_TCP_OVERHEAD if proto == "TCP" else IPV4_UDP_OVERHEAD
-            offered_bps += snap["tx_pps"] * (self.size + overhead) * 8.0
+            offered_bps += snap["tx_pps"] * self.mean_wire[sid] * 8.0
             eff = self.effective_loss(snap["loss"], snap["late"])  # deadbanded impairment
             if proto == "TCP":
                 # TCP gets a Path Quality Index, not MOS: retransmissions show
@@ -1843,7 +2070,9 @@ class Engine:
             else:
                 score, mos, label = quality_score(snap["latency"], eff, snap["jitter"])
             snap.update(sid=sid, proto=proto, port=port, name=name,
-                        score=score, mos=mos, label=label, eff_loss=eff)
+                        score=score, mos=mos, label=label, eff_loss=eff,
+                        expect_size=self.expect_size[sid],
+                        dscp_req=self.dscp[sid])
             rows.append(snap)
             tot_tx += snap["cum_tx"]
             tot_recv += snap["cum_recv"]
@@ -1891,7 +2120,8 @@ class Engine:
         udp_rows = [r for r in rows if r["proto"] == "UDP" and r["connected"]]
         if any(r["size_mismatch"] for r in rows):
             size_status = "mismatch"
-        elif udp_rows and all(r["peer_rx_max"] >= self.size and r["rx_echo_max"] >= self.size
+        elif udp_rows and all(r["peer_rx_max"] >= r["expect_size"]
+                              and r["rx_echo_max"] >= r["expect_size"]
                               for r in udp_rows):
             size_status = "verified"
         else:
@@ -1937,6 +2167,7 @@ class Engine:
             # load a verifiable known quantity, not a computed hope.
             "offered_mbps": offered_bps / 1e6,
             "target_mbps": self.target_mbps,
+            "profiles_active": self.profiles_active,
         }
 
     def reset(self):
@@ -1969,7 +2200,15 @@ TXT_DIM = "#9aa3ad"
 FONT = "Segoe UI"
 
 # distinct, on-brand line colours per stream
-STREAM_COLORS = {0: "#01A982", 1: "#FF8300", 2: "#00B0E6", 3: "#FEC901"}
+# Per-stream line colors; cycles when a port list grows past the palette
+# (1.8.0: up to 8 streams per protocol). The first four match the historic
+# 2 UDP + 2 TCP assignment so screenshots stay comparable across versions.
+STREAM_PALETTE = ("#01A982", "#FF8300", "#00B0E6", "#FEC901",
+                  "#C140FF", "#7ee2b8", "#ff7eb6", "#9aa3ad")
+
+
+def stream_color(sid):
+    return STREAM_PALETTE[sid % len(STREAM_PALETTE)]
 
 
 
@@ -2158,7 +2397,7 @@ def run_gui(engine, args):
     from tkinter import ttk
 
     view_seconds = float(args.history)
-    series = [(sid, STREAM_COLORS[sid], name.split("-")[1])
+    series = [(sid, stream_color(sid), name.split("-")[1])
               for sid, proto, port, name in STREAMS]
 
     root = tk.Tk()
@@ -2406,13 +2645,14 @@ def run_gui(engine, args):
 
     # ---- totals table (hidden by default; toggled by the Totals button) ----
     totals_cols = ("stream", "sent", "recv", "lost", "late", "lossp",
-                   "txb", "peerrx", "echorx", "size")
+                   "txb", "peerrx", "echorx", "size", "dscp")
     totals_head = {"stream": "Stream", "sent": "Sent", "recv": "Received",
                    "lost": "Lost", "late": "Late", "lossp": "Loss %",
                    "txb": "TX B", "peerrx": "Peer RX B", "echorx": "My RX B",
-                   "size": "Size"}
+                   "size": "Size", "dscp": "DSCP rq→f/r"}
     totals_w = {"stream": 110, "sent": 78, "recv": 84, "lost": 64, "late": 60,
-                "lossp": 64, "txb": 66, "peerrx": 78, "echorx": 72, "size": 80}
+                "lossp": 64, "txb": 66, "peerrx": 78, "echorx": 72, "size": 80,
+                "dscp": 110}
     totals_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
     # not packed here — do_toggle_totals packs/unpacks the whole frame
     totals_tree = ttk.Treeview(totals_frame, columns=totals_cols, show="headings",
@@ -2426,7 +2666,7 @@ def run_gui(engine, args):
     totals_tree.tag_configure("bad", foreground="#ffb3a6")
     for sid, proto, port, name in STREAMS:
         totals_tree.insert("", "end", iid=f"t{sid}",
-                           values=(name, 0, 0, 0, 0, "0.0", 0, 0, 0, "-"))
+                           values=(name, 0, 0, 0, 0, "0.0", 0, 0, 0, "-", "-"))
     # frame stays unpacked -> hidden until the Totals button is clicked
 
     # ---- isolate table (hidden; splits loss into forward vs return) --------
@@ -2525,9 +2765,10 @@ def run_gui(engine, args):
                       text=f"WAN: {n} packet{'s' if n > 1 else ''} · "
                            f"{wan_total:,} B on the wire · +{tax:.1f}% overhead"
                            f" · ×{n} packet amplification")
+        pps0 = engine.rate_of_sid.get(0, args.pps)
         c.create_text(x0, y4 + 18, anchor="w", fill=TXT_DIM, font=(FONT, 9),
-                      text=f"predicted per UDP stream: {args.pps:g} pps LAN → "
-                           f"{args.pps * n:g} pps WAN, each direction "
+                      text=f"predicted per UDP stream: {pps0:g} pps LAN → "
+                           f"{pps0 * n:g} pps WAN, each direction "
                            f"(echoes are full-size)")
         if inner > 1500:
             frags = -(-(inner - 20) // 1480)  # RFC 791: 1480 B payload per frag
@@ -2706,10 +2947,20 @@ def run_gui(engine, args):
                     "pending": "…"}[snap["size_status"]]
         vx = (f"  ·  VXLAN vni {snap['vxlan']['vni']} udp/{snap['vxlan']['port']}"
               if snap["vxlan"] else "")
+        bleached = [(r["name"], r["dscp_req"], r["fwd_tos"] >> 2)
+                    for r in snap["rows"]
+                    if r["dscp_req"] is not None and r["fwd_tos"] is not None
+                    and (r["fwd_tos"] >> 2) != r["dscp_req"]]
         if snap.get("udp_silent"):
             warn_var.set("⚠ UDP silent while TCP is up — UDP blocked in the "
                          "path (firewall/ACL) or the peer runs an outdated "
                          "version; update BOTH ends")
+        elif bleached:
+            name, req, got = bleached[0]
+            more = f" (+{len(bleached) - 1} more)" if len(bleached) > 1 else ""
+            warn_var.set(f"⚠ DSCP rewritten mid-path: {name} sent "
+                         f"{dscp_name(req)}, peer received {dscp_name(got)}"
+                         f"{more} — bleaching/remap policy in the path")
         elif snap.get("loss_pattern"):
             warn_var.set(f"⚠ loss pattern (last 60 s): {snap['loss_pattern']}")
         else:
@@ -2724,9 +2975,11 @@ def run_gui(engine, args):
         load_txt = f"  ·  probe load {snap['offered_mbps']:.2f} Mbps"
         if snap.get("target_mbps"):
             load_txt += f" / target {_fmt_num(snap['target_mbps'])}"
+        frame_txt = (f"frame {snap['frame_size']} B" if not
+                     snap.get("profiles_active") else "frames per profile")
         foot_path_var.set(
             f"peer {args.peer}  ·  {ports_summary()}  ·  "
-            f"frame {snap['frame_size']} B  DF {df}  size {size_tag}{vx}"
+            f"{frame_txt}  DF {df}  size {size_tag}{vx}"
             f"{load_txt}  ·  "
             f"uptime {up_s // 3600:02d}:{(up_s % 3600) // 60:02d}:{up_s % 60:02d}")
         if load_shown["on"] or load_gen.running:
@@ -2766,19 +3019,27 @@ def run_gui(engine, args):
             for row in snap["rows"]:
                 decided = row["cum_recv"] + row["cum_lost"] + row["cum_late"]
                 lossp = (row["cum_lost"] / decided * 100.0) if decided else 0.0
-                full = (row["peer_rx_max"] >= snap["frame_size"]
-                        and row["rx_echo_max"] >= snap["frame_size"])
+                full = (row["peer_rx_max"] >= row["expect_size"]
+                        and row["rx_echo_max"] >= row["expect_size"])
                 if row["size_mismatch"]:
                     size_cell, tag = f"⚠ {row['size_mismatch']}", "bad"
                 elif full:
                     size_cell, tag = "OK", "ok"
                 else:
                     size_cell, tag = "…", ""
+                if row["dscp_req"] is None and row["fwd_tos"] is None:
+                    dscp_cell = "-"
+                else:
+                    f_ = (dscp_name(row["fwd_tos"] >> 2)
+                          if row["fwd_tos"] is not None else "?")
+                    r_ = (dscp_name(row["rtn_tos"] >> 2)
+                          if row["rtn_tos"] is not None else "?")
+                    dscp_cell = f"{dscp_name(row['dscp_req'])}→{f_}/{r_}"
                 totals_tree.item(f"t{row['sid']}", tags=(tag,), values=(
                     row["name"], f"{row['cum_tx']:,}", f"{row['cum_recv']:,}",
                     f"{row['cum_lost']:,}", f"{row['cum_late']:,}", f"{lossp:.2f}",
-                    snap["frame_size"], row["peer_rx_max"], row["rx_echo_max"],
-                    size_cell))
+                    row["expect_size"], row["peer_rx_max"], row["rx_echo_max"],
+                    size_cell, dscp_cell))
 
         hist = engine.history_copy()
         owd_f, owd_r, band_hist = engine.extra_history_copy()
@@ -2834,7 +3095,7 @@ def run_mesh_gui(engine, args):
     import tkinter as tk
 
     view_seconds = float(args.history)
-    series = [(sid, STREAM_COLORS[sid], name.split("-")[1])
+    series = [(sid, stream_color(sid), name.split("-")[1])
               for sid, proto, port, name in STREAMS]
     peers = engine.peers
 
@@ -3160,8 +3421,10 @@ def _hms(seconds):
 
 def run_console(engine, args):
     vt = enable_vt_mode()
+    rate_txt = (f"target {args.mbps:g} Mbps" if args.mbps
+                else f"{args.pps:g} probes/s/stream")
     print(f"Network Vitals {__version__}  peer={args.peer}  bind={args.bind}  "
-          f"{ports_summary()}  {args.pps:g} probes/s/stream")
+          f"{ports_summary()}  {rate_txt}")
     print("Ctrl-C to stop.\n")
     try:
         run_console_loop(engine, args, vt)
@@ -3210,11 +3473,23 @@ def run_console_loop(engine, args, vt):
             load_txt = f"   probe load {snap['offered_mbps']:.2f} Mbps"
             if snap.get("target_mbps"):
                 load_txt += f" / target {_fmt_num(snap['target_mbps'])}"
+            frame_txt = (f"frame {snap['frame_size']} B"
+                         if not snap.get("profiles_active")
+                         else "frames per profile")
             print("  " + "-" * 100)
-            print(f"  frame {snap['frame_size']} B   DF {df}   size {size_tag}{vx}"
+            print(f"  {frame_txt}   DF {df}   size {size_tag}{vx}"
                   f"{load_txt}   (UDP peer-RX / my-RX per stream:"
                   + "".join(f"  {r['name'].split('-')[1]} {r['peer_rx_max']}/{r['rx_echo_max']}"
                             for r in snap["rows"] if r["proto"] == "UDP") + ")")
+            if any(r["dscp_req"] is not None or r["fwd_tos"] is not None
+                   for r in snap["rows"]):
+                def _dn(tos):
+                    return dscp_name(tos >> 2) if tos is not None else "?"
+                print("  DSCP req→fwd/rtn:  " + "   ".join(
+                    f"{r['name'].split('-')[1]} "
+                    f"{dscp_name(r['dscp_req'])}→{_dn(r['fwd_tos'])}/"
+                    f"{_dn(r['rtn_tos'])}"
+                    for r in snap["rows"]))
             # Two totals lines: the resettable demo window and the lifetime
             # run, so loss over the whole duration and loss since the last
             # reset are both visible without restarting the app.
@@ -3448,8 +3723,24 @@ def verify_rsa_sha256(pubkey_pem, message, signature):
 
 
 def _ver_tuple(s):
+    """Order-comparable version tuple: plain 'X.Y[.Z]' releases and
+    'X.Y.ZaN' alpha pre-releases ('1.8.0a2'). An alpha sorts BELOW its
+    final (1.8.0a1 < 1.8.0a2 < 1.8.0 < 1.8.1a1), so UAT machines move
+    a1 -> a2 -> final through the normal signed updater. The tuple is
+    (major, minor, patch, is_final, alpha_n); unparseable -> None."""
+    m = re.fullmatch(r"\s*v?(\d+)\.(\d+)(?:\.(\d+))?(?:a(\d+))?\s*", s or "")
+    if m:
+        major, minor, patch, alpha = m.groups()
+        return (int(major), int(minor), int(patch or 0),
+                1 if alpha is None else 0,
+                int(alpha) if alpha is not None else 0)
+    # Fallback for anything odd a manifest might carry: first three number
+    # groups, treated as a final release (pre-1.8.0 behavior, widened).
     nums = re.findall(r"\d+", s or "")[:3]
-    return tuple(int(x) for x in nums) if nums else None
+    if not nums:
+        return None
+    parts = tuple(int(x) for x in nums)
+    return parts + (0,) * (3 - len(parts)) + (1, 0)
 
 
 def _parse_manifest(manifest_bytes):
@@ -3757,17 +4048,29 @@ def _launcher_argv(vals):
     bind = (vals.get("bind") or "").strip() or "0.0.0.0"
     if bind != "0.0.0.0":
         argv += ["--bind", bind]
-    for label, key, flag, default in (
-            ("UDP ports", "udp_ports", "--udp-ports", DEFAULT_UDP_PORTS),
-            ("TCP ports", "tcp_ports", "--tcp-ports", DEFAULT_TCP_PORTS)):
+    for label, key, flag, parser, default in (
+            ("UDP ports", "udp_ports", "--udp-ports", _udp_port_list,
+             DEFAULT_UDP_PORTS),
+            ("TCP ports", "tcp_ports", "--tcp-ports", _tcp_port_list,
+             DEFAULT_TCP_PORTS)):
         raw = (vals.get(key) or "").strip()
         if raw:
             try:
-                ports = _port_pair(raw)
+                ports = parser(raw)
             except argparse.ArgumentTypeError as e:
                 raise ValueError(f"{label}: {e}")
             if ports != default:
-                argv += [flag, "%d,%d" % ports]
+                argv += [flag, ",".join(map(str, ports)) or "none"]
+    for label, key, flag, parser in (
+            ("Profiles", "profiles", "--profiles", _profile_list),
+            ("DSCP", "dscp", "--dscp", _dscp_list)):
+        raw = str(vals.get(key) or "").strip()
+        if raw:
+            try:
+                parser(raw)
+            except argparse.ArgumentTypeError as e:
+                raise ValueError(f"{label}: {e}")
+            argv += [flag, raw]
     window = num("Window", vals["window"], float, 1.0, 3600.0)
     if window != 10.0:
         argv += ["--window", _fmt_num(window)]
@@ -4099,6 +4402,8 @@ def run_launcher(update_url=UPDATE_URL):
     bind_var = tk.StringVar(value=sstr("bind", "0.0.0.0"))
     udp_var = tk.StringVar(value=sstr("udp_ports", "%d,%d" % DEFAULT_UDP_PORTS))
     tcp_var = tk.StringVar(value=sstr("tcp_ports", "%d,%d" % DEFAULT_TCP_PORTS))
+    profiles_var = tk.StringVar(value=sstr("profiles", ""))
+    dscp_var = tk.StringVar(value=sstr("dscp", ""))
     window_var = tk.StringVar(value=sstr("window", "10"))
     timeout_var = tk.StringVar(value=sstr("timeout", "2"))
     deadband_var = tk.StringVar(value=sstr("loss_deadband", "0.5"))
@@ -4110,8 +4415,10 @@ def run_launcher(update_url=UPDATE_URL):
     console_var = tk.BooleanVar(value=sbool("no_gui", False))
 
     rows = [("Bind address", bind_var, "local address to listen on"),
-            ("UDP ports (A,B)", udp_var, "both ends must match"),
-            ("TCP ports (A,B)", tcp_var, "both ends must match"),
+            ("UDP ports (list)", udp_var, "1-8 ports, one stream each; both ends must match"),
+            ("TCP ports (list)", tcp_var, "0-8 ports ('none' = UDP only); both ends must match"),
+            ("Profiles", profiles_var, "per stream: voice, video, bulk, imix, SIZE or SIZExPPS"),
+            ("DSCP", dscp_var, "per stream: EF, AF41, CS5, BE, 0-63 or '-' (blank = unmarked)"),
             ("Window (s)", window_var, "sliding window for loss/jitter/rates"),
             ("Probe timeout (s)", timeout_var, "un-echoed probe counts lost after this"),
             ("Loss deadband (%)", deadband_var, "loss+late below this reads as 0"),
@@ -4179,7 +4486,8 @@ def run_launcher(update_url=UPDATE_URL):
             "mbps": mbps_var.get(),
             "dont_fragment": bool(df_var.get()),
             "bind": bind_var.get(), "udp_ports": udp_var.get(),
-            "tcp_ports": tcp_var.get(), "window": window_var.get(),
+            "tcp_ports": tcp_var.get(), "profiles": profiles_var.get(),
+            "dscp": dscp_var.get(), "window": window_var.get(),
             "timeout": timeout_var.get(), "loss_deadband": deadband_var.get(),
             "history": history_var.get(), "refresh_ms": refresh_var.get(),
             "vxlan": bool(vx_var.get()), "vxlan_vni": vni_var.get(),
@@ -4277,7 +4585,7 @@ def run_launcher(update_url=UPDATE_URL):
                                  parent=root)
             return None
         try:
-            ports = (_port_pair(vals["udp_ports"])
+            ports = (_udp_port_list(vals["udp_ports"])
                      if vals["udp_ports"].strip() else DEFAULT_UDP_PORTS)
         except argparse.ArgumentTypeError as e:
             messagebox.showerror("Network Vitals", f"UDP ports: {e}",
@@ -4368,6 +4676,151 @@ def _port_pair(text):
     return ports
 
 
+MAX_STREAMS_PER_PROTO = 8
+
+
+def _port_list(text, what, min_ports=1, allow_none=False):
+    """Parse a comma list of 1-8 ports (1.8.0: the stream count per protocol
+    is no longer fixed at two). 'none' -> () where a protocol may be dropped
+    entirely (TCP-only match rules, pure-voice demos)."""
+    raw = (text or "").strip()
+    if allow_none and raw.lower() in ("none", "off", "0", ""):
+        return ()
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not (min_ports <= len(parts) <= MAX_STREAMS_PER_PROTO):
+        raise argparse.ArgumentTypeError(
+            f"{what}: expected {min_ports}-{MAX_STREAMS_PER_PROTO} "
+            f"comma-separated ports, got {len(parts)}")
+    try:
+        ports = tuple(int(p) for p in parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{what}: ports must be integers")
+    for p in ports:
+        if not (1 <= p <= 65535):
+            raise argparse.ArgumentTypeError(
+                f"{what}: port {p} out of range 1-65535")
+    if len(set(ports)) != len(ports):
+        raise argparse.ArgumentTypeError(f"{what}: duplicate port")
+    return ports
+
+
+def _udp_port_list(text):
+    """--udp-ports: 1-8 ports. At least one UDP stream is required - the
+    latency band, one-way drift and the one-shot tools all ride UDP."""
+    return _port_list(text, "UDP ports", min_ports=1, allow_none=False)
+
+
+def _tcp_port_list(text):
+    """--tcp-ports: 0-8 ports; 'none' runs a UDP-only stream set."""
+    return _port_list(text, "TCP ports", min_ports=1, allow_none=True)
+
+
+# -- traffic profiles (R-3): per-stream size/rate mixes ----------------------
+# name -> (payload size pattern in bytes, pps or None = inherit the base
+# --pps/--tcp-pps rate). A multi-entry pattern cycles probe-by-probe (IMIX).
+# 'imix' is the classic 7:4:1 mix of 64/576/1500-byte IP packets expressed
+# as probe payloads (IP size - 28); its per-stream mean is ~354 B of payload.
+TRAFFIC_PROFILES = {
+    "default": (None, None),     # --size at the base rate
+    "voice": ((200,), 50),       # G.711: 20 ms cadence
+    "video": ((1200,), 90),      # conferencing-like: big frames, ~0.9 Mbps
+    "bulk": ((1400,), 200),      # near-MTU filler, ~2.3 Mbps
+    "imix": ((36,) * 7 + (548,) * 4 + (1472,), None),
+}
+
+
+def _profile_list(text):
+    """--profiles: comma list, one entry per stream in stream (sid) order;
+    streams beyond the list keep 'default'. An entry is a profile name, a
+    payload SIZE, or SIZExPPS (e.g. 1200x90)."""
+    out = []
+    for tok in (t.strip() for t in (text or "").split(",")):
+        if not tok:
+            raise argparse.ArgumentTypeError("empty profile entry")
+        low = tok.lower()
+        if low in TRAFFIC_PROFILES:
+            out.append(low)
+            continue
+        m = re.fullmatch(r"(\d+)(?:x(\d+(?:\.\d+)?))?", low)
+        if not m:
+            raise argparse.ArgumentTypeError(
+                f"unknown profile {tok!r} - use one of "
+                f"{', '.join(sorted(TRAFFIC_PROFILES))}, or SIZE / SIZExPPS")
+        size = int(m.group(1))
+        if not (HEADER_LEN <= size <= MAX_SIZE):
+            raise argparse.ArgumentTypeError(
+                f"profile size {size} out of range {HEADER_LEN}-{MAX_SIZE}")
+        pps = float(m.group(2)) if m.group(2) else None
+        if pps is not None and not (0 < pps <= 100000):
+            raise argparse.ArgumentTypeError(
+                f"profile rate {pps:g} out of range (0, 100000]")
+        out.append((size, pps))
+    if len(out) > 2 * MAX_STREAMS_PER_PROTO:
+        raise argparse.ArgumentTypeError(
+            f"more profile entries than possible streams "
+            f"({2 * MAX_STREAMS_PER_PROTO} max)")
+    return out
+
+
+def _dscp_list(text):
+    """--dscp: comma list, one code point per stream in sid order (streams
+    beyond the list stay unmarked). Entries: EF, AF41, CS5, BE, 0-63, or
+    '-'/'none' to leave that stream unmarked."""
+    out = []
+    for tok in (t.strip().lower() for t in (text or "").split(",")):
+        if tok in ("", "-", "none"):
+            out.append(None)
+            continue
+        if tok in DSCP_NAMES:
+            out.append(DSCP_NAMES[tok])
+            continue
+        try:
+            v = int(tok)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"unknown DSCP {tok!r} - use EF, AF41, CS5, BE, 0-63, or '-'")
+        if not (0 <= v <= 63):
+            raise argparse.ArgumentTypeError(f"DSCP {v} out of range 0-63")
+        out.append(v)
+    if len(out) > 2 * MAX_STREAMS_PER_PROTO:
+        raise argparse.ArgumentTypeError(
+            f"more DSCP entries than possible streams "
+            f"({2 * MAX_STREAMS_PER_PROTO} max)")
+    return out
+
+
+def resolve_profiles(entries, n_streams, base_size):
+    """Expand --profiles entries to one (sizes_pattern, pps_or_None) per
+    stream in sid order; missing entries mean 'default' (--size, base rate)."""
+    resolved = []
+    for i in range(n_streams):
+        e = entries[i] if entries and i < len(entries) else "default"
+        if isinstance(e, tuple):
+            sizes, pps = (e[0],), e[1]
+        else:
+            sizes, pps = TRAFFIC_PROFILES[e]
+            if sizes is None:
+                sizes = (base_size,)
+        sizes = tuple(max(HEADER_LEN, min(MAX_SIZE, s)) for s in sizes)
+        resolved.append((sizes, pps))
+    return resolved
+
+
+def mean_wire_size(sizes, proto):
+    """Mean IP-level bytes per probe for a size pattern on one protocol."""
+    overhead = IPV4_TCP_OVERHEAD if proto == "TCP" else IPV4_UDP_OVERHEAD
+    return sum(sizes) / len(sizes) + overhead
+
+
+def pps_for_streams(mbps, profiles, protos):
+    """--mbps with per-stream profiles: equal bandwidth share per stream,
+    each stream's pps derived from its own mean wire size (profile SIZES are
+    kept, profile rates are overridden). Returns pps floats, floored at 0.1."""
+    share = mbps * 1e6 / len(profiles) / 8.0
+    return [max(0.1, share / mean_wire_size(sizes, proto))
+            for (sizes, _pps), proto in zip(profiles, protos)]
+
+
 def pps_from_mbps(mbps, size, udp_streams=2, tcp_streams=2):
     """Derive per-stream probe rates from a target offered load (--mbps).
 
@@ -4416,12 +4869,16 @@ def parse_args(argv=None):
                         "independently if desired.")
     p.add_argument("--bind", default="0.0.0.0",
                    help="Local address to bind/listen on (default: all interfaces).")
-    p.add_argument("--udp-ports", type=_port_pair, default=DEFAULT_UDP_PORTS,
-                   metavar="A,B",
-                   help="The two UDP ports (default %d,%d)." % DEFAULT_UDP_PORTS)
-    p.add_argument("--tcp-ports", type=_port_pair, default=DEFAULT_TCP_PORTS,
-                   metavar="A,B",
-                   help="The two TCP ports (default %d,%d)." % DEFAULT_TCP_PORTS)
+    p.add_argument("--udp-ports", type=_udp_port_list, default=DEFAULT_UDP_PORTS,
+                   metavar="A,B,...",
+                   help="1-%d UDP ports, one stream per port (default %d,%d). "
+                        "At least one UDP stream is required."
+                        % ((MAX_STREAMS_PER_PROTO,) + DEFAULT_UDP_PORTS))
+    p.add_argument("--tcp-ports", type=_tcp_port_list, default=DEFAULT_TCP_PORTS,
+                   metavar="A,B,...",
+                   help="0-%d TCP ports, one stream per port (default %d,%d; "
+                        "'none' runs UDP-only)."
+                        % ((MAX_STREAMS_PER_PROTO,) + DEFAULT_TCP_PORTS))
     p.add_argument("--pps", type=int, default=50,
                    help="Probe packets per second, per stream (default 50).")
     p.add_argument("--mbps", type=float, default=None, metavar="X",
@@ -4435,6 +4892,21 @@ def parse_args(argv=None):
                    help="Probe packet size in bytes (default 200, min %d, max %d; "
                         "e.g. 8972 to fill a 9000-byte jumbo frame)."
                         % (HEADER_LEN, MAX_SIZE))
+    p.add_argument("--profiles", type=_profile_list, default=None,
+                   metavar="P1,P2,...",
+                   help="Per-stream traffic profiles in stream order (streams "
+                        "beyond the list keep --size at the base rate): "
+                        "voice, video, bulk, imix, SIZE, or SIZExPPS - e.g. "
+                        "'voice,imix' shapes the first two streams. imix "
+                        "cycles the classic 7:4:1 64/576/1500 B IP mix.")
+    p.add_argument("--dscp", type=_dscp_list, default=None, metavar="D1,D2,...",
+                   help="Per-stream DSCP code points in stream order (streams "
+                        "beyond the list stay unmarked): EF, AF41, CS5, BE, "
+                        "0-63, or '-' to skip a stream. POSIX marks the exact "
+                        "value; Windows maps to the nearest qWAVE traffic "
+                        "type (no admin needed) and the UI reports the code "
+                        "point that actually went out. The Totals table "
+                        "shows requested vs arrived (fwd/rtn readback).")
     p.add_argument("--dont-fragment", action="store_true",
                    help="Set the IPv4 Don't-Fragment bit on UDP so oversized probes "
                         "are dropped, not fragmented (required to truly test jumbo). "
@@ -5091,17 +5563,42 @@ def main(argv=None):
         run_burst_test(args)
         return
 
-    # --mbps: derive the per-stream rates from the FINAL probe size (after
-    # the clamps above, so the offered-load math matches what is sent).
+    # Per-stream profiles / DSCP lists resolve against the FINAL stream
+    # catalogue (ports may add or drop streams) and the final probe size.
+    profiles = None
+    if args.profiles is not None:
+        if len(args.profiles) > len(STREAMS):
+            print(f"error: --profiles has {len(args.profiles)} entries but "
+                  f"only {len(STREAMS)} streams are configured",
+                  file=sys.stderr)
+            return 2
+        profiles = resolve_profiles(args.profiles, len(STREAMS), args.size)
+    dscp = None
+    if args.dscp is not None:
+        if len(args.dscp) > len(STREAMS):
+            print(f"error: --dscp has {len(args.dscp)} entries but only "
+                  f"{len(STREAMS)} streams are configured", file=sys.stderr)
+            return 2
+        dscp = (list(args.dscp) + [None] * len(STREAMS))[:len(STREAMS)]
+
+    # --mbps: derive each stream's rate from its own (mean) wire size, so
+    # the offered-load math matches what is actually sent - profiles keep
+    # their sizes, --mbps overrides their rates.
     if args.mbps is not None:
         if not (0 < args.mbps <= 1000):
             print("error: --mbps must be in (0, 1000]", file=sys.stderr)
             return 2
-        args.pps, args.tcp_pps = pps_from_mbps(args.mbps, args.size)
-        print(f"note: --mbps {_fmt_num(args.mbps)} -> {args.pps:.1f} pps per "
-              f"UDP stream + {args.tcp_pps:.1f} pps per TCP stream at "
-              f"{args.size} B probes (probes only; echoes double the wire "
-              f"load).", file=sys.stderr)
+        if profiles is None:
+            profiles = resolve_profiles(None, len(STREAMS), args.size)
+        rates = pps_for_streams(args.mbps, profiles,
+                                [cfg[1] for cfg in STREAMS])
+        profiles = [(sizes, rate)
+                    for (sizes, _p), rate in zip(profiles, rates)]
+        print(f"note: --mbps {_fmt_num(args.mbps)} -> "
+              + ", ".join(f"{STREAMS[i][3]} {rates[i]:.1f} pps"
+                          for i in range(len(STREAMS)))
+              + " (probes only; echoes double the wire load).",
+              file=sys.stderr)
 
     set_timer_resolution(1)  # smooth pacing on Windows -> fewer microburst drops
     # Binding can transiently fail right after an in-app update restart (the
@@ -5116,7 +5613,7 @@ def main(argv=None):
                         loss_deadband=args.loss_deadband,
                         dont_fragment=args.dont_fragment, vxlan=vxlan,
                         peers=args.peers, tcp_pps=args.tcp_pps,
-                        target_mbps=args.mbps)
+                        target_mbps=args.mbps, profiles=profiles, dscp=dscp)
         try:
             engine.start()
             last_err = None

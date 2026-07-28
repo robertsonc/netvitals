@@ -149,9 +149,21 @@ class TestManifestParsing(unittest.TestCase):
                                % (b"a" * 64))
 
     def test_version_tuple(self):
-        self.assertEqual(nq._ver_tuple("1.6.2"), (1, 6, 2))
+        # The tuple is an ordering key, not a public shape - assert order.
         self.assertIsNone(nq._ver_tuple("none"))
         self.assertLess(nq._ver_tuple("1.6.2"), nq._ver_tuple("1.7.0"))
+        self.assertEqual(nq._ver_tuple("1.6.2"), nq._ver_tuple("v1.6.2"))
+
+    def test_alpha_versions_order_below_their_final(self):
+        # UAT flow: a1 -> a2 -> final must each read as an upgrade.
+        v = nq._ver_tuple
+        self.assertLess(v("1.8.0a1"), v("1.8.0a2"))
+        self.assertLess(v("1.8.0a2"), v("1.8.0"))
+        self.assertLess(v("1.8.0"), v("1.8.1a1"))
+        self.assertLess(v("1.7.0"), v("1.8.0a1"))
+        # Equal strings stay equal; an alpha never equals its final.
+        self.assertEqual(v("1.8.0a1"), v("1.8.0a1"))
+        self.assertNotEqual(v("1.8.0a1"), v("1.8.0"))
 
 
 if __name__ == "__main__":
