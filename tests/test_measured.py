@@ -90,15 +90,20 @@ class TestJsonPath(unittest.TestCase):
 class TestSimSource(unittest.TestCase):
     def test_integrates_rates_through_slices(self):
         # Two streams: 50 pps x 1 slice and 10 pps x 3 slices; x2 for the
-        # reflected echoes -> 160 WAN pps.
+        # reflected echoes -> 160 WAN pps. The source integrates over REAL
+        # elapsed time, so divide by the measured span, not the nominal
+        # sleep - CI runners oversleep freely (a macOS runner turned a
+        # 0.25 s sleep into ~0.4 s and 160 pps into a phantom 256).
         src = nq.SimWanSource(lambda: [(50.0, 1), (10.0, 3)], noise_pps=0.0)
         src.poll()
-        time.sleep(0.25)
         a = src.poll()
+        t0 = time.monotonic()
         time.sleep(0.25)
         b = src.poll()
-        rate = (b["tx_pkts"] - a["tx_pkts"]) / 0.25
-        self.assertAlmostEqual(rate, 160.0, delta=32.0)  # ±2% jitter + timing
+        dt = time.monotonic() - t0
+        rate = (b["tx_pkts"] - a["tx_pkts"]) / dt
+        # ±2% jitter + ±1 packet of int truncation on each counter read.
+        self.assertAlmostEqual(rate, 160.0, delta=24.0)
 
 
 class TestSliceBoundaryDetector(unittest.TestCase):
