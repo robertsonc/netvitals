@@ -696,7 +696,7 @@ is measured. (This is the existing README roadmap, carried forward.)*
 | **1.7** ✅ shipped | R-1, R-2, R-5 (DF + late split; TCP/VXLAN burst deferred) | Biggest demo wins, no new privileges/protocols: dial-a-bandwidth + sustained load on the live charts |
 | **1.8** ✅ shipped | R-6, R-3, R-7 + alpha-aware updater | The policy-classification surface: DSCP + multi-class mixes + configurable stream sets |
 | **1.9** ✅ shipped | R-10 (collector + simulator; Orchestrator preset at UAT), R-12, R-4 | First measured-WAN loop (counters + calibration burst + scripted scenarios) |
-| **2.0** ✅ shipped (2.0.0a1) | R-11, R-13, R-15, R-19 (charts-in-report deferred) | The full "prove the fabric" story + the leave-behind report |
+| **2.0** ✅ shipped | R-11, R-13, R-15, R-19 (charts-in-report deferred) | The full "prove the fabric" story + the leave-behind report |
 | **2.x** | R-8, R-9, R-14, R-16 – R-18, R-20, R-21 | Scale-out, automation, elastic loads |
 
 ---
