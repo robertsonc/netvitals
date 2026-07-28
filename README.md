@@ -441,6 +441,13 @@ Bad below.
                    policer / shaper signatures) - see "Burst test" below
 --burst-mbps A,B   burst stages in Mbps (default 1,2,5,10,25)
 --burst-secs S     seconds per burst stage (default 3)
+--slice-scan       one-shot: measure the fabric's REAL slice budget from the
+                   RTT-vs-size staircase (see "Measuring the WAN side")
+--wan-counters S   poll WAN-side packet counters and show measured WAN pps:
+                   sim[:NOISE] | snmp:HOST,COMMUNITY,IFINDEX[,PORT] |
+                   rest:URL[|TOKEN[|TXKEY|RXKEY]]
+--scenario FILE    replay a JSON demo timeline (stages with load/square-wave/
+                   reset), drawn as stage markers on the charts
 ```
 
 At the defaults each stream is ~50 packets/s × 200 B ≈ 10 KB/s each way, i.e.
@@ -702,6 +709,59 @@ fabric measures differently. Note the numbers are a *prediction* from that
 model, not a measurement of your fabric; pair the panel with the WAN-side
 counters on the roadmap below to close the loop.
 
+## Measuring the WAN side (1.9.0)
+
+Three ways to turn the Anatomy panel's *prediction* into *measurement*:
+
+- **WAN counters** (`--wan-counters`): a poller thread reads the fabric's
+  WAN-side packet counters once a second and the Anatomy panel (and the
+  console) shows **measured WAN pps next to the predicted pps** — live
+  proof that 1 LAN packet becomes N WAN packets. Sources:
+  - `sim[:NOISE_PPS]` — a built-in simulator that integrates this
+    instance's own offered load through the EC slicing model (plus
+    optional background noise), so the whole workflow — including the
+    square-wave calibration below — runs with **no fabric access at all**;
+  - `snmp:HOST,COMMUNITY,IFINDEX[,PORT]` — stdlib SNMPv2c GET of the
+    IF-MIB 64-bit counters (`ifHCIn/OutUcastPkts`); works against
+    EdgeConnect or any router/switch;
+  - `rest:URL[|TOKEN[|TX_KEY|RX_KEY]]` — generic JSON poller (dotted key
+    paths; token sent as both `Authorization: Bearer` and `X-Auth-Token`).
+    The Orchestrator-specific endpoint is chosen during UAT against real
+    gear; this is its stable integration point.
+  On busy fabrics, square-wave the load (the ⚡ Load panel or a scenario
+  stage) and diff the counters between on and off windows — the load's
+  WAN footprint falls out of the subtraction.
+- **Slice scan** (`--slice-scan`): a one-shot that steps the probe size
+  across a uniform grid and reads the RTT-vs-size **staircase** the
+  slicing fabric imposes — measuring the *real* slice budget instead of
+  trusting `EC_SLICE_BUDGET`, and telling you when the model constant
+  needs tuning. On a path with no slicing fabric it says so.
+- **Slice-loss ratio (always on)**: run two UDP streams whose probes slice
+  into different WAN packet counts (e.g. `--profiles 200,3000`) and, when
+  both lose, the app checks whether the loss ratio tracks the slice-count
+  ratio — sustained `large ≈ N × small` is live slicing evidence with no
+  fabric access, called out in the status line.
+
+## Scenario scripting (`--scenario`, 1.9.0)
+
+A demo arc as a JSON file instead of a memorized click sequence:
+
+```json
+{"name": "policy-demo", "repeat": 1, "stages": [
+  {"name": "baseline",  "secs": 60},
+  {"name": "load",      "secs": 30, "load_mbps": 10},
+  {"name": "calibrate", "secs": 60, "load_mbps": 10,
+   "square_on_s": 5, "square_off_s": 5},
+  {"name": "clean slate", "secs": 5, "reset": true}]}
+```
+
+Each stage can hold a sustained load (`load_mbps`, optionally square-waved),
+and/or reset the since-reset stats. Stage boundaries are drawn as dashed
+**markers on all four charts** (labeled on the latency chart), the footer
+shows the live stage/pass countdown, and `repeat: 0` loops until the app
+closes. Load stages need native transport (not `--vxlan`) and target the
+first peer.
+
 ## VXLAN encapsulation (`--vxlan`)
 
 Run **both ends** with `--vxlan` and every probe stream — the TCP streams as
@@ -841,6 +901,13 @@ the host-side measurement tranche of this roadmap.
 readout, the **sustained-load panel** (⚡ Load button, with the square-wave
 calibration schedule), and the **hardened burst test** (optional DF,
 loss-vs-late split in stages and verdicts).
+
+*Shipped in 1.9.0* (Milestone 1.9 — measuring the WAN side): **WAN counter
+polling** (`--wan-counters`: SNMP / generic REST / a no-hardware simulator)
+with measured-vs-predicted WAN pps in the Anatomy panel, the **slice scan**
+(`--slice-scan`, measures the real slice budget from the RTT staircase),
+the always-on **slice-loss-ratio evidence**, and **scenario scripting**
+(`--scenario` JSON timelines with chart stage markers).
 
 *Shipped in 1.8.0* (Milestone 1.8 — the policy-classification surface):
 **configurable stream sets** (1–8 UDP + 0–8 TCP port lists), **per-stream
