@@ -15,8 +15,14 @@ import netquality as nq  # noqa: E402
 
 class TestWanSpec(unittest.TestCase):
     def test_sim_forms(self):
-        self.assertEqual(nq._wan_spec("sim"), {"kind": "sim", "noise_pps": 0.0})
+        self.assertEqual(nq._wan_spec("sim"),
+                         {"kind": "sim", "noise_pps": 0.0, "loss_pct": 0.0})
         self.assertEqual(nq._wan_spec("sim:250")["noise_pps"], 250.0)
+        # 2.0.0: sim:NOISE:LOSS_PCT rehearses the FEC verdict.
+        spec = nq._wan_spec("sim:100:1.5")
+        self.assertEqual((spec["noise_pps"], spec["loss_pct"]), (100.0, 1.5))
+        with self.assertRaises(argparse.ArgumentTypeError):
+            nq._wan_spec("sim:1:200")
 
     def test_snmp_form(self):
         spec = nq._wan_spec("snmp:10.0.0.5,public,3")

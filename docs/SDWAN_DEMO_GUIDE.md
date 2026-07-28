@@ -497,6 +497,46 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
   peer; a stage with `reset: true` wipes the since-reset window (lifetime
   counters survive, as always).
 
+### T21. FEC proof and loss amplification (2.0.0)
+
+- **Demonstrates:** *measured* proof that FEC is repairing — WAN counters
+  dropping while probes run clean — or its absence: probe loss amplified
+  by the slice count.
+- **Run:** `--wan-counters snmp:...` against a device exposing
+  discard/error counters (or `sim:0:1.5` to rehearse: the simulator drops
+  1.5 % on the WAN while the clean path keeps probes at 0 %).
+- **Show:** the status line naming the verdict; the Anatomy/Topology
+  panels carrying the measured rates behind it; the report capturing it.
+
+### T22. PMTUD black-hole naming and fragment counting (2.0.0)
+
+- **Demonstrates:** whether an MTU limit is *announced* (ICMP
+  frag-needed, PMTUD works) or *silent* (black hole); and at capture
+  level, whether whole packets or kernel-reassembled fragments arrived.
+- **Run:** `--mtu-sweep` (the ICMP verdict is automatic on Linux, no
+  root); `--frag-sniffer` alongside a session (needs root/admin).
+- **Show:** the sweep's closing verdict line; the footer/console fragment
+  counter staying at 0 while jumbo sizes verify = the fabric delivered
+  whole packets.
+
+### T23. Live topology strip (2.0.0)
+
+- **Demonstrates:** the whole story on one strip — Host → EC → fabric →
+  EC → peer with LAN pps, predicted/measured WAN pps and the ×N
+  amplification moving live.
+- **Run:** dashboard → **≣ Topology** (pair with `--wan-counters` for the
+  measured span).
+
+### T24. The leave-behind report (2.0.0)
+
+- **Demonstrates:** the demo's evidence as a file: scores, per-stream
+  stats with DSCP readback, totals, forward/return split, every fired
+  diagnostic, WAN counters, scenario state.
+- **Run:** **⭳ Report** in the dashboard, `w` in the console, or
+  `--report BASE` for an automatic write at exit.
+- **Show:** the self-contained HTML opens anywhere; the JSON feeds
+  before/after diffs and CI-style acceptance checks.
+
 ## 2.4 Constraint summary (read before scripting a demo)
 
 | Constraint | Detail |
@@ -505,7 +545,8 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
 | Per-stream sizes/rates via `--profiles` (1.8.0) | named profiles + IMIX shipped; still no time-varying ramps in the continuous engine (Roadmap R-4) |
 | Stream count: 1–8 UDP + 0–8 TCP (1.8.0) | at least one UDP stream always required; both ends must run identical port lists |
 | DSCP marking shipped (1.8.0) | exact on POSIX; Windows non-admin goes through qWAVE traffic types (EF request → CS7 on the wire, reported honestly); native-UDP readback needs a POSIX receiver, VXLAN readback works everywhere, native TCP shows `?` |
-| One-shot tools (sweep/burst) and the Load panel | UDP-only, native-mode peers only, tool host must be a configured peer on the target; Load panel is single-pair GUI only |
+| One-shot tools (sweep/burst/slice-scan) and the Load panel | UDP-only, native-mode peers only, tool host must be a configured peer on the target; Load panel is single-pair GUI only |
+| Privilege boundaries (2.0.0) | frag sniffer needs root/admin (raw capture); the sweep's ICMP verdict needs Linux (IP_RECVERR, no root); FEC verdict needs a drop-reporting counter source |
 | Version parity | both ends ≥ 1.5.0; VXLAN both-ends-or-neither, same VNI/port |
 | Burst test / Load | both directions carry the offered load (echoes are full-size); burst DF is opt-in via `--dont-fragment` |
 
@@ -598,9 +639,12 @@ is measured. (This is the existing README roadmap, carried forward.)*
   the square-wave calibration isolates the load's footprint on busy
   fabrics. Remaining for UAT against real gear: the Orchestrator-specific
   endpoint/auth preset and hub-transit path selection.
-- **R-11. FEC verdict** *(README #2)*: WAN slice loss vs probe loss — WAN
-  counters dropping while probe loss stays 0 % is measured proof FEC is
-  repairing; probe loss ≈ N × slice loss quantifies loss amplification.
+- **R-11. FEC verdict** *(README #2)*. ✅ **Shipped in 2.0.0**: the WAN
+  counter source's drop rates (SNMP discard/error OIDs; `sim:NOISE:LOSS%`
+  for rehearsal) are compared with app-level probe loss — WAN dropping
+  while probes run clean is called out as **measured FEC repair**, and
+  probe loss ≈ N× WAN slice loss as **amplification with no repair**;
+  silent when neither is proven.
 - **R-12. Slice-boundary detector** *(README #3)*. ✅ **Shipped in 1.9.0**:
   `--slice-scan` measures the real slice budget from the RTT-vs-size
   staircase (and says when the Anatomy model constant needs tuning), and
@@ -608,14 +652,18 @@ is measured. (This is the existing README roadmap, carried forward.)*
   with different slice counts (e.g. `--profiles 200,3000`) and calls out
   `large ≈ N × small` loss as live per-WAN-packet loss — no EC access
   needed for either.
-- **R-13. LAN fragment sniffer + ICMP listener** *(README #4, #5)*: raw-
-  socket fragment counting to distinguish EC reassembly from kernel
-  reassembly, and "ICMP frag-needed (MTU=1500) received" vs "silently
-  dropped → PMTUD black hole" during sweeps.
+- **R-13. LAN fragment sniffer + ICMP listener** *(README #4, #5)*.
+  ✅ **Shipped in 2.0.0**: `--frag-sniffer` counts IPv4 fragments to/from
+  the peer at capture level (AF_PACKET / SIO_RCVALL — needs root/admin,
+  degrades to an honest "unavailable"), and the MTU sweep now reads the
+  Linux socket error queue (IP_RECVERR, **no root needed**) to report
+  "ICMP frag-needed received (MTU=N)" vs "silently dropped → PMTUD black
+  hole".
 - **R-14. Coalescing detector** *(README #6)*: receiver-side inter-arrival
   clustering + the ~1–3 ms wait-timer signature in small-probe RTT.
-- **R-15. Live topology strip** *(README #7)*: Host → EC1 → fabric → EC2 →
-  Host with measured pps at each hop and the amplification ratio on the
+- **R-15. Live topology strip** *(README #7)*. ✅ **Shipped in 2.0.0**: the
+  **≣ Topology** button draws Host → EC → fabric → EC → peer with live
+  numbers — LAN pps, predicted/measured WAN pps, amplification on the
   tunnel span.
 
 ## Phase 4 — Scale, repeatability, reporting
@@ -628,10 +676,12 @@ is measured. (This is the existing README roadmap, carried forward.)*
   degraded ⇒ C's site/link" called out automatically.
 - **R-18. Hub/star mode** *(README #9.4)*: first-class spoke→hub topology
   (works by list construction today) to keep probe count linear at scale.
-- **R-19. Results export & demo report.** One-click snapshot of a demo
-  window (scores, charts, totals, verdicts) to JSON/CSV + a self-contained
-  HTML report — the "leave-behind" after a POC; before/after-policy
-  comparison view.
+- **R-19. Results export & demo report.** ◐ **Shipped in 2.0.0**: the
+  **⭳ Report** button (console `w`; `--report BASE` at exit) writes a
+  timestamped JSON + self-contained HTML pair — scores, per-stream stats
+  incl. DSCP readback, totals, every fired diagnostic, WAN counters and
+  scenario state. Remaining: embedded chart images and a before/after-
+  policy comparison view.
 - **R-20. Headless/automation mode.** `--json` periodic stats on stdout, a
   local metrics endpoint (Prometheus-style), and scripted pass/fail
   assertions with exit codes ("loss < 0.5 % and p95 < 80 ms for 10 min") —
@@ -646,7 +696,7 @@ is measured. (This is the existing README roadmap, carried forward.)*
 | **1.7** ✅ shipped | R-1, R-2, R-5 (DF + late split; TCP/VXLAN burst deferred) | Biggest demo wins, no new privileges/protocols: dial-a-bandwidth + sustained load on the live charts |
 | **1.8** ✅ shipped | R-6, R-3, R-7 + alpha-aware updater | The policy-classification surface: DSCP + multi-class mixes + configurable stream sets |
 | **1.9** ✅ shipped | R-10 (collector + simulator; Orchestrator preset at UAT), R-12, R-4 | First measured-WAN loop (counters + calibration burst + scripted scenarios) |
-| **2.0** | R-11, R-13, R-15, R-19 | The full "prove the fabric" story + the leave-behind report |
+| **2.0** ✅ shipped | R-11, R-13, R-15, R-19 (charts-in-report deferred) | The full "prove the fabric" story + the leave-behind report |
 | **2.x** | R-8, R-9, R-14, R-16 – R-18, R-20, R-21 | Scale-out, automation, elastic loads |
 
 ---
