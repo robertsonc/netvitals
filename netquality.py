@@ -2970,11 +2970,168 @@ BAND_FILL = "#4FB3C9"   # percentile band, composited against the card
 
 def _chart_geom(w, h):
     """Padding for a chart of this size. Small multiples get tighter margins
-    so the plot area itself never collapses to a sliver."""
+    so the plot area itself never collapses to a sliver.
+
+    The top margin is deliberately thin: the title is a watermark inside the
+    plot and the legend only exists on hover, so neither one is buying a
+    header row at the expense of the data."""
     tight = h < 230
     return {"l": 52 if tight else 60, "r": 16 if tight else 22,
-            "t": 44 if tight else 52, "b": 26 if tight else 30,
+            "t": 22 if tight else 26, "b": 26 if tight else 30,
             "tight": tight}
+
+
+# --- hover legend ----------------------------------------------------------
+# The per-series key is a stack of pills at the plot's top-left that fades in
+# under the pointer and back out when it leaves, so the resting chart spends
+# all of its height on data. Tk cannot fade a widget - but every colour in
+# this UI is composited by hand against a known backdrop anyway, so a fade is
+# just the same pills re-blended a few times a second.
+LEGEND_PILL_H = 20
+LEGEND_PILL_GAP = 4
+
+
+def _title_ink(well, legend_alpha):
+    """Watermark strength for a chart title: ~70% of the text colour at rest,
+    receding as the hover legend comes up over the same corner."""
+    return _over(TXT, well, 0.70 - 0.42 * legend_alpha)
+
+
+def _legend_state(canvas):
+    """Per-canvas legend state, created (and bound) on first use."""
+    st = getattr(canvas, "_nq_legend", None)
+    if st is None:
+        st = {"alpha": 0.0, "target": 0.0, "job": None, "open": set(),
+              "hits": [], "items": (), "origin": None, "well": BG}
+        canvas._nq_legend = st
+        canvas.bind("<Enter>", lambda _e: _legend_show(canvas, True), add="+")
+        canvas.bind("<Leave>", lambda _e: _legend_show(canvas, False), add="+")
+        canvas.bind("<Button-1>", lambda e: _legend_click(canvas, e), add="+")
+        canvas.bind("<Motion>", lambda e: _legend_motion(canvas, e), add="+")
+    return st
+
+
+def _legend_hit(canvas, x, y):
+    for hx0, hy0, hx1, hy1, idx in canvas._nq_legend["hits"]:
+        if hx0 <= x <= hx1 and hy0 <= y <= hy1:
+            return idx
+    return None
+
+
+def _legend_paint(canvas):
+    """Repaint the pill stack at the current fade level."""
+    st = canvas._nq_legend
+    canvas.delete("nqlegend")
+    st["hits"] = []
+    a = st["alpha"]
+    well = st["well"]
+    # Dim the title in step with the fade rather than waiting for the next
+    # refresh tick, so the two never cross over at full strength.
+    for tid in canvas.find_withtag("nqtitle"):
+        canvas.itemconfigure(tid, fill=_title_ink(well, a))
+    if a <= 0.02 or not st["items"] or not st["origin"]:
+        return
+    x0, y = st["origin"]
+    # Eight streams per protocol is a supported config, and eight pills do not
+    # fit a small multiple. Drop to what fits and say so, rather than running
+    # the stack off the bottom of the plot.
+    per = LEGEND_PILL_H + LEGEND_PILL_GAP
+    fits = max(1, int(st.get("maxh", 1e6) // per))
+    shown, hidden = st["items"], 0
+    if len(shown) > fits:
+        hidden = len(shown) - (fits - 1)
+        shown = shown[:fits - 1]
+    for i, (color, label, value) in enumerate(shown):
+        # Collapsed shows the live number, which is what a glance wants;
+        # clicking swaps in the stream's name for when it doesn't.
+        text = f"{label}   {value}".strip() if i in st["open"] else (value or label)
+        tid = canvas.create_text(x0 + 21, y + LEGEND_PILL_H / 2, text=text,
+                                 anchor="w", fill=_over(TXT, well, 0.92 * a),
+                                 font=(FONT, 8, "bold"), tags="nqlegend")
+        x1 = canvas.bbox(tid)[2] + 10
+        _round_rect(canvas, x0, y, x1, y + LEGEND_PILL_H, 9,
+                    fill=_over(GLASS, well, 0.13 * a),
+                    outline=_over(color, well, 0.55 * a), width=1,
+                    tags="nqlegend")
+        canvas.create_line(x0 + 10, y + 6, x0 + 10, y + LEGEND_PILL_H - 6,
+                           fill=_over(color, well, a), width=3,
+                           capstyle="round", tags="nqlegend")
+        canvas.tag_raise(tid)
+        st["hits"].append((x0, y, x1, y + LEGEND_PILL_H, i))
+        y += per
+    if hidden:
+        tid = canvas.create_text(x0 + 12, y + LEGEND_PILL_H / 2,
+                                 text=f"+{hidden} more", anchor="w",
+                                 fill=_over(TXT_DIM, well, 0.92 * a),
+                                 font=(FONT, 8), tags="nqlegend")
+        _round_rect(canvas, x0, y, canvas.bbox(tid)[2] + 10,
+                    y + LEGEND_PILL_H, 9,
+                    fill=_over(GLASS, well, 0.13 * a),
+                    outline=_over(GLASS, well, 0.22 * a), width=1,
+                    tags="nqlegend")
+        canvas.tag_raise(tid)
+
+
+def _legend_step(canvas):
+    st = canvas._nq_legend
+    st["job"] = None
+    a, target = st["alpha"], st["target"]
+    if abs(target - a) < 0.03:
+        st["alpha"] = target
+    else:
+        st["alpha"] = a + (target - a) * 0.34
+        try:
+            st["job"] = canvas.after(28, lambda: _legend_step(canvas))
+        except Exception:
+            return                      # canvas went away mid-fade
+    _legend_paint(canvas)
+
+
+def _legend_show(canvas, on):
+    st = _legend_state(canvas)
+    st["target"] = 1.0 if on else 0.0
+    if not on:
+        canvas.configure(cursor="")
+    if st["job"] is None and st["alpha"] != st["target"]:
+        try:
+            st["job"] = canvas.after(16, lambda: _legend_step(canvas))
+        except Exception:
+            pass
+
+
+def _legend_click(canvas, event):
+    st = _legend_state(canvas)
+    if st["alpha"] < 0.4:
+        return
+    idx = _legend_hit(canvas, event.x, event.y)
+    if idx is not None:
+        st["open"].symmetric_difference_update({idx})
+        _legend_paint(canvas)
+
+
+def _legend_motion(canvas, event):
+    st = _legend_state(canvas)
+    if st["alpha"] < 0.4:
+        return
+    canvas.configure(cursor=("hand2" if _legend_hit(canvas, event.x, event.y)
+                             is not None else ""))
+
+
+def _legend_items(key, series, samples_by_sid, value_fmt, unit, band,
+                  band_label):
+    """(colour, name, latest value) per series, plus the band if there is one."""
+    out = []
+    for sid, color, label in series:
+        cur = None
+        for s in reversed(samples_by_sid.get(sid, ())):
+            if s.get(key) is not None:
+                cur = s.get(key)
+                break
+        out.append((color, label,
+                    f"{value_fmt(cur)}{unit}" if cur is not None else "-"))
+    if band and band_label:
+        out.append((BAND_FILL, band_label, ""))
+    return tuple(out)
 
 
 def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
@@ -3042,12 +3199,6 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
         if stale:
             canvas.delete(*stale)
 
-    # ---- title + legend ---------------------------------------------------
-    tsize = 9 if g["tight"] else 10
-    title_id = canvas.create_text(cx0 + 18, cy0 + 21, text=title, anchor="w",
-                                  fill=TXT, font=(FONT, tsize, "bold"))
-    legend_x0 = canvas.bbox(title_id)[2] + 16
-
     # ---- autoscale --------------------------------------------------------
     vmax = ymin_floor
     for sid, _c, _n in series:
@@ -3091,6 +3242,17 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
                       (0.5, f"-{int(view_seconds / 2)}s"), (1.0, "now")):
         canvas.create_text(pad_l + pw * frac, pad_b + 15, text=lbl,
                            anchor="center", fill=TXT_FAINT, font=(FONT, 7))
+
+    # ---- title, as a watermark inside the plot ----------------------------
+    # Drawn here, before the data, so the traces pass over it. A title you
+    # already know is worth less than the reading it would otherwise hide,
+    # and this buys the ~50 px that a dedicated header row used to cost. It
+    # also recedes as the legend fades in, so the pills never have to fight
+    # it for the same corner on a small multiple.
+    canvas.create_text((pad_l + pad_r) / 2.0, pad_t + 14, text=title,
+                       anchor="center", tags="nqtitle",
+                       fill=_title_ink(well, _legend_state(canvas)["alpha"]),
+                       font=(FONT, 9 if g["tight"] else 10, "bold"))
 
     # ---- percentile band --------------------------------------------------
     # A flat composited colour instead of the old 50% stipple: we know exactly
@@ -3203,43 +3365,17 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
                 canvas.create_oval(hx - 2.6, hy - 2.6, hx + 2.6, hy + 2.6,
                                    fill=color, outline=_lighten(color, 0.55))
 
-    # ---- legend chips -----------------------------------------------------
-    lx = legend_x0
-    ly = cy0 + 21
-    for sid, color, label in series:
-        cur = None
-        for s in reversed(samples_by_sid.get(sid, ())):
-            if s.get(key) is not None:
-                cur = s.get(key)
-                break
-        txt = f"{value_fmt(cur)}{unit}" if cur is not None else "-"
-        lid = canvas.create_text(lx + 16, ly, anchor="w", font=(FONT, 8),
-                                 fill=TXT_DIM, text=f"{label}  ")
-        vid = canvas.create_text(canvas.bbox(lid)[2] - 2, ly, anchor="w",
-                                 font=(FONT, 8, "bold"),
-                                 fill=(TXT if cur is not None else TXT_FAINT),
-                                 text=txt)
-        right = canvas.bbox(vid)[2]
-        if right > cx1 - 14:                 # ran out of room: drop the rest
-            canvas.delete(lid)
-            canvas.delete(vid)
-            break
-        _round_rect(canvas, lx - 5, ly - 10, right + 6, ly + 10, 9,
-                    fill=_over(GLASS, surface, 0.07))
-        canvas.create_line(lx + 4, ly - 4.5, lx + 4, ly + 4.5, fill=color,
-                           width=3, capstyle="round")
-        canvas.tag_raise(lid)
-        canvas.tag_raise(vid)
-        lx = right + 18
-    if band and band_label and lx < cx1 - 90:
-        bid = canvas.create_text(lx + 16, ly, anchor="w", text=band_label,
-                                 fill=TXT_DIM, font=(FONT, 8))
-        _round_rect(canvas, lx - 5, ly - 10, canvas.bbox(bid)[2] + 6, ly + 10,
-                    9, fill=_over(GLASS, surface, 0.07))
-        canvas.create_line(lx + 4, ly - 4.5, lx + 4, ly + 4.5,
-                           fill=_over(BAND_FILL, surface, 0.7), width=3,
-                           capstyle="round")
-        canvas.tag_raise(bid)
+    # ---- hover legend ------------------------------------------------------
+    # Values are handed to the pill stack rather than drawn now: the stack
+    # only materialises under the pointer, and its fade animation repaints it
+    # between refresh ticks off this same state.
+    st = _legend_state(canvas)
+    st["items"] = _legend_items(key, series, samples_by_sid, value_fmt, unit,
+                                band, band_label)
+    st["origin"] = (pad_l + 10, pad_t + 10)
+    st["maxh"] = ph - 20
+    st["well"] = well
+    _legend_paint(canvas)
 
 
 # ---------------------------------------------------------------------------
