@@ -46,6 +46,7 @@ The dashboard shows **four live + history charts**:
 plus, in the header:
 
 - a big colour-coded **Experience score** (0–100, green = excellent → red = bad),
+  drawn as a glowing arc gauge so the state is readable from across a room,
 - a **UDP MOS** (E-model, averaged over the UDP streams) and a **TCP PQI** —
   MOS is a media metric and the wrong lens for TCP, which converts loss into
   delay via retransmission, so TCP streams get a **Path Quality Index**
@@ -60,12 +61,12 @@ plus, in the header:
   - TCP connection-establishment time (every reconnect is timed, plus a
     throwaway handshake is sampled every ~15 s per TCP port; establishment
     well beyond the RTT means SYN loss),
-- a **Reset / Clear** button that wipes the charts and all accumulated
+- a **Reset** button that wipes the charts and all accumulated
   loss/latency/jitter stats so a demo can start from a clean slate,
 - a **Totals** button that toggles a per-stream table of the since-reset
   counters (sent / received / lost / late / loss %). The bottom status bar
   always shows the aggregate **since reset** counters (cleared by
-  **Reset / Clear**) *and* the **lifetime** counters (never cleared while the
+  **Reset**) *and* the **lifetime** counters (never cleared while the
   app runs), so the loss over the whole run stays visible across resets.
 - an **Isolate** button that splits each stream's round-trip loss into a
   **forward** component (probes that never reached the peer) and a **return**
@@ -277,7 +278,7 @@ While it runs, the console UI accepts single-key commands:
 
 | Key | Action |
 |-----|--------|
-| `r` | reset the *since reset* counters/stats — same as the GUI **Reset / Clear** button |
+| `r` | reset the *since reset* counters/stats — same as the GUI **Reset** button |
 | `q` | quit (Ctrl-C also works) |
 
 The status area shows **two totals lines**: *since reset* (the demo window —

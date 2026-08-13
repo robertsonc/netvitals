@@ -196,7 +196,7 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
   direction total. UDP cadence = G.711 (20 ms); TCP models an interactive
   app.
 - **Show:** Experience score ≥ 80 "Excellent", flat charts, one-way drift
-  hugging zero. Press **Reset / Clear** to start the demo window clean.
+  hugging zero. Press **Reset** to start the demo window clean.
 
 ### T2. Known-load scaling and soak
 
@@ -395,7 +395,7 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
 
 ### T14. Demo hygiene and operator controls
 
-- **Reset / Clear** (GUI button / `r` in console): wipes charts and
+- **Reset** (GUI button / `r` in console): wipes charts and
   since-reset stats for a clean demo window; lifetime counters survive so
   the whole-run truth stays available.
 - **Loss deadband** (0.5 % default): sub-threshold blips read as 0 for the
