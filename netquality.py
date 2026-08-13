@@ -1079,15 +1079,19 @@ def loss_verdict(fwd_lost, rtn_lost, inflight=6):
 
 
 def score_color(r):
+    """Band colour for a 0-100 quality score, matching score_label()'s bands.
+
+    Tuned for the dark glass theme: saturated enough to carry a glow, light
+    enough to stay legible as text on a translucent surface."""
     if r >= 80:
-        return "#1a9850"
+        return "#20D9A2"    # excellent - mint
     if r >= 70:
-        return "#66bd63"
+        return "#8CD94E"    # good - lime
     if r >= 60:
-        return "#fee08b"
+        return "#FFC24B"    # fair - amber
     if r >= 50:
-        return "#fc8d59"
-    return "#d73027"
+        return "#FF9245"    # poor - orange
+    return "#FF5C6C"        # bad - red
 
 
 # ---------------------------------------------------------------------------
@@ -2285,36 +2289,254 @@ class Engine:
 
 
 # ---------------------------------------------------------------------------
-# HPE-inspired theme + Canvas charts (no external dependencies)
+# Design system: a "spatial" glass theme, drawn entirely on Tk Canvases
 # ---------------------------------------------------------------------------
-HPE_GREEN = "#01A982"     # HPE signature green
-HPE_GREEN_DK = "#017a5e"
-BG = "#1a1d21"            # app background (HPE dark neutral)
-PANEL = "#23272e"        # cards / chart panels
-PANEL_HI = "#2c313a"
-GRID = "#363b44"
-TXT = "#f2f4f5"
-TXT_DIM = "#9aa3ad"
-FONT = "Segoe UI"
+# Tk has no compositor: every widget is opaque, there is no alpha channel, no
+# backdrop blur and no anti-aliasing. Glassmorphism is therefore done here the
+# only way it can be - by ARITHMETIC. Each surface colour is alpha-composited
+# in Python against the one backdrop it will actually sit on, so "a 12% white
+# card over the base" is resolved to a literal hex string before Tk ever sees
+# it. Every frame in the app shares one flat backdrop (BG), which makes that
+# compositing exact rather than approximate.
+#
+# Depth then comes from the three things a real compositor would hand us:
+#   * soft shadows   - nested rounded rects fading out into the backdrop
+#   * specular edges - a 1 px light hairline along the lit (top) edge of a card
+#   * ambient glow   - radial washes bled behind accents and live chart lines
 
-# distinct, on-brand line colours per stream
+
+def _rgb(c):
+    """'#rrggbb' -> (r, g, b)."""
+    c = c.lstrip("#")
+    return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
+
+
+def _hexc(t):
+    """(r, g, b) -> '#rrggbb', clamped to the byte range."""
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in t)
+
+
+def _mix(c1, c2, t):
+    """Blend two colours: t=0 -> c1, t=1 -> c2."""
+    a, b = _rgb(c1), _rgb(c2)
+    return _hexc(tuple(a[i] + (b[i] - a[i]) * t for i in range(3)))
+
+
+def _over(fg, bg, alpha):
+    """Composite `fg` over opaque `bg` at `alpha`. This is the glass trick:
+    the caller states an intent ("white at 8%") and gets back the flat colour
+    Tk needs, already resolved against the surface underneath."""
+    return _mix(bg, fg, alpha)
+
+
+def _lighten(c, t):
+    return _mix(c, "#ffffff", t)
+
+
+def _darken(c, t):
+    return _mix(c, "#000000", t)
+
+
+# --- base ------------------------------------------------------------------
+HPE_GREEN = "#01A982"     # HPE signature green (brand constant)
+BG = "#080B12"            # deep space base - the backdrop everything sits on
+
+GLASS = "#A9C2FF"         # cool moonlight tint every glass surface is made of
+SPEC = "#FFFFFF"          # specular highlight source
+
+# The glass elevation ladder, stated as alpha over BG rather than as picked
+# hex values - the whole point is that a surface's colour is derived from how
+# much light it lets through, so the numbers below are the design decisions
+# and the hex strings are just what they compile to.
+PANEL_TOP = _over(GLASS, BG, 0.125)  # lit top edge of a card gradient
+PANEL_LO = _over(GLASS, BG, 0.045)   # shaded bottom edge of a card gradient
+GRID = _over(GLASS, BG, 0.155)       # card hairline border
+STROKE_HI = _over(SPEC, BG, 0.22)    # specular top hairline
+
+TXT = "#E9EEF7"
+TXT_DIM = "#8D9AB3"
+TXT_FAINT = "#5B6880"
+
+ACCENT = HPE_GREEN                   # brand green, used for chrome
+ACCENT_HI = "#2BE3B0"                # brighter green for glows and lit states
+ACCENT_2 = "#38BDF8"                 # cyan
+ACCENT_3 = "#8B7CFF"                 # violet
+WARN = "#FFC24B"
+DANGER = "#FF5C6C"
+
+RADIUS = 16               # standard card corner
+RADIUS_SM = 10            # chips, buttons, inner wells
+
+# The glass level a hosting card settles on. Widgets parked inside one (a
+# Treeview, a form) can only be a single flat colour, so the card and the ttk
+# theme have to agree on exactly which colour that is.
+CARD_LEVEL = 0.085
+CARD_SURFACE = _over(GLASS, BG, CARD_LEVEL)
+
+# Row accents for the tables. Full-strength ACCENT_HI on every clean row turns
+# a table into a wall of glowing green, so the "everything is fine" state is
+# deliberately the quiet one and only the exceptions are saturated.
+OK_SOFT = _mix(ACCENT_HI, TXT, 0.45)
+WARN_SOFT = _mix(WARN, TXT, 0.25)
+
+FONT = "Segoe UI"
+FONT_MONO = "Consolas"
+
+# Preferred UI faces, best first. Segoe UI Variable is the Windows 11 system
+# face; the rest are the sensible fallbacks on the platforms this also runs
+# on. _resolve_fonts() picks the first one actually installed.
+_FONT_STACK = ("Segoe UI Variable Text", "Segoe UI", "Inter", "SF Pro Text",
+               "Helvetica Neue", "DejaVu Sans")
+_MONO_STACK = ("Cascadia Mono", "Consolas", "SF Mono", "JetBrains Mono",
+               "DejaVu Sans Mono", "Courier New")
+_fonts_resolved = [False]
+
+
+def _resolve_fonts(root):
+    """Point FONT/FONT_MONO at the best face this machine actually has.
+
+    Tk silently substitutes an unknown family, which on a non-Windows box
+    turns the whole UI into the default bitmap face. Asking the font engine
+    once at startup keeps the type crisp everywhere the app runs."""
+    if _fonts_resolved[0]:
+        return
+    _fonts_resolved[0] = True
+    global FONT, FONT_MONO
+    try:
+        import tkinter.font as tkfont
+        have = {f.lower() for f in tkfont.families(root)}
+    except Exception:               # no font engine: keep the Windows default
+        return
+    for name in _FONT_STACK:
+        if name.lower() in have:
+            FONT = name
+            break
+    for name in _MONO_STACK:
+        if name.lower() in have:
+            FONT_MONO = name
+            break
+
+
 # Per-stream line colors; cycles when a port list grows past the palette
-# (1.8.0: up to 8 streams per protocol). The first four match the historic
-# 2 UDP + 2 TCP assignment so screenshots stay comparable across versions.
-STREAM_PALETTE = ("#01A982", "#FF8300", "#00B0E6", "#FEC901",
-                  "#C140FF", "#7ee2b8", "#ff7eb6", "#9aa3ad")
+# (1.8.0: up to 8 streams per protocol). The first four keep the historic
+# 2 UDP + 2 TCP hues - brightened for legibility against the dark glass, so
+# screenshots stay comparable across versions.
+STREAM_PALETTE = ("#00D89F", "#FF9F45", "#38BDF8", "#FFD84D",
+                  "#B08CFF", "#5EEAD4", "#FF8FC7", "#9AA7BE")
 
 
 def stream_color(sid):
     return STREAM_PALETTE[sid % len(STREAM_PALETTE)]
 
 
+# ---------------------------------------------------------------------------
+# Canvas primitives: rounded geometry, gradients, shadows, glass cards
+# ---------------------------------------------------------------------------
+def _rr_points(x0, y0, x1, y1, r):
+    """Control points for a corner-rounded rectangle drawn with
+    create_polygon(smooth=True). Doubling the corner points is what turns Tk's
+    spline into a clean quarter-round instead of a lozenge."""
+    r = max(0, min(r, (x1 - x0) / 2.0, (y1 - y0) / 2.0))
+    return (x0 + r, y0, x1 - r, y0, x1, y0, x1, y0 + r,
+            x1, y1 - r, x1, y1, x1 - r, y1, x0 + r, y1,
+            x0, y1, x0, y1 - r, x0, y0 + r, x0, y0)
 
-def _draw_ekg(canvas, color=HPE_GREEN, width=2):
-    """Draw a small ECG/EKG heartbeat trace (P-QRS-T) onto a Tk Canvas.
+
+def _round_rect(canvas, x0, y0, x1, y1, r=RADIUS, **kw):
+    """Filled and/or outlined rounded rectangle."""
+    kw.setdefault("outline", "")
+    return canvas.create_polygon(*_rr_points(x0, y0, x1, y1, r), smooth=True,
+                                 **kw)
+
+
+def _rr_inset(dy, h, r):
+    """Horizontal inset of a rounded rect's edge, `dy` px below its top."""
+    d = min(dy, h - dy)
+    if d >= r or r <= 0:
+        return 0.0
+    return r - math.sqrt(max(0.0, r * r - (r - d) * (r - d)))
+
+
+def _rr_gradient(canvas, x0, y0, x1, y1, r, top, bottom, step=2, tint=None,
+                 tint_alpha=0.18, tint_falloff=2.2, **kw):
+    """Vertical gradient clipped to a rounded rect.
+
+    Tk cannot clip, so the rounded silhouette is produced by shortening each
+    scanline by the corner inset - exact, and cheaper than any stencil. An
+    optional `tint` washes the lit top of the pane with an accent colour,
+    which is what sells the surface as translucent rather than merely dark;
+    because it rides on the scanlines it is clipped for free."""
+    h = max(1.0, y1 - y0)
+    step = max(1, int(step))
+    y = y0
+    while y < y1:
+        t = (y - y0) / h
+        ins = _rr_inset(y - y0, h, r)
+        col = _mix(top, bottom, t)
+        if tint:
+            col = _over(tint, col, tint_alpha * (1.0 - t) ** tint_falloff)
+        canvas.create_line(x0 + ins, y, x1 - ins, y, width=step + 1,
+                           fill=col, **kw)
+        y += step
+
+
+def _shadow(canvas, x0, y0, x1, y1, r=RADIUS, base=BG, spread=9, dy=4,
+            layers=6, strength=0.55):
+    """Soft drop shadow: concentric rounded rects fading into `base`.
+
+    Drawn outermost-first so each opaque ring covers the one before it - the
+    overlap is what makes the ramp read as a blur rather than as bands."""
+    for i in range(layers, 0, -1):
+        g = i / float(layers)                 # 1.0 = outermost, faintest
+        pad = spread * g
+        a = strength * 0.05 * (1.0 - g + 0.35)
+        _round_rect(canvas, x0 - pad, y0 - pad + dy * g, x1 + pad,
+                    y1 + pad + dy * g, r + pad,
+                    fill=_over("#000000", base, a))
+
+
+def _radial(canvas, cx, cy, rad, color, base, alpha=0.5, steps=16):
+    """A soft radial wash - the ambient light bleeding through the glass.
+
+    `base` must be the colour actually underneath, since the falloff is
+    composited against it rather than blended by a GPU."""
+    for i in range(steps, 0, -1):
+        g = i / float(steps)
+        a = alpha * (1.0 - g) ** 1.8
+        if a <= 0.002:
+            continue
+        rr = rad * g
+        canvas.create_oval(cx - rr, cy - rr, cx + rr, cy + rr,
+                           fill=_over(color, base, a), outline="")
+
+
+def _glass(canvas, x0, y0, x1, y1, r=RADIUS, base=BG, top=PANEL_TOP,
+           bottom=PANEL_LO, border=GRID, specular=True, shadow=True,
+           glow=None, glow_alpha=0.16, step=2):
+    """The house card: shadow, gradient glass body, hairline, specular edge.
+
+    Everything a compositor would do for a frosted pane, resolved to flat
+    colours: `glow` washes the lit top of the pane with an accent, `specular`
+    is the 1 px highlight where the light catches the top bevel."""
+    if shadow:
+        _shadow(canvas, x0, y0, x1, y1, r, base=base)
+    _rr_gradient(canvas, x0, y0, x1, y1, r, top, bottom, step=step,
+                 tint=glow, tint_alpha=glow_alpha)
+    if border:
+        _round_rect(canvas, x0, y0, x1, y1, r, fill="", outline=border,
+                    width=1)
+    if specular:
+        canvas.create_line(x0 + r * 0.75, y0 + 1, x1 - r * 0.75, y0 + 1,
+                           fill=STROKE_HI, width=1)
+
+
+def _draw_ekg(canvas, color=ACCENT_HI, width=2, glow=True, base=BG, dx=0, dy=0):
+    """Draw the ECG/EKG heartbeat trace (P-QRS-T) that is the app's mark.
 
     Coordinates are tuned for a ~52x34 canvas: flat baseline, small P bump, a
-    sharp QRS spike, then a T bump back to baseline.
+    sharp QRS spike, then a T bump back to baseline. The trace is stroked
+    twice - a wide dim pass for the glow, a crisp pass on top - which is how
+    every light source in this UI is faked.
     """
     pts = [
         (2, 18), (12, 18),          # baseline
@@ -2324,9 +2546,411 @@ def _draw_ekg(canvas, color=HPE_GREEN, width=2):
         (32, 18), (36, 11),         # back to baseline, T wave
         (40, 18), (51, 18),         # baseline out
     ]
-    flat = [c for xy in pts for c in xy]
+    flat = [c for xy in pts for c in (xy[0] + dx, xy[1] + dy)]
+    if glow:
+        for w, a in ((width + 6, 0.10), (width + 3, 0.20)):
+            canvas.create_line(*flat, fill=_over(color, base, a), width=w,
+                               capstyle="round", joinstyle="round")
     canvas.create_line(*flat, fill=color, width=width,
                        capstyle="round", joinstyle="round", smooth=False)
+
+
+def _draw_aurora(canvas, w, h, base=BG, blobs=None, seam=True):
+    """Ambient light behind a full-bleed band (the header, the launcher hero).
+
+    A Canvas clips to its own bounds, so the washes can run off the edges and
+    be cut cleanly - no masking needed. Blobs are placed apart because each is
+    composited against `base` rather than against whatever it overlaps."""
+    canvas.create_rectangle(0, 0, w, h, fill=base, outline="")
+    if blobs is None:
+        blobs = ((0.06, 0.05, 1.15, ACCENT, 0.30),
+                 (0.55, -0.35, 1.05, ACCENT_3, 0.17),
+                 (0.97, 0.85, 0.95, ACCENT_2, 0.16))
+    for fx, fy, frad, col, a in blobs:
+        _radial(canvas, fx * w, fy * h, frad * h, col, base, alpha=a, steps=15)
+    if seam:
+        # the light hairline where the band meets the content below
+        _draw_hairline(canvas, 0, h - 1, w, base=base)
+
+
+def _draw_hairline(canvas, x0, y, x1, base=BG, color=GLASS, alpha=0.16,
+                   segments=34):
+    """A 1 px rule that fades out at both ends - a spatial-UI staple, and the
+    only way an edge reads as soft when there is no alpha channel."""
+    span = max(1.0, x1 - x0)
+    for i in range(segments):
+        t = i / float(segments)
+        # bell-shaped falloff: full strength mid-span, nothing at the ends
+        a = alpha * math.sin(math.pi * t) ** 0.7
+        canvas.create_line(x0 + span * t, y, x0 + span * (t + 1.0 / segments), y,
+                           fill=_over(color, base, a), width=1)
+
+
+def _score_orb(canvas, cx, cy, rad, score, color, base=BG, caption=None):
+    """The headline health readout: a glowing arc gauge wrapped round the
+    score. The ring gives the bare number a scale to sit on, and the glow is
+    what makes the state readable across a demo room."""
+    dead = score is None
+    col = _over(GLASS, base, 0.30) if dead else color
+
+    if not dead:
+        # Kept inside ~1.35r: a wider bloom gets sliced by the canvas edge in
+        # a header band, and a clipped glow reads as a rendering seam.
+        _radial(canvas, cx, cy, rad * 1.35, col, base, alpha=0.40, steps=14)
+    # the glass disc the ring is inlaid into
+    _rr_gradient(canvas, cx - rad, cy - rad, cx + rad, cy + rad, rad,
+                 _over(GLASS, base, 0.17), _over(GLASS, base, 0.045), step=2)
+    canvas.create_oval(cx - rad, cy - rad, cx + rad, cy + rad, fill="",
+                       outline=_over(GLASS, base, 0.20), width=1)
+
+    ring = rad - 6
+    box = (cx - ring, cy - ring, cx + ring, cy + ring)
+    canvas.create_arc(*box, start=225, extent=-270, style="arc", width=5,
+                      outline=_over("#000000", _over(GLASS, base, 0.11), 0.45))
+    if not dead:
+        frac = max(0.0, min(1.0, score / 100.0))
+        ext = -270.0 * frac
+        if ext:
+            for wid, a in ((12, 0.20), (8, 0.38)):   # glow under the arc
+                canvas.create_arc(*box, start=225, extent=ext, style="arc",
+                                  width=wid,
+                                  outline=_over(col, _over(GLASS, base, 0.10), a))
+            canvas.create_arc(*box, start=225, extent=ext, style="arc",
+                              width=5, outline=col)
+    canvas.create_text(cx, cy - (2 if caption else 0), anchor="center",
+                       text=("--" if dead else f"{score:.0f}"),
+                       fill=(TXT_FAINT if dead else TXT),
+                       font=(FONT, max(14, int(rad * 0.62)), "bold"))
+    if caption:
+        canvas.create_text(cx, cy + rad * 0.52, anchor="center", text=caption,
+                           fill=TXT_FAINT, font=(FONT, 7, "bold"))
+
+
+def _metric_chip(canvas, x0, y0, x1, y1, label, value, color=None, base=BG):
+    """Small glass tile: a caption beside a number. Used for the UDP MOS /
+    TCP PQI pair in the header."""
+    _glass(canvas, x0, y0, x1, y1, r=RADIUS_SM, base=base,
+           top=_over(GLASS, base, 0.11), bottom=_over(GLASS, base, 0.05),
+           glow=color, glow_alpha=0.13, shadow=False)
+    canvas.create_text(x0 + 11, (y0 + y1) / 2.0, anchor="w", text=label,
+                       fill=TXT_FAINT, font=(FONT, 7, "bold"))
+    canvas.create_text(x1 - 11, (y0 + y1) / 2.0, anchor="e", text=value,
+                       fill=(color or TXT), font=(FONT, 13, "bold"))
+
+
+# ---------------------------------------------------------------------------
+# Glass widgets. Built lazily inside a function so that importing this module
+# never imports tkinter - the console UI has to keep working on a box with no
+# Tk installed at all.
+# ---------------------------------------------------------------------------
+_GLASS_WIDGETS = {}
+_GLOW_PAD = 5      # slack around a pill so its outer glow has room to render
+
+
+def _glass_widgets():
+    if _GLASS_WIDGETS:
+        return _GLASS_WIDGETS
+    import tkinter as tk
+
+    class GlassButton(tk.Canvas):
+        """A rounded glass pill that behaves like tk.Button.
+
+        Tk's own button cannot be rounded, tinted or lit, so it is rebuilt on
+        a Canvas. `configure`/`cget` still answer to `text` and `state`, so
+        existing callers drive it exactly like the stock widget."""
+
+        def __init__(self, parent, text="", command=None, primary=False,
+                     toggle=False, base=BG, height=30, pad_x=15, size=9,
+                     accent=ACCENT, min_width=0, check=False):
+            super().__init__(parent, bg=base, highlightthickness=0, bd=0,
+                             height=height + 2 * _GLOW_PAD, takefocus=0)
+            self._text, self._command = text, command
+            self._primary, self._toggle = primary, toggle
+            self._check = check          # draw a tick box left of the label
+            self._base, self._accent = base, accent
+            self._ph, self._pad_x, self._size = height, pad_x, size
+            self._min_w = min_width
+            self._hover = self._press = self._on = False
+            self._enabled = True
+            self._measure()
+            self.bind("<Enter>", self._enter)
+            self.bind("<Leave>", self._leave)
+            self.bind("<Button-1>", self._down)
+            self.bind("<ButtonRelease-1>", self._up)
+            self.bind("<Configure>", lambda _e: self._render())
+
+        # -- geometry -------------------------------------------------------
+        def _measure(self):
+            try:
+                import tkinter.font as tkfont
+                tw = tkfont.Font(root=self, family=FONT, size=self._size,
+                                 weight="bold").measure(self._text)
+            except Exception:                     # no font engine: estimate
+                tw = int(7.2 * len(self._text))
+            pill = max(self._min_w, tw + self._pad_x * 2
+                       + (22 if self._check else 0))
+            super().configure(width=pill + 2 * _GLOW_PAD)
+
+        # -- interaction ----------------------------------------------------
+        def _enter(self, _e=None):
+            if self._enabled:
+                self._hover = True
+                self.configure(cursor="hand2")
+                self._render()
+
+        def _leave(self, _e=None):
+            self._hover = self._press = False
+            self._render()
+
+        def _down(self, _e=None):
+            if self._enabled:
+                self._press = True
+                self._render()
+
+        def _up(self, _e=None):
+            was = self._press
+            self._press = False
+            self._render()
+            if was and self._enabled and self._command:
+                self._command()
+
+        # -- tk.Button-compatible surface -----------------------------------
+        def configure(self, cnf=None, **kw):
+            if isinstance(cnf, dict):
+                kw.update(cnf)
+            redraw = False
+            if "text" in kw:
+                self._text = kw.pop("text")
+                self._measure()
+                redraw = True
+            if "state" in kw:
+                self._enabled = str(kw.pop("state")) != "disabled"
+                self._hover = self._press = False
+                redraw = True
+            if "command" in kw:
+                self._command = kw.pop("command")
+            if "on" in kw:
+                self._on = bool(kw.pop("on"))
+                redraw = True
+            if kw:
+                super().configure(**kw)
+            if redraw:
+                self._render()
+
+        config = configure
+
+        def cget(self, key):
+            if key == "text":
+                return self._text
+            if key == "state":
+                return "normal" if self._enabled else "disabled"
+            if key == "on":
+                return self._on
+            return super().cget(key)
+
+        __getitem__ = cget
+
+        def set_on(self, on):
+            self.configure(on=on)
+
+        # -- paint ----------------------------------------------------------
+        def _render(self):
+            self.delete("all")
+            w = self.winfo_width() or self.winfo_reqwidth()
+            p, h = _GLOW_PAD, self._ph
+            x0, x1 = p, w - p
+            if x1 - x0 < 4:
+                return
+            r = min(RADIUS_SM, h / 2.0)
+            base, acc = self._base, self._accent
+            dy = 1 if self._press else 0
+            y0, y1 = p + dy, p + h + dy
+            lit = self._primary or self._on
+
+            if not self._enabled:
+                top, bot = _over(GLASS, base, 0.05), _over(GLASS, base, 0.035)
+                border, fg = _over(GLASS, base, 0.08), TXT_FAINT
+            elif self._primary:
+                top = _lighten(acc, 0.22 if self._hover else 0.10)
+                bot = _darken(acc, 0.20)
+                border, fg = _lighten(acc, 0.40), "#03130E"
+            elif self._on:
+                top = _over(acc, base, 0.34 if self._hover else 0.26)
+                bot = _over(acc, base, 0.14)
+                border, fg = _over(acc, base, 0.60), ACCENT_HI
+            else:
+                lvl = 0.135 if self._hover else 0.08
+                top, bot = _over(GLASS, base, lvl + 0.045), _over(GLASS, base, lvl)
+                border = _over(GLASS, base, 0.22 if self._hover else 0.14)
+                fg = TXT if self._hover else _mix(TXT, TXT_DIM, 0.45)
+
+            if self._enabled and (lit or self._hover):
+                gcol = acc if lit else GLASS
+                ga = 0.30 if lit else 0.13
+                for pad, mul in ((5.0, 0.30), (3.0, 0.55), (1.5, 0.9)):
+                    _round_rect(self, x0 - pad, y0 - pad, x1 + pad, y1 + pad,
+                                r + pad, fill=_over(gcol, base, ga * mul * 0.42))
+            _rr_gradient(self, x0, y0, x1, y1, r, top, bot, step=2)
+            _round_rect(self, x0, y0, x1, y1, r, fill="", outline=border,
+                        width=1)
+            if self._enabled and not self._press:
+                self.create_line(x0 + r * 0.8, y0 + 1, x1 - r * 0.8, y0 + 1,
+                                 fill=_over(SPEC, top,
+                                            0.30 if self._primary else 0.18),
+                                 width=1)
+            if self._check:
+                # A tick box inside the pill, so a boolean still reads as a
+                # boolean rather than as a button that happens to stay lit.
+                cy, bs = (y0 + y1) / 2.0, 6.5
+                bx = x0 + self._pad_x
+                _round_rect(self, bx - bs, cy - bs, bx + bs, cy + bs, 4,
+                            fill=(_over(acc, base, 0.55) if self._on
+                                  else _over("#000000", top, 0.34)),
+                            outline=(_lighten(acc, 0.3) if self._on
+                                     else _over(GLASS, top, 0.22)), width=1)
+                if self._on:
+                    self.create_line(bx - 3.4, cy + 0.2, bx - 0.8, cy + 3.0,
+                                     bx + 3.6, cy - 3.2, fill="#04140F",
+                                     width=2, capstyle="round",
+                                     joinstyle="round")
+                self.create_text(bx + bs + 9, cy, text=self._text, anchor="w",
+                                 fill=fg, font=(FONT, self._size, "bold"))
+            else:
+                self.create_text((x0 + x1) / 2.0, (y0 + y1) / 2.0,
+                                 text=self._text, fill=fg,
+                                 font=(FONT, self._size, "bold"))
+
+    class GlassCard(tk.Canvas):
+        """A rounded glass pane that hosts real widgets.
+
+        Tk widgets are opaque rectangles, so a table or a form can never have
+        a rounded edge of its own. Parking the child in a canvas window, inset
+        from the card silhouette, buys back the rounded glass frame while
+        leaving the child an ordinary widget."""
+
+        def __init__(self, parent, base=BG, padx=14, pady=12, r=RADIUS,
+                     glow=None, shadow=True, level=CARD_LEVEL, **kw):
+            super().__init__(parent, bg=base, highlightthickness=0, bd=0,
+                             height=60, **kw)
+            self._base, self._padx, self._pady = base, padx, pady
+            self._r, self._glow, self._shadow = r, glow, shadow
+            # A hosting card keeps a near-flat gradient: the child frame can
+            # only be one colour, so a strong ramp would show a seam at the
+            # inset edge. The specular hairline supplies the depth instead.
+            self._top = _over(GLASS, base, level + 0.022)
+            self._bot = _over(GLASS, base, level - 0.018)
+            self.surface = _over(GLASS, base, level)
+            self.body = tk.Frame(self, bg=self.surface)
+            self._win = None
+            self.body.bind("<Configure>", self._sync_size)
+            self.bind("<Configure>", self._repaint)
+
+        def _sync_size(self, _e=None):
+            """Track the hosted widget's natural size.
+
+            Hosting inverts Tk's usual sizing: the canvas would otherwise
+            report a stock 378x60 request and then FORCE the child down to
+            that, silently clipping a form instead of growing to hold it. So
+            the card asks for whatever the child asks for, plus its inset."""
+            chrome_h = 2 * self._pady + 2 * _GLOW_PAD
+            chrome_w = 2 * self._padx + 2 * _GLOW_PAD
+            need_h = self.body.winfo_reqheight() + chrome_h
+            need_w = self.body.winfo_reqwidth() + chrome_w
+            kw = {}
+            if abs(need_h - self.winfo_reqheight()) > 1:
+                kw["height"] = need_h
+            if abs(need_w - self.winfo_reqwidth()) > 1:
+                kw["width"] = need_w
+            if kw:
+                super().configure(**kw)
+
+        def _repaint(self, _e=None):
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 20 or h < 20:
+                return
+            self.delete("all")            # window items survive: only unmapped
+            m = _GLOW_PAD
+            _glass(self, m, m, w - m, h - m, r=self._r, base=self._base,
+                   top=self._top, bottom=self._bot, glow=self._glow,
+                   glow_alpha=0.09, shadow=self._shadow, step=2)
+            self._win = self.create_window(m + self._padx, m + self._pady,
+                                           window=self.body, anchor="nw",
+                                           width=max(10, w - 2 * (m + self._padx)))
+
+    _GLASS_WIDGETS.update(button=GlassButton, card=GlassCard)
+    return _GLASS_WIDGETS
+
+
+def _style_tables(ttk, tk):
+    """Dress ttk's Treeview to match the glass cards it gets hosted in.
+
+    The row background has to be exactly CARD_SURFACE: the table is an opaque
+    widget sitting inside the card's inset, so any drift shows up as a visible
+    panel-within-a-panel."""
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure("NQ.Treeview", background=CARD_SURFACE,
+                    fieldbackground=CARD_SURFACE, foreground=TXT, rowheight=30,
+                    font=(FONT, 10), borderwidth=0, relief="flat")
+    style.configure("NQ.Treeview.Heading", background=CARD_SURFACE,
+                    foreground=TXT_DIM, font=(FONT, 8, "bold"),
+                    relief="flat", borderwidth=0, padding=(4, 6))
+    style.map("NQ.Treeview.Heading",
+              background=[("active", _over(GLASS, BG, CARD_LEVEL + 0.05))],
+              foreground=[("active", TXT_DIM)])
+    style.map("NQ.Treeview",
+              background=[("selected", _over(ACCENT, CARD_SURFACE, 0.30))],
+              foreground=[("selected", TXT)])
+    style.layout("NQ.Treeview", [("NQ.Treeview.treearea", {"sticky": "nswe"})])
+
+
+def _glass_entry(tk, parent, var, width, surface, justify="left", size=10):
+    """A text field that reads as a well cut into the glass rather than a box
+    sitting on it: recessed fill, hairline border, accent focus ring."""
+    e = tk.Entry(parent, textvariable=var, width=width,
+                 bg=_over("#000000", surface, 0.28), fg=TXT,
+                 insertbackground=ACCENT_HI, relief="flat", bd=0,
+                 highlightthickness=1,
+                 highlightbackground=_over(GLASS, surface, 0.16),
+                 highlightcolor=ACCENT, font=(FONT, size), justify=justify,
+                 disabledbackground=_over("#000000", surface, 0.16),
+                 disabledforeground=TXT_FAINT,
+                 selectbackground=_over(ACCENT, surface, 0.40),
+                 selectforeground=TXT)
+    return e
+
+
+def _flow_layout(container, widgets, gap_x=3, gap_y=4):
+    """Left-to-right flow that wraps onto further rows as the window narrows.
+
+    Tk has no wrapping container, and a toolbar of nine buttons has to survive
+    a 480 px window - which is why the old header had to hand-juggle its
+    button bar between two rows."""
+    state = {"h": -1}
+
+    def relayout(_e=None):
+        w = container.winfo_width()
+        if w <= 1:
+            return
+        x = y = rowh = 0
+        for wd in widgets:
+            ww, wh = wd.winfo_reqwidth(), wd.winfo_reqheight()
+            if x and x + ww > w:
+                x, y, rowh = 0, y + rowh + gap_y, 0
+            wd.place(x=x, y=y)
+            x += ww + gap_x
+            rowh = max(rowh, wh)
+        need = y + rowh
+        if need != state["h"]:
+            state["h"] = need
+            container.configure(height=need)
+
+    container.bind("<Configure>", relayout)
+    container.after(0, relayout)
+    return relayout
 
 
 def _nice_ceiling(v):
@@ -2341,13 +2965,23 @@ def _nice_ceiling(v):
     return 10 * base
 
 
-BAND_FILL = "#3a6f7d"   # percentile band (stippled -> reads as translucent)
+BAND_FILL = "#4FB3C9"   # percentile band, composited against the card
+
+
+def _chart_geom(w, h):
+    """Padding for a chart of this size. Small multiples get tighter margins
+    so the plot area itself never collapses to a sliver."""
+    tight = h < 230
+    return {"l": 52 if tight else 60, "r": 16 if tight else 22,
+            "t": 44 if tight else 52, "b": 26 if tight else 30,
+            "tight": tight}
 
 
 def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
                 ymin_floor=1.0, unit="", value_fmt=None, band=None,
-                band_label=None, markers=None, mark_labels=False):
-    """Render one time-series chart onto a Tk Canvas.
+                band_label=None, markers=None, mark_labels=False,
+                accent=None, base=BG):
+    """Render one time-series chart as a floating glass card.
 
     series: list of (sid, color, short_label). samples_by_sid: {sid: [sample]}.
     Each sample is {'t', key..., 'up'}; None values break the line (gap = down).
@@ -2355,6 +2989,9 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
     series lines (None/down samples break it), labeled `band_label`.
     markers: optional [(t_mono, label)] scenario stage boundaries, drawn as
     dashed verticals (labels only when mark_labels, to keep small charts clean).
+
+    The canvas paints its own card, so its widget background is the app base
+    and the rounded corners resolve against it.
     """
     if value_fmt is None:
         value_fmt = lambda v: f"{v:.0f}"
@@ -2362,17 +2999,56 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
     h = canvas.winfo_height()
     if w < 30 or h < 30:
         return
-    canvas.delete("all")
-    canvas.create_rectangle(0, 0, w, h, fill=PANEL, outline=GRID)
-    pad_l, pad_r, pad_t, pad_b = 46, 12, 30, 20
-    pw, ph = w - pad_l - pad_r, h - pad_t - pad_b
-    if pw < 10 or ph < 10:
-        return
-    title_id = canvas.create_text(12, 15, text=title, anchor="w", fill=TXT,
-                                  font=(FONT, 10, "bold"))
-    legend_x0 = canvas.bbox(title_id)[2] + 18  # start legend after the title
 
-    # autoscale Y
+    # The card and the plot well are pure functions of the canvas size, and
+    # they are by far the most expensive things here - a gradient is one line
+    # item per scanline. So they are painted once per resize and left alone,
+    # and only the data is torn down on each tick. That keeps a 2 Hz refresh
+    # roughly as cheap as the flat-rectangle version it replaces.
+    m = 4                                   # slack for the drop shadow
+    cx0, cy0, cx1, cy1 = m, m, w - m, h - m
+    accent = accent or (series[0][1] if series else ACCENT)
+    surface = _mix(PANEL_TOP, PANEL_LO, 0.45)   # mean card tone, for blending
+    g = _chart_geom(w, h)
+    pad_l, pad_r = cx0 + g["l"], cx1 - g["r"]
+    pad_t, pad_b = cy0 + g["t"], cy1 - g["b"]
+    pw, ph = pad_r - pad_l, pad_b - pad_t
+    if pw < 24 or ph < 24:
+        return
+    well = _over("#000000", surface, 0.30)   # what the plot content sits on
+
+    chrome_key = (w, h, accent)
+    if getattr(canvas, "_nq_chrome", None) != chrome_key:
+        canvas.delete("all")
+        _glass(canvas, cx0, cy0, cx1, cy1, r=RADIUS, base=base, glow=accent,
+               glow_alpha=0.13, step=2)
+        # The plot sits BELOW the glass rather than on it: a dark inset well
+        # with its own top shadow, so the data reads as being seen through
+        # the pane instead of printed on it.
+        wx0, wy0 = pad_l - 9, pad_t - 9
+        wx1, wy1 = pad_r + 10, pad_b + 9
+        _rr_gradient(canvas, wx0, wy0, wx1, wy1, RADIUS_SM,
+                     _over("#000000", surface, 0.38),
+                     _over("#000000", surface, 0.20), step=2)
+        canvas.create_line(wx0 + 8, wy0 + 1, wx1 - 8, wy0 + 1,
+                           fill=_over("#000000", surface, 0.52), width=1)
+        canvas._nq_chrome = chrome_key
+        # Everything drawn from here on is data. Canvas ids only ever climb,
+        # so remembering the last chrome id is enough to sweep the data away
+        # on the next tick without tagging every single item.
+        canvas._nq_static = max(canvas.find_all() or [0])
+    else:
+        stale = [i for i in canvas.find_all() if i > canvas._nq_static]
+        if stale:
+            canvas.delete(*stale)
+
+    # ---- title + legend ---------------------------------------------------
+    tsize = 9 if g["tight"] else 10
+    title_id = canvas.create_text(cx0 + 18, cy0 + 21, text=title, anchor="w",
+                                  fill=TXT, font=(FONT, tsize, "bold"))
+    legend_x0 = canvas.bbox(title_id)[2] + 16
+
+    # ---- autoscale --------------------------------------------------------
     vmax = ymin_floor
     for sid, _c, _n in series:
         for s in samples_by_sid.get(sid, ()):
@@ -2385,13 +3061,6 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
                 vmax = max(vmax, s["hi"])
     vmax = _nice_ceiling(vmax)
 
-    # horizontal gridlines + Y labels
-    for i in range(5):
-        yy = pad_t + ph * i / 4.0
-        canvas.create_line(pad_l, yy, w - pad_r, yy, fill=GRID)
-        canvas.create_text(pad_l - 5, yy, text=value_fmt(vmax * (1 - i / 4.0)),
-                           anchor="e", fill=TXT_DIM, font=(FONT, 7))
-
     t0 = now - view_seconds
 
     def X(t):
@@ -2400,7 +3069,32 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
     def Y(v):
         return pad_t + ph * (1 - min(1.0, max(0.0, v) / vmax))
 
-    # percentile band (behind the series lines; gaps where the link was down)
+    # ---- grid + Y labels --------------------------------------------------
+    # Pick a row count whose labels are all distinct under this formatter: a
+    # 2-unit axis divided four ways used to print "2 2 1 0 0", which reads as
+    # a rendering bug rather than as a scale.
+    for rows in ((4, 2) if not g["tight"] else (3, 2)):
+        labels = [value_fmt(vmax * (1 - i / float(rows)))
+                  for i in range(rows + 1)]
+        if len(set(labels)) == len(labels):
+            break
+    for i, lbl in enumerate(labels):
+        yy = pad_t + ph * i / float(rows)
+        canvas.create_line(pad_l, yy, pad_r, yy,
+                           fill=_over(GLASS, well, 0.10 if i else 0.16),
+                           dash=(1, 3) if i else None)
+        canvas.create_text(pad_l - 15, yy, text=lbl, anchor="e",
+                           fill=TXT_FAINT, font=(FONT, 7))
+
+    # ---- X axis time labels ----------------------------------------------
+    for frac, lbl in ((0.0, f"-{int(view_seconds)}s"),
+                      (0.5, f"-{int(view_seconds / 2)}s"), (1.0, "now")):
+        canvas.create_text(pad_l + pw * frac, pad_b + 15, text=lbl,
+                           anchor="center", fill=TXT_FAINT, font=(FONT, 7))
+
+    # ---- percentile band --------------------------------------------------
+    # A flat composited colour instead of the old 50% stipple: we know exactly
+    # what is underneath, so the blend is smooth where the dither was coarse.
     if band:
         runs, cur = [], []
         for s in band:
@@ -2415,9 +3109,11 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
             cur.append((s["t"], lo, hi))
         if cur:
             runs.append(cur)
+        fill = _over(BAND_FILL, well, 0.26)
+        edge = _over(BAND_FILL, well, 0.44)
         for run in runs:
-            # Decimate long runs: stippled polygons are the priciest thing on
-            # these canvases and ~200 vertices per edge is visually identical.
+            # Decimate long runs: ~200 vertices per edge is visually identical
+            # and keeps the polygon cheap on a 2 Hz redraw.
             step = max(1, len(run) // 200)
             pts = run[::step]
             if pts[-1] is not run[-1]:
@@ -2426,62 +3122,124 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
                 continue
             top = [c for tt, lo, hi in pts for c in (X(tt), Y(hi))]
             bot = [c for tt, lo, hi in reversed(pts) for c in (X(tt), Y(lo))]
-            canvas.create_polygon(*top, *bot, fill=BAND_FILL, outline="",
-                                  stipple="gray50")
+            canvas.create_polygon(*top, *bot, fill=fill, outline="")
+            canvas.create_line(*top, fill=edge, width=1)
 
-    # X axis time labels
-    for frac, lbl in ((0.0, f"-{int(view_seconds)}s"),
-                      (0.5, f"-{int(view_seconds / 2)}s"), (1.0, "now")):
-        canvas.create_text(pad_l + pw * frac, h - 8, text=lbl, anchor="center",
-                           fill=TXT_DIM, font=(FONT, 7))
-
-    # scenario stage markers (behind the series lines)
+    # ---- scenario stage markers (behind the series lines) -----------------
     if markers:
         for mt, mlabel in markers:
             if mt < t0 or mt > now:
                 continue
             mx = X(mt)
-            canvas.create_line(mx, pad_t, mx, pad_t + ph, fill="#5a6270",
-                               dash=(3, 3))
+            canvas.create_line(mx, pad_t, mx, pad_b,
+                               fill=_over(ACCENT_3, well, 0.55), dash=(2, 4))
             if mark_labels and mlabel:
-                canvas.create_text(min(mx + 3, w - pad_r - 4), pad_t + 8,
-                                   text=mlabel, anchor="w", fill=TXT_DIM,
-                                   font=(FONT, 7))
+                lx2 = min(mx + 5, pad_r - 4)
+                lid = canvas.create_text(lx2 + 6, pad_t + 9, text=mlabel,
+                                         anchor="w", fill=_lighten(ACCENT_3, 0.3),
+                                         font=(FONT, 7, "bold"))
+                bx = canvas.bbox(lid)
+                _round_rect(canvas, bx[0] - 5, bx[1] - 3, bx[2] + 5, bx[3] + 3,
+                            6, fill=_over(ACCENT_3, well, 0.16))
+                canvas.tag_raise(lid)
 
-    # series polylines (break on None = stream down)
+    # ---- series -----------------------------------------------------------
+    # Each line is stroked more than once: wide dim halos underneath, then the
+    # crisp stroke. That is the glow, and it is also what keeps a 2 px line
+    # legible on top of the band without anti-aliasing to help.
+    #
+    # The halos are decimated and the crisp stroke is not. Every coordinate
+    # costs a float->string conversion on the way into Tcl, and a 5-minute
+    # history at 2 Hz is 600 points per series; spending that three times over
+    # is what turns a redraw sluggish. A blur cannot show the difference, but
+    # a dropped latency spike in the real line certainly would.
+    halos = ((6, 0.10), (4, 0.20)) if not g["tight"] else ((4, 0.18),)
+    fill_area = len(series) <= 2
+
+    def _thin(flat, keep):
+        """Subsample a flat [x0,y0,x1,y1,...] polyline to ~`keep` vertices,
+        always retaining the last point so the line still ends where the data
+        does."""
+        n = len(flat) // 2
+        step = max(1, n // max(2, keep))
+        if step == 1:
+            return flat
+        out = [c for i in range(0, n, step) for c in flat[i * 2:i * 2 + 2]]
+        if out[-2:] != flat[-2:]:
+            out.extend(flat[-2:])
+        return out
+
     for sid, color, _n in series:
-        pts = []
+        runs, pts = [], []
         for s in samples_by_sid.get(sid, ()):
             if s["t"] < t0:
                 continue
             v = s.get(key)
             if v is None:
                 if len(pts) >= 4:
-                    canvas.create_line(*pts, fill=color, width=2)
+                    runs.append(pts)
                 pts = []
                 continue
             pts.extend((X(s["t"]), Y(v)))
         if len(pts) >= 4:
-            canvas.create_line(*pts, fill=color, width=2)
+            runs.append(pts)
+        for run in runs:
+            if fill_area:
+                # gradient wash under the line, clipped by the polygon itself
+                poly = list(run) + [run[-2], pad_b, run[0], pad_b]
+                canvas.create_polygon(*poly, fill=_over(color, well, 0.13),
+                                      outline="")
+            halo_pts = _thin(run, int(pw / 6))
+            for wid, a in halos:
+                canvas.create_line(*halo_pts, fill=_over(color, well, a),
+                                   width=wid, capstyle="round",
+                                   joinstyle="round")
+            canvas.create_line(*run, fill=color, width=2, capstyle="round",
+                               joinstyle="round")
+        if runs:                       # live head: a lit dot at the last point
+            hx, hy = runs[-1][-2], runs[-1][-1]
+            if hx >= pad_r - 3:        # only when the series is actually current
+                _radial(canvas, hx, hy, 9, color, well, alpha=0.55, steps=7)
+                canvas.create_oval(hx - 2.6, hy - 2.6, hx + 2.6, hy + 2.6,
+                                   fill=color, outline=_lighten(color, 0.55))
 
-    # legend with current values
+    # ---- legend chips -----------------------------------------------------
     lx = legend_x0
+    ly = cy0 + 21
     for sid, color, label in series:
         cur = None
         for s in reversed(samples_by_sid.get(sid, ())):
             if s.get(key) is not None:
                 cur = s.get(key)
                 break
-        canvas.create_rectangle(lx, 11, lx + 9, 19, fill=color, outline="")
-        txt = f"{label} {value_fmt(cur)}{unit}" if cur is not None else f"{label} -"
-        tid = canvas.create_text(lx + 13, 15, text=txt, anchor="w",
+        txt = f"{value_fmt(cur)}{unit}" if cur is not None else "-"
+        lid = canvas.create_text(lx + 16, ly, anchor="w", font=(FONT, 8),
+                                 fill=TXT_DIM, text=f"{label}  ")
+        vid = canvas.create_text(canvas.bbox(lid)[2] - 2, ly, anchor="w",
+                                 font=(FONT, 8, "bold"),
+                                 fill=(TXT if cur is not None else TXT_FAINT),
+                                 text=txt)
+        right = canvas.bbox(vid)[2]
+        if right > cx1 - 14:                 # ran out of room: drop the rest
+            canvas.delete(lid)
+            canvas.delete(vid)
+            break
+        _round_rect(canvas, lx - 5, ly - 10, right + 6, ly + 10, 9,
+                    fill=_over(GLASS, surface, 0.07))
+        canvas.create_line(lx + 4, ly - 4.5, lx + 4, ly + 4.5, fill=color,
+                           width=3, capstyle="round")
+        canvas.tag_raise(lid)
+        canvas.tag_raise(vid)
+        lx = right + 18
+    if band and band_label and lx < cx1 - 90:
+        bid = canvas.create_text(lx + 16, ly, anchor="w", text=band_label,
                                  fill=TXT_DIM, font=(FONT, 8))
-        lx = canvas.bbox(tid)[2] + 12
-    if band and band_label:
-        canvas.create_rectangle(lx, 11, lx + 9, 19, fill=BAND_FILL, outline="",
-                                stipple="gray50")
-        canvas.create_text(lx + 13, 15, text=band_label, anchor="w",
-                           fill=TXT_DIM, font=(FONT, 8))
+        _round_rect(canvas, lx - 5, ly - 10, canvas.bbox(bid)[2] + 6, ly + 10,
+                    9, fill=_over(GLASS, surface, 0.07))
+        canvas.create_line(lx + 4, ly - 4.5, lx + 4, ly + 4.5,
+                           fill=_over(BAND_FILL, surface, 0.7), width=3,
+                           capstyle="round")
+        canvas.tag_raise(bid)
 
 
 # ---------------------------------------------------------------------------
@@ -2514,174 +3272,135 @@ def run_gui(engine, args):
               for sid, proto, port, name in STREAMS]
 
     root = tk.Tk()
+    _resolve_fonts(root)
     _set_window_icon(root)
     root.title(f"Network Vitals {__version__}  -  peer {args.peer}")
-    root.geometry("1000x600")
-    root.minsize(480, 320)
+    root.geometry("1180x760")
+    root.minsize(480, 340)
     root.configure(bg=BG)
 
-    # ---- ttk dark theme ---------------------------------------------------
-    style = ttk.Style()
-    try:
-        style.theme_use("clam")
-    except tk.TclError:
-        pass
-    style.configure("NQ.Treeview", background=PANEL, fieldbackground=PANEL,
-                    foreground=TXT, rowheight=30, font=(FONT, 10), borderwidth=0)
-    style.configure("NQ.Treeview.Heading", background=PANEL_HI, foreground=HPE_GREEN,
-                    font=(FONT, 9, "bold"), relief="flat", borderwidth=0)
-    style.map("NQ.Treeview.Heading", background=[("active", PANEL_HI)])
-    style.map("NQ.Treeview", background=[("selected", HPE_GREEN_DK)],
-              foreground=[("selected", "white")])
+    _style_tables(ttk, tk)
 
-    # ---- header bar -------------------------------------------------------
-    # row1 carries the branding and the score cluster; the button bar joins
-    # row1 when the window is wide and drops to its own row underneath when
-    # it is not, so the buttons can never sit on top of the health readout.
-    header = tk.Frame(root, bg=BG, padx=14, pady=10)
-    header.pack(fill="x", side="top")
-    row1 = tk.Frame(header, bg=BG)
-    row1.pack(fill="x", side="top")
+    # ---- hero band --------------------------------------------------------
+    # Everything in the band is drawn as Canvas items rather than assembled
+    # from widgets: a Tk widget is an opaque rectangle, so a Label parked on
+    # the ambient gradient would punch a flat hole in it. Drawing instead
+    # means the brand, the readouts and the light all composite properly, and
+    # the band can re-lay itself out at any width in one pass.
+    HERO_H = 108
+    hero = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0, height=HERO_H)
+    hero.pack(fill="x", side="top")
+    hero_state = {"score": None, "label": "Starting…", "sub": "", "detail": "",
+                  "mos": None, "pqi": None, "mos_c": None, "pqi_c": None}
 
-    # EKG/heartbeat glyph (vector, drawn on a canvas)
-    ekg = tk.Canvas(row1, width=54, height=34, bg=BG, highlightthickness=0)
-    ekg.pack(side="left", padx=(0, 10))
-    _draw_ekg(ekg)
+    def paint_hero(_event=None):
+        w = hero.winfo_width()
+        if w < 10:
+            return
+        h = HERO_H
+        hero.delete("all")
+        _draw_aurora(hero, w, h)
 
-    # packed AFTER the stats cluster below: pack grants space in packing
-    # order, so the brand title truncates before the score cluster clips
-    title_lbl = tk.Label(row1, text="Network Vitals", fg=TXT, bg=BG,
-                         font=(FONT, 17, "bold"), anchor="w")
+        # brand lockup
+        _draw_ekg(hero, dx=20, dy=h / 2 - 24, width=2)
+        hero.create_text(84, h / 2 - 12, anchor="w", text="Network Vitals",
+                         fill=TXT, font=(FONT, 19, "bold"))
+        hero.create_text(85, h / 2 + 12, anchor="w",
+                         text=hero_state["sub"] or f"peer {args.peer}",
+                         fill=TXT_DIM, font=(FONT, 9))
 
-    btnbar = tk.Frame(header, bg=BG)  # placed by _reflow_header below
+        # Right-hand readout cluster, laid out right to left so the orb - the
+        # one thing worth seeing from the back of a room - always owns the
+        # corner, and the softer readouts drop off as the window narrows.
+        score = hero_state["score"]
+        col = score_color(score) if score is not None else TXT_DIM
+        rad = 38
+        cx = w - 22 - rad
+        _score_orb(hero, cx, h / 2, rad, score, col, base=BG)
+        x = cx - rad - 22
+
+        if w >= 640:                      # experience text block
+            left = x
+            for dy, text, fill, font in (
+                    (-24, "EXPERIENCE", TXT_FAINT, (FONT, 7, "bold")),
+                    (-4, hero_state["label"], TXT, (FONT, 17, "bold")),
+                    (18, hero_state["detail"], TXT_DIM, (FONT, 9))):
+                tid = hero.create_text(x, h / 2 + dy, anchor="e", text=text,
+                                       fill=fill, font=font)
+                left = min(left, hero.bbox(tid)[0])
+            x = left - 20
+
+        if w >= 940:                      # metric chips: first to go
+            cw, ch = 122, 32
+            _metric_chip(hero, x - cw, h / 2 - ch - 3, x, h / 2 - 3,
+                         "UDP MOS", hero_state["mos"] or "--",
+                         hero_state["mos_c"] or TXT_FAINT)
+            _metric_chip(hero, x - cw, h / 2 + 3, x, h / 2 + ch + 3,
+                         "TCP PQI", hero_state["pqi"] or "--",
+                         hero_state["pqi_c"] or TXT_FAINT)
+
+    hero.bind("<Configure>", paint_hero)
+
+    # ---- toolbar ----------------------------------------------------------
+    # Its own row, always: the old header shuffled the buttons in and out of
+    # the brand row to stop them landing on the score readout. A wrapping flow
+    # makes that dance unnecessary and survives narrower windows than it did.
+    GlassButton = _glass_widgets()["button"]
+    toolbar = tk.Frame(root, bg=BG, height=40)
+    toolbar.pack(fill="x", side="top", padx=14, pady=(2, 8))
+    toolbar.pack_propagate(False)
 
     def do_reset():
         engine.reset()  # charts + stats clear; they repopulate on the next tick
 
-    reset_btn = tk.Button(btnbar, text="↺  Reset / Clear", command=do_reset,
-                          bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
-                          activeforeground="white", relief="flat", bd=0,
-                          highlightthickness=0, padx=12, pady=5,
-                          font=(FONT, 9, "bold"), cursor="hand2")
-    reset_btn.pack(side="left", padx=(0, 6))
+    reset_btn = GlassButton(toolbar, text="↺  Reset", command=do_reset)
+
+    def _panel_toggle(state, frame, btn, on_show=None):
+        """One collapsible bottom panel. The whole FRAME is packed/unpacked,
+        not just its contents: an emptied but still-packed frame keeps its
+        last requested size, which is what used to leave the charts squeezed
+        after a table was closed."""
+        def toggle():
+            state["on"] = not state["on"]
+            if state["on"]:
+                frame.pack(fill="x", side="bottom", before=charts,
+                           padx=12, pady=(0, 6))
+                btn.set_on(True)
+                if on_show:
+                    on_show()
+            else:
+                frame.pack_forget()
+                btn.set_on(False)
+        return toggle
 
     totals_shown = {"on": False}
-
-    def do_toggle_totals():
-        # Toggle the whole FRAME, not the tree inside it: an emptied,
-        # still-packed frame keeps its last requested size, which is what
-        # used to leave the bottom charts squeezed after closing the table.
-        totals_shown["on"] = not totals_shown["on"]
-        if totals_shown["on"]:
-            totals_frame.pack(fill="x", side="bottom", before=charts)
-            totals_btn.configure(text="▴  Totals")
-        else:
-            totals_frame.pack_forget()
-            totals_btn.configure(text="▾  Totals")
-
-    totals_btn = tk.Button(btnbar, text="▾  Totals", command=do_toggle_totals,
-                           bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
-                           activeforeground="white", relief="flat", bd=0,
-                           highlightthickness=0, padx=12, pady=5,
-                           font=(FONT, 9, "bold"), cursor="hand2")
-    totals_btn.pack(side="left", padx=(0, 6))
-
     isolate_shown = {"on": False}
-
-    def do_toggle_isolate():
-        isolate_shown["on"] = not isolate_shown["on"]
-        if isolate_shown["on"]:
-            iso_frame.pack(fill="x", side="bottom", before=charts)
-            isolate_btn.configure(text="▴  Isolate")
-        else:
-            iso_frame.pack_forget()
-            isolate_btn.configure(text="⇄  Isolate")
-
-    isolate_btn = tk.Button(btnbar, text="⇄  Isolate", command=do_toggle_isolate,
-                            bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
-                            activeforeground="white", relief="flat", bd=0,
-                            highlightthickness=0, padx=12, pady=5,
-                            font=(FONT, 9, "bold"), cursor="hand2")
-    isolate_btn.pack(side="left", padx=(0, 6))
-
     anatomy_shown = {"on": False}
-
-    def do_toggle_anatomy():
-        anatomy_shown["on"] = not anatomy_shown["on"]
-        if anatomy_shown["on"]:
-            anat_frame.pack(fill="x", side="bottom", before=charts)
-            anatomy_btn.configure(text="▴  Anatomy")
-            draw_anatomy()
-        else:
-            anat_frame.pack_forget()
-            anatomy_btn.configure(text="▦  Anatomy")
-
-    anatomy_btn = tk.Button(btnbar, text="▦  Anatomy", command=do_toggle_anatomy,
-                            bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
-                            activeforeground="white", relief="flat", bd=0,
-                            highlightthickness=0, padx=12, pady=5,
-                            font=(FONT, 9, "bold"), cursor="hand2")
-    anatomy_btn.pack(side="left", padx=(0, 6))
-
     topo_shown = {"on": False}
-
-    def do_toggle_topo():
-        topo_shown["on"] = not topo_shown["on"]
-        if topo_shown["on"]:
-            topo_frame.pack(fill="x", side="bottom", before=charts)
-            topo_btn.configure(text="▴  Topology")
-        else:
-            topo_frame.pack_forget()
-            topo_btn.configure(text="≣  Topology")
-
-    topo_btn = tk.Button(btnbar, text="≣  Topology", command=do_toggle_topo,
-                         bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
-                         activeforeground="white", relief="flat", bd=0,
-                         highlightthickness=0, padx=12, pady=5,
-                         font=(FONT, 9, "bold"), cursor="hand2")
-    topo_btn.pack(side="left", padx=(0, 6))
-
     load_shown = {"on": False}
 
-    def do_toggle_load():
-        load_shown["on"] = not load_shown["on"]
-        if load_shown["on"]:
-            load_frame.pack(fill="x", side="bottom", before=charts)
-            load_btn.configure(text="▴  Load")
-        else:
-            load_frame.pack_forget()
-            load_btn.configure(text="⚡  Load")
-
-    load_btn = tk.Button(btnbar, text="⚡  Load", command=do_toggle_load,
-                         bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
-                         activeforeground="white", relief="flat", bd=0,
-                         highlightthickness=0, padx=12, pady=5,
-                         font=(FONT, 9, "bold"), cursor="hand2")
-    load_btn.pack(side="left", padx=(0, 6))
+    totals_btn = GlassButton(toolbar, text="▤  Totals", toggle=True)
+    isolate_btn = GlassButton(toolbar, text="⇄  Isolate", toggle=True)
+    anatomy_btn = GlassButton(toolbar, text="▦  Anatomy", toggle=True)
+    topo_btn = GlassButton(toolbar, text="≣  Topology", toggle=True)
+    load_btn = GlassButton(toolbar, text="⚡  Load", toggle=True)
 
     def do_fit_charts():
-        """Collapse the bottom tables and force a fresh geometry pass so the
+        """Collapse the bottom panels and force a fresh geometry pass so the
         charts reclaim the full current window space."""
-        if totals_shown["on"]:
-            do_toggle_totals()
-        if isolate_shown["on"]:
-            do_toggle_isolate()
-        if anatomy_shown["on"]:
-            do_toggle_anatomy()
-        if topo_shown["on"]:
-            do_toggle_topo()
-        if load_shown["on"]:
-            do_toggle_load()
+        for st, btn in ((totals_shown, totals_btn), (isolate_shown, isolate_btn),
+                        (anatomy_shown, anatomy_btn), (topo_shown, topo_btn),
+                        (load_shown, load_btn)):
+            if st["on"]:
+                st["on"] = False
+                btn.set_on(False)
+        for f in (totals_frame, iso_frame, anat_frame, topo_frame, load_frame):
+            f.pack_forget()
         for c in (lat_canvas, loss_canvas, jit_canvas, owd_canvas):
             c.configure(width=100, height=80)
         root.update_idletasks()
 
-    fit_btn = tk.Button(btnbar, text="⤢  Fit charts", command=do_fit_charts,
-                        bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
-                        activeforeground="white", relief="flat", bd=0,
-                        highlightthickness=0, padx=12, pady=5,
-                        font=(FONT, 9, "bold"), cursor="hand2")
-    fit_btn.pack(side="left")
+    fit_btn = GlassButton(toolbar, text="⤢  Fit charts", command=do_fit_charts)
 
     def do_report():
         # The demo's leave-behind: a JSON + self-contained HTML pair.
@@ -2695,108 +3414,42 @@ def run_gui(engine, args):
         messagebox.showinfo("Network Vitals",
                             f"Report written:\n{hp}\n{jp}", parent=root)
 
-    rep_btn = tk.Button(btnbar, text="⭳  Report", command=do_report,
-                        bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
-                        activeforeground="white", relief="flat", bd=0,
-                        highlightthickness=0, padx=12, pady=5,
-                        font=(FONT, 9, "bold"), cursor="hand2")
-    rep_btn.pack(side="left")
+    rep_btn = GlassButton(toolbar, text="⭳  Report", command=do_report)
 
     def do_update():
         # Explicit user action; a restart re-runs with this exact argv.
         open_update_dialog(root, args.update_url,
                            relaunch_argv=getattr(args, "_argv", None))
 
-    upd_btn = tk.Button(btnbar, text="⟳  Update", command=do_update,
-                        bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
-                        activeforeground="white", relief="flat", bd=0,
-                        highlightthickness=0, padx=12, pady=5,
-                        font=(FONT, 9, "bold"), cursor="hand2")
-    upd_btn.pack(side="left", padx=(6, 0))
+    upd_btn = GlassButton(toolbar, text="⟳  Update", command=do_update)
 
-    # right-hand stat cluster: quality text + experience score + composite MOS
-    stats = tk.Frame(row1, bg=BG)
-    stats.pack(side="right")
-
-    # Per-protocol headline metrics: UDP keeps MOS (a media metric); TCP gets
-    # a Path Quality Index (RTT, RTT variance, retransmissions, throughput,
-    # connection establishment) - MOS is the wrong lens for TCP.
-    udp_mos_var = tk.StringVar(value="--")
-    tcp_pqi_var = tk.StringVar(value="--")
-    mos_block = tk.Frame(stats, bg=BG)
-    mos_block.pack(side="right", padx=(14, 0))
-    tk.Label(mos_block, text="UDP MOS", fg=TXT_DIM, bg=BG,
-             font=(FONT, 8, "bold")).grid(row=0, column=0, sticky="e", padx=(0, 5))
-    udp_mos_num = tk.Label(mos_block, textvariable=udp_mos_var,
-                           font=(FONT, 14, "bold"), fg=TXT, bg=BG)
-    udp_mos_num.grid(row=0, column=1, sticky="w")
-    tk.Label(mos_block, text="TCP PQI", fg=TXT_DIM, bg=BG,
-             font=(FONT, 8, "bold")).grid(row=1, column=0, sticky="e", padx=(0, 5))
-    tcp_pqi_num = tk.Label(mos_block, textvariable=tcp_pqi_var,
-                           font=(FONT, 14, "bold"), fg=TXT, bg=BG)
-    tcp_pqi_num.grid(row=1, column=1, sticky="w")
-
-    score_var = tk.StringVar(value="--")
-    score_lbl = tk.Label(stats, textvariable=score_var, font=(FONT, 34, "bold"),
-                         width=4, fg="white", bg="#555a61")
-    score_lbl.pack(side="right")
-
-    label_var = tk.StringVar(value="Starting...")
-    sub_var = tk.StringVar(value="")
-    txt = tk.Frame(stats, bg=BG)
-    txt.pack(side="right", padx=(0, 12))
-    tk.Label(txt, text="EXPERIENCE", fg=TXT_DIM, bg=BG,
-             font=(FONT, 8, "bold")).pack(anchor="e")
-    tk.Label(txt, textvariable=label_var, fg=TXT, bg=BG, anchor="e",
-             font=(FONT, 17, "bold")).pack(anchor="e", fill="x")
-    tk.Label(txt, textvariable=sub_var, fg=TXT_DIM, bg=BG, anchor="e",
-             font=(FONT, 9)).pack(anchor="e", fill="x")
-
-    title_lbl.pack(side="left", anchor="w")
-
-    hdr = {"wide": None, "btn_req": 0}
-
-    def _reflow_header(_event=None):
-        w = header.winfo_width()
-        if w <= 1:
-            return  # not laid out yet
-        if not hdr["btn_req"]:
-            root.update_idletasks()  # settle requested sizes once
-            hdr["btn_req"] = btnbar.winfo_reqwidth()
-        need = (28 + ekg.winfo_reqwidth() + 10 + title_lbl.winfo_reqwidth()
-                + 18 + hdr["btn_req"] + 16 + stats.winfo_reqwidth())
-        wide = w >= need
-        if wide == hdr["wide"]:
-            return
-        hdr["wide"] = wide
-        btnbar.pack_forget()
-        if wide:
-            btnbar.pack(in_=row1, side="left", padx=(18, 0))
-        else:
-            btnbar.pack(in_=header, side="top", anchor="w", pady=(8, 0))
-
-    header.bind("<Configure>", _reflow_header)
-    stats.bind("<Configure>", _reflow_header)  # score/label text can widen
+    _flow_layout(toolbar, [reset_btn, totals_btn, isolate_btn, anatomy_btn,
+                           topo_btn, load_btn, fit_btn, rep_btn, upd_btn])
 
     # ---- footer (pinned to the bottom, before charts claim the middle) ----
     # Two short left-anchored lines instead of one mega-line: a label centers
     # its text in the space it gets, so the old single line clipped at BOTH
     # ends in a narrow window.  The warning gets a row only while active.
-    footer = tk.Frame(root, bg=BG, padx=14, pady=6)
+    footer = tk.Frame(root, bg=BG, padx=18, pady=(0))
     footer.pack(fill="x", side="bottom")
+    rule = tk.Canvas(footer, bg=BG, highlightthickness=0, height=1)
+    rule.pack(fill="x", pady=(0, 8))
+    rule.bind("<Configure>", lambda _e: (rule.delete("all"),
+                                         _draw_hairline(rule, 0, 0,
+                                                        rule.winfo_width())))
     warn_var = tk.StringVar(value="")
-    warn_lbl = tk.Label(footer, textvariable=warn_var, fg="#ffd27e", bg=BG,
+    warn_lbl = tk.Label(footer, textvariable=warn_var, fg=WARN, bg=BG,
                         font=(FONT, 9, "bold"), anchor="w")
     scen_var = tk.StringVar(value="")
-    scen_lbl = tk.Label(footer, textvariable=scen_var, fg=HPE_GREEN, bg=BG,
+    scen_lbl = tk.Label(footer, textvariable=scen_var, fg=ACCENT_HI, bg=BG,
                         font=(FONT, 9, "bold"), anchor="w")
     foot_path_var = tk.StringVar(value="")
     foot_path_lbl = tk.Label(footer, textvariable=foot_path_var, fg=TXT_DIM,
                              bg=BG, font=(FONT, 9), anchor="w")
     foot_path_lbl.pack(fill="x")
     foot_cnt_var = tk.StringVar(value="")
-    tk.Label(footer, textvariable=foot_cnt_var, fg=TXT_DIM, bg=BG,
-             font=(FONT, 9), anchor="w").pack(fill="x")
+    tk.Label(footer, textvariable=foot_cnt_var, fg=TXT_FAINT, bg=BG,
+             font=(FONT, 9), anchor="w").pack(fill="x", pady=(1, 8))
 
     # ---- totals table (hidden by default; toggled by the Totals button) ----
     totals_cols = ("stream", "sent", "recv", "lost", "late", "lossp",
@@ -2808,17 +3461,19 @@ def run_gui(engine, args):
     totals_w = {"stream": 110, "sent": 78, "recv": 84, "lost": 64, "late": 60,
                 "lossp": 64, "txb": 66, "peerrx": 78, "echorx": 72, "size": 80,
                 "dscp": 110}
-    totals_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
-    # not packed here — do_toggle_totals packs/unpacks the whole frame
-    totals_tree = ttk.Treeview(totals_frame, columns=totals_cols, show="headings",
-                               height=len(STREAMS), style="NQ.Treeview")
+    GlassCard = _glass_widgets()["card"]
+    totals_frame = GlassCard(root, glow=ACCENT_2)
+    # not packed here — the Totals toggle packs/unpacks the whole card
+    totals_tree = ttk.Treeview(totals_frame.body, columns=totals_cols,
+                               show="headings", height=len(STREAMS),
+                               style="NQ.Treeview")
     totals_tree.pack(fill="x")
     for c in totals_cols:
         totals_tree.heading(c, text=totals_head[c])
         totals_tree.column(c, width=totals_w[c], anchor=("w" if c == "stream" else "e"),
                            stretch=(c == "stream"))
-    totals_tree.tag_configure("ok", foreground="#7ee2b8")
-    totals_tree.tag_configure("bad", foreground="#ffb3a6")
+    totals_tree.tag_configure("ok", foreground=OK_SOFT)
+    totals_tree.tag_configure("bad", foreground=DANGER)
     for sid, proto, port, name in STREAMS:
         totals_tree.insert("", "end", iid=f"t{sid}",
                            values=(name, 0, 0, 0, 0, "0.0", 0, 0, 0, "-", "-"))
@@ -2831,17 +3486,17 @@ def run_gui(engine, args):
                 "rtn": "Rtn lost (←peer)", "rtnp": "Rtn %", "where": "Where"}
     iso_w = {"stream": 110, "sent": 84, "fwd": 120, "fwdp": 70,
              "rtn": 120, "rtnp": 70, "where": 110}
-    iso_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
-    # not packed here — do_toggle_isolate packs/unpacks the whole frame
-    iso_tree = ttk.Treeview(iso_frame, columns=iso_cols, show="headings",
+    iso_frame = GlassCard(root, glow=ACCENT_3)
+    # not packed here — the Isolate toggle packs/unpacks the whole card
+    iso_tree = ttk.Treeview(iso_frame.body, columns=iso_cols, show="headings",
                             height=len(STREAMS), style="NQ.Treeview")
     iso_tree.pack(fill="x")
     for c in iso_cols:
         iso_tree.heading(c, text=iso_head[c])
         iso_tree.column(c, width=iso_w[c], anchor=("w" if c in ("stream", "where") else "e"),
                         stretch=(c == "stream"))
-    iso_tree.tag_configure("ok", foreground="#7ee2b8")
-    iso_tree.tag_configure("warn", foreground="#ffd27e")
+    iso_tree.tag_configure("ok", foreground=OK_SOFT)
+    iso_tree.tag_configure("warn", foreground=WARN_SOFT)
     for sid, proto, port, name in STREAMS:
         iso_tree.insert("", "end", iid=f"i{sid}",
                         values=(name, 0, 0, "0.00", 0, "0.00", "…"))
@@ -2852,12 +3507,12 @@ def run_gui(engine, args):
     # packets below, drawn from the EdgeConnect wire model (ec_wire_view).
     # Everything here is static per run (probe size, DF, VXLAN, pps), so it
     # redraws only on toggle and canvas resize - never in the refresh loop.
-    anat_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
-    # not packed here — do_toggle_anatomy packs/unpacks the whole frame
-    anat_canvas = tk.Canvas(anat_frame, bg=PANEL, highlightthickness=0,
-                            height=204)
+    anat_frame = tk.Frame(root, bg=BG)
+    # not packed here — the Anatomy toggle packs/unpacks the whole frame
+    anat_canvas = tk.Canvas(anat_frame, bg=BG, highlightthickness=0,
+                            height=232)
     anat_canvas.pack(fill="x")
-    ANAT_PAY, ANAT_OH = "#00B0E6", "#FF8300"  # payload / encap overhead
+    ANAT_PAY, ANAT_OH = ACCENT_2, "#FF9F45"   # payload / encap overhead
 
     def draw_anatomy(_event=None):
         c = anat_canvas
@@ -2865,6 +3520,11 @@ def run_gui(engine, args):
         if w <= 1 or not anatomy_shown["on"]:
             return
         c.delete("all")
+        h = int(c["height"])
+        m = 4
+        _glass(c, m, m, w - m, h - m, r=RADIUS, base=BG, glow=ANAT_PAY,
+               glow_alpha=0.12)
+        surf = _mix(PANEL_TOP, PANEL_LO, 0.45)
         probe = engine.size
         vx_on = bool(engine.vxlan)
         inner = probe + 28 + (VXLAN_OVERHEAD_UDP if vx_on else 0)
@@ -2873,49 +3533,58 @@ def run_gui(engine, args):
         wan_total = sum(wr for _, wr in pieces)
         tax = (wan_total - inner) / inner * 100.0
 
-        x0, gap, bh = 64, 6, 20
-        usable = max(50, w - x0 - 16 - (n - 1) * gap)
+        x0, gap, bh = 74, 6, 22
+        usable = max(50, w - x0 - 28 - (n - 1) * gap)
         scale = usable / wan_total
 
-        c.create_text(14, 16, anchor="w", fill=TXT, font=(FONT, 10, "bold"),
+        def bar(x, y, wid, color, r=5):
+            """One byte-proportional block, lit from the top like everything
+            else on the pane so the bars read as objects, not swatches."""
+            if wid < 1.2:
+                return
+            _rr_gradient(c, x, y, x + wid, y + bh, min(r, wid / 2.0),
+                         _lighten(color, 0.24), _darken(color, 0.18), step=2)
+
+        c.create_text(20, 24, anchor="w", fill=TXT, font=(FONT, 10, "bold"),
                       text="Wire anatomy — one UDP probe through the fabric")
-        c.create_text(w - 14, 16, anchor="e", fill=TXT_DIM, font=(FONT, 8),
+        c.create_text(w - 20, 24, anchor="e", fill=TXT_FAINT, font=(FONT, 8),
                       text=f"model: tunnel MTU {EC_TUNNEL_MTU} · slice budget "
                            f"{EC_SLICE_BUDGET} B · GCM framing {EC_GCM_FRAMING} B")
 
-        y = 40  # LAN row: the one packet the fabric ingests on lan1
-        c.create_text(x0 - 10, y + bh / 2, anchor="e", fill=TXT_DIM,
+        y = 52  # LAN row: the one packet the fabric ingests on lan1
+        c.create_text(x0 - 12, y + bh / 2, anchor="e", fill=TXT_DIM,
                       font=(FONT, 9, "bold"), text="LAN")
-        c.create_rectangle(x0, y, x0 + inner * scale, y + bh,
-                           fill=ANAT_PAY, outline="")
+        bar(x0, y, inner * scale, ANAT_PAY)
         parts = (f"probe {probe:,} + VXLAN {VXLAN_OVERHEAD_UDP} + IP/UDP 28"
                  if vx_on else f"probe {probe:,} + IP/UDP 28")
         df = "DF on" if args.dont_fragment else "DF off"
-        c.create_text(x0 + 2, y + bh + 11, anchor="w", fill=TXT_DIM,
+        c.create_text(x0 + 2, y + bh + 12, anchor="w", fill=TXT_FAINT,
                       font=(FONT, 8), text=f"1 packet · {inner:,} B ({parts}) · {df}")
 
-        y2 = y + bh + 30
+        y2 = y + bh + 32
         verb = (f"EC encrypts + encapsulates → 1 tunnel packet (no slicing: "
                 f"{inner:,} B ≤ {EC_SLICE_BUDGET:,} B budget)" if n == 1 else
                 f"EC slices + encapsulates → {n} tunnel packets")
-        c.create_text(x0, y2, anchor="w", fill=HPE_GREEN,
-                      font=(FONT, 9, "bold"), text=verb)
+        vid = c.create_text(x0 + 10, y2, anchor="w", fill=ACCENT_HI,
+                            font=(FONT, 9, "bold"), text=verb)
+        vb = c.bbox(vid)
+        _round_rect(c, vb[0] - 9, vb[1] - 4, vb[2] + 9, vb[3] + 4, 9,
+                    fill=_over(ACCENT, surf, 0.14))
+        c.tag_raise(vid)
 
-        y3 = y2 + 12  # WAN row: the tunnel packets, payload + overhead
-        c.create_text(x0 - 10, y3 + bh / 2, anchor="e", fill=TXT_DIM,
+        y3 = y2 + 16  # WAN row: the tunnel packets, payload + overhead
+        c.create_text(x0 - 12, y3 + bh / 2, anchor="e", fill=TXT_DIM,
                       font=(FONT, 9, "bold"), text="WAN")
         x = x0
         for s, wr in pieces:
-            c.create_rectangle(x, y3, x + s * scale, y3 + bh,
-                               fill=ANAT_PAY, outline="")
-            c.create_rectangle(x + s * scale, y3, x + wr * scale, y3 + bh,
-                               fill=ANAT_OH, outline="")
+            bar(x, y3, wr * scale, ANAT_OH)         # full block = wire bytes
+            bar(x, y3, s * scale, ANAT_PAY)         # payload share on top
             if wr * scale >= 48:
-                c.create_text(x + wr * scale / 2, y3 + bh + 11,
-                              fill=TXT_DIM, font=(FONT, 8), text=f"{wr:,} B")
+                c.create_text(x + wr * scale / 2, y3 + bh + 12,
+                              fill=TXT_FAINT, font=(FONT, 8), text=f"{wr:,} B")
             x += wr * scale + gap
 
-        y4 = y3 + bh + 28
+        y4 = y3 + bh + 32
         c.create_text(x0, y4, anchor="w", fill=TXT, font=(FONT, 9),
                       text=f"WAN: {n} packet{'s' if n > 1 else ''} · "
                            f"{wan_total:,} B on the wire · +{tax:.1f}% overhead"
@@ -2932,22 +3601,22 @@ def run_gui(engine, args):
                     f" only #1 carries the L4 header")
         else:
             noec = "without the fabric: fits a standard 1500 B hop as-is"
-        c.create_text(x0, y4 + 36, anchor="w", fill=TXT_DIM, font=(FONT, 9),
+        c.create_text(x0, y4 + 36, anchor="w", fill=TXT_FAINT, font=(FONT, 9),
                       text=noec)
+        c.create_text(x0, y4 + 54, anchor="w", fill=TXT_FAINT, font=(FONT, 9),
+                      text=anat_wan_var.get())
 
     anat_canvas.bind("<Configure>", draw_anatomy)
-    # Measured WAN line under the anatomy canvas (1.9.0): live counters
+    # Measured WAN line inside the anatomy canvas (1.9.0): live counters
     # from --wan-counters next to the model's prediction - the loop closer.
     anat_wan_var = tk.StringVar(value="")
-    tk.Label(anat_frame, textvariable=anat_wan_var, fg=TXT_DIM, bg=BG,
-             font=(FONT, 9), anchor="w").pack(fill="x", pady=(2, 0))
 
     # ---- topology strip (hidden; Host → EC → fabric → EC → Host with the
     # measured numbers moving, R-15) ------------------------------------------
-    topo_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
-    # not packed here — do_toggle_topo packs/unpacks the whole frame
-    topo_canvas = tk.Canvas(topo_frame, bg=PANEL, highlightthickness=0,
-                            height=118)
+    topo_frame = tk.Frame(root, bg=BG)
+    # not packed here — the Topology toggle packs/unpacks the whole frame
+    topo_canvas = tk.Canvas(topo_frame, bg=BG, highlightthickness=0,
+                            height=136)
     topo_canvas.pack(fill="x")
     topo_state = {"snap": None}
 
@@ -2958,6 +3627,11 @@ def run_gui(engine, args):
         if w <= 1 or snap is None or not topo_shown["on"]:
             return
         c.delete("all")
+        h = int(c["height"])
+        m = 4
+        _glass(c, m, m, w - m, h - m, r=RADIUS, base=BG, glow=ACCENT,
+               glow_alpha=0.12)
+        surf = _mix(PANEL_TOP, PANEL_LO, 0.45)
         lan_tx = sum(r["tx_pps"] for r in snap["rows"])
         lan_rx = sum(r["rx_pps"] for r in snap["rows"])
         pred = snap["predicted_wan_pps"]
@@ -2973,31 +3647,43 @@ def run_gui(engine, args):
                    else f"{pred:.0f} pps predicted")),
                  ("EC (remote)", "reassembles"),
                  (f"peer {snap['peer']}", f"{lan_rx:.0f} pps back")]
-        bw, bh, y0 = 150, 44, 22
-        gap = max(24, (w - 28 - bw * len(nodes)) // max(1, len(nodes) - 1))
-        x = 14
+        y0, bh = 26, 48
+        avail = w - 40
+        gap = max(26, min(46, (avail - 150 * len(nodes)) // max(1, len(nodes) - 1)))
+        bw = max(96, (avail - gap * (len(nodes) - 1)) / float(len(nodes)))
+        x = 20.0
         for i, (name, sub) in enumerate(nodes):
-            fill = PANEL_HI if i != 2 else HPE_GREEN_DK
-            c.create_rectangle(x, y0, x + bw, y0 + bh, fill=fill,
-                               outline=GRID)
-            c.create_text(x + bw / 2, y0 + 15, text=name, fill=TXT,
+            hot = (i == 2)                    # the fabric is the subject here
+            _glass(c, x, y0, x + bw, y0 + bh, r=RADIUS_SM, base=surf,
+                   top=_over(ACCENT if hot else GLASS, surf, 0.22 if hot else 0.10),
+                   bottom=_over(ACCENT if hot else GLASS, surf, 0.10 if hot else 0.04),
+                   border=_over(ACCENT if hot else GLASS, surf, 0.45 if hot else 0.16),
+                   shadow=False)
+            c.create_text(x + bw / 2, y0 + 18, text=name,
+                          fill=(ACCENT_HI if hot else TXT),
                           font=(FONT, 9, "bold"))
-            c.create_text(x + bw / 2, y0 + 31, text=sub, fill=TXT_DIM,
+            c.create_text(x + bw / 2, y0 + 34, text=sub, fill=TXT_DIM,
                           font=(FONT, 8))
             if i < len(nodes) - 1:
-                ax0, ax1 = x + bw, x + bw + gap
+                ax0, ax1 = x + bw + 5, x + bw + gap - 5
                 ay = y0 + bh / 2
-                c.create_line(ax0, ay, ax1, ay, fill=HPE_GREEN, width=2,
-                              arrow="last")
-                c.create_line(ax0, ay + 8, ax1, ay + 8, fill="#FF8300",
-                              width=2, arrow="first")
+                if ax1 > ax0:
+                    # forward on top, return underneath: two lanes, each
+                    # glowing in its own direction's colour
+                    for yy, col, arw in ((ay - 5, ACCENT_HI, "last"),
+                                         (ay + 5, "#FF9F45", "first")):
+                        c.create_line(ax0, yy, ax1, yy,
+                                      fill=_over(col, surf, 0.22), width=6,
+                                      capstyle="round")
+                        c.create_line(ax0, yy, ax1, yy, fill=col, width=2,
+                                      arrow=arw, arrowshape=(7, 8, 3))
             x += bw + gap
         wan_txt = ("WAN span: predicted "
                    f"{pred:.0f} pps"
                    + (f" · measured {meas:.0f} pps ({wan['kind']})"
                       if meas is not None else
                       "  ·  add --wan-counters to measure it"))
-        c.create_text(14, y0 + bh + 26, anchor="w", fill=TXT_DIM,
+        c.create_text(20, y0 + bh + 26, anchor="w", fill=TXT_DIM,
                       font=(FONT, 9), text=wan_txt)
 
     topo_canvas.bind("<Configure>", draw_topology)
@@ -3010,48 +3696,51 @@ def run_gui(engine, args):
     load_gen = LoadGenerator(engine.peer, args.udp_ports[0], bind=args.bind,
                              dont_fragment=args.dont_fragment,
                              timeout=args.timeout)
-    load_frame = tk.Frame(root, bg=BG, padx=12, pady=2)
-    # not packed here — do_toggle_load packs/unpacks the whole frame
-    load_inner = tk.Frame(load_frame, bg=PANEL, padx=10, pady=8)
-    load_inner.pack(fill="x")
+    load_frame = GlassCard(root, glow=WARN)
+    # not packed here — the Load toggle packs/unpacks the whole card
+    load_inner = load_frame.body
+    LOAD_BG = load_frame.surface
     load_mbps_var = tk.StringVar(value="5")
     load_sq_var = tk.BooleanVar(value=False)
     load_on_var = tk.StringVar(value="10")
     load_off_var = tk.StringVar(value="10")
     load_status_var = tk.StringVar(value="idle")
-    load_hdr = tk.Frame(load_inner, bg=PANEL)
+    load_hdr = tk.Frame(load_inner, bg=LOAD_BG)
     load_hdr.pack(fill="x")
-    tk.Label(load_hdr, text="Sustained load", fg=TXT, bg=PANEL,
+    tk.Label(load_hdr, text="Sustained load", fg=TXT, bg=LOAD_BG,
              font=(FONT, 10, "bold")).pack(side="left")
     tk.Label(load_hdr, text=f"UDP {BURST_PROBE_SIZE} B TEST probes → "
                             f"{engine.peer}:{args.udp_ports[0]} · echoes "
                             f"double the wire load · excluded from loss "
                             f"isolation",
-             fg=TXT_DIM, bg=PANEL, font=(FONT, 8)).pack(side="left",
-                                                        padx=(10, 0))
-    ctl = tk.Frame(load_inner, bg=PANEL)
-    ctl.pack(fill="x", pady=(6, 0))
+             fg=TXT_FAINT, bg=LOAD_BG, font=(FONT, 8)).pack(side="left",
+                                                            padx=(10, 0))
+    ctl = tk.Frame(load_inner, bg=LOAD_BG)
+    ctl.pack(fill="x", pady=(8, 0))
 
     def _load_entry(var, width):
-        e = tk.Entry(ctl, textvariable=var, width=width, bg=PANEL_HI, fg=TXT,
-                     insertbackground=TXT, relief="flat", highlightthickness=1,
-                     highlightbackground=GRID, highlightcolor=HPE_GREEN,
-                     font=(FONT, 10), justify="right")
-        return e
+        return _glass_entry(tk, ctl, var, width, LOAD_BG, justify="right")
 
-    tk.Label(ctl, text="Mbps", fg=TXT_DIM, bg=PANEL,
+    tk.Label(ctl, text="Mbps", fg=TXT_DIM, bg=LOAD_BG,
              font=(FONT, 9)).pack(side="left")
-    _load_entry(load_mbps_var, 6).pack(side="left", padx=(4, 12), ipady=1)
-    tk.Checkbutton(ctl, text="square wave", variable=load_sq_var, bg=PANEL,
-                   fg=TXT, activebackground=PANEL, activeforeground=TXT,
-                   selectcolor=PANEL_HI, font=(FONT, 9), highlightthickness=0,
-                   cursor="hand2").pack(side="left")
-    tk.Label(ctl, text="on s", fg=TXT_DIM, bg=PANEL,
-             font=(FONT, 9)).pack(side="left", padx=(8, 0))
-    _load_entry(load_on_var, 4).pack(side="left", padx=(4, 0), ipady=1)
-    tk.Label(ctl, text="off s", fg=TXT_DIM, bg=PANEL,
-             font=(FONT, 9)).pack(side="left", padx=(8, 0))
-    _load_entry(load_off_var, 4).pack(side="left", padx=(4, 12), ipady=1)
+    _load_entry(load_mbps_var, 6).pack(side="left", padx=(6, 14), ipady=3)
+    # A glass toggle rather than a tk.Checkbutton: X11 draws that indicator
+    # with a hard 3D bevel that no option can flatten, and one chrome box in
+    # the middle of the panel undoes the whole surface treatment.
+    sq_btn = GlassButton(ctl, text="⌁  square wave", base=LOAD_BG, toggle=True)
+
+    def _toggle_square():
+        load_sq_var.set(not load_sq_var.get())
+        sq_btn.set_on(load_sq_var.get())
+
+    sq_btn.configure(command=_toggle_square)
+    sq_btn.pack(side="left")
+    tk.Label(ctl, text="on s", fg=TXT_DIM, bg=LOAD_BG,
+             font=(FONT, 9)).pack(side="left", padx=(10, 0))
+    _load_entry(load_on_var, 4).pack(side="left", padx=(6, 0), ipady=3)
+    tk.Label(ctl, text="off s", fg=TXT_DIM, bg=LOAD_BG,
+             font=(FONT, 9)).pack(side="left", padx=(10, 0))
+    _load_entry(load_off_var, 4).pack(side="left", padx=(6, 14), ipady=3)
 
     def do_load_start():
         if load_gen.running:
@@ -3082,14 +3771,11 @@ def run_gui(engine, args):
         else:
             load_start_btn.configure(text="■  Stop load")
 
-    load_start_btn = tk.Button(ctl, text="▶  Start load", command=do_load_start,
-                               bg=PANEL_HI, fg=TXT,
-                               activebackground=HPE_GREEN_DK,
-                               activeforeground="white", relief="flat", bd=0,
-                               highlightthickness=0, padx=12, pady=3,
-                               font=(FONT, 9, "bold"), cursor="hand2")
+    load_start_btn = GlassButton(ctl, text="▶  Start load",
+                                 command=do_load_start, base=LOAD_BG,
+                                 primary=True, accent=WARN)
     load_start_btn.pack(side="left")
-    tk.Label(ctl, textvariable=load_status_var, fg=TXT_DIM, bg=PANEL,
+    tk.Label(ctl, textvariable=load_status_var, fg=TXT_DIM, bg=LOAD_BG,
              font=(FONT, 9), anchor="w").pack(side="left", padx=(12, 0))
     if engine.vxlan:
         # A VXLAN-mode peer opens no native UDP listener, so there is
@@ -3105,60 +3791,71 @@ def run_gui(engine, args):
     # chart row stayed squeezed to a sliver until the app was restarted.
     # Grid weights re-distribute the space proportionally on every geometry
     # pass, so the charts always track the current window size.
-    charts = tk.Frame(root, bg=BG, padx=12, pady=6)
+    # Chart canvases carry the app base colour, not a panel colour: each one
+    # paints its own rounded glass card, and the corners have to resolve
+    # against the backdrop for the card to read as a floating pane.
+    charts = tk.Frame(root, bg=BG, padx=14, pady=2)
     charts.pack(fill="both", expand=True)
     charts.columnconfigure(0, weight=1)
     charts.rowconfigure(0, weight=3, uniform="charts")
     charts.rowconfigure(1, weight=2, uniform="charts")
     # Small requested sizes: the drawn size is allocation-driven, and modest
     # requests keep the layout solvable at any window size.
-    lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0,
+    lat_canvas = tk.Canvas(charts, bg=BG, highlightthickness=0,
                            width=100, height=80)
-    lat_canvas.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+    lat_canvas.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
     bottom = tk.Frame(charts, bg=BG)
     bottom.grid(row=1, column=0, sticky="nsew")
     bottom.rowconfigure(0, weight=1)
     bottom.columnconfigure(0, weight=1, uniform="bottom")
     bottom.columnconfigure(1, weight=1, uniform="bottom")
     bottom.columnconfigure(2, weight=1, uniform="bottom")
-    loss_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
+    loss_canvas = tk.Canvas(bottom, bg=BG, highlightthickness=0,
                             width=100, height=80)
-    loss_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 3))
-    jit_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
+    loss_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+    jit_canvas = tk.Canvas(bottom, bg=BG, highlightthickness=0,
                            width=100, height=80)
-    jit_canvas.grid(row=0, column=1, sticky="nsew", padx=(3, 3))
-    owd_canvas = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
+    jit_canvas.grid(row=0, column=1, sticky="nsew", padx=(4, 4))
+    owd_canvas = tk.Canvas(bottom, bg=BG, highlightthickness=0,
                            width=100, height=80)
-    owd_canvas.grid(row=0, column=2, sticky="nsew", padx=(3, 0))
+    owd_canvas.grid(row=0, column=2, sticky="nsew", padx=(4, 0))
+
+    # The panel toggles can only be wired now that both the panels and the
+    # charts they insert themselves above exist.
+    for _btn, _state, _frame, _cb in (
+            (totals_btn, totals_shown, totals_frame, None),
+            (isolate_btn, isolate_shown, iso_frame, None),
+            (anatomy_btn, anatomy_shown, anat_frame, draw_anatomy),
+            (topo_btn, topo_shown, topo_frame, draw_topology),
+            (load_btn, load_shown, load_frame, None)):
+        _btn.configure(command=_panel_toggle(_state, _frame, _btn, _cb))
 
     def refresh_body():
         snap = engine.snapshot()
-        def set_metric(var, num, value, fmt, color_score):
+
+        def metric(value, fmt, color_score):
             if value is None:
-                var.set("--")
-                num.configure(fg=TXT_DIM)
-            else:
-                var.set(fmt.format(value))
-                num.configure(fg=score_color(color_score))
+                return "--", TXT_FAINT
+            return fmt.format(value), score_color(color_score)
 
         if snap["links_up"] == 0:
-            score_var.set("--")
-            score_lbl.configure(bg="#555a61")
-            set_metric(udp_mos_var, udp_mos_num, None, "", 0)
-            set_metric(tcp_pqi_var, tcp_pqi_num, None, "", 0)
-            label_var.set("Waiting for peer")
-            sub_var.set(f"peer {args.peer} - no streams up yet")
+            hero_state.update(score=None, label="Waiting for peer",
+                              detail=f"peer {args.peer} — no streams up yet",
+                              sub=f"peer {args.peer}",
+                              mos="--", mos_c=TXT_FAINT,
+                              pqi="--", pqi_c=TXT_FAINT)
         else:
             o = snap["overall"]
-            score_var.set(f"{o:.0f}")
-            score_lbl.configure(bg=score_color(o))
-            set_metric(udp_mos_var, udp_mos_num, snap["udp_mos"], "{:.1f}",
-                       snap["udp_score"] or 0)
-            set_metric(tcp_pqi_var, tcp_pqi_num, snap["tcp_pqi"], "{:.0f}",
-                       snap["tcp_pqi"] or 0)
-            label_var.set(snap["overall_label"])
-            sub_var.set(f"worst {snap['worst']:.0f}  -  "
-                        f"{snap['links_up']}/{len(STREAMS)} streams up")
+            mos, mos_c = metric(snap["udp_mos"], "{:.1f}", snap["udp_score"] or 0)
+            pqi, pqi_c = metric(snap["tcp_pqi"], "{:.0f}", snap["tcp_pqi"] or 0)
+            hero_state.update(
+                score=o, label=snap["overall_label"],
+                detail=f"worst {snap['worst']:.0f}  ·  "
+                       f"{snap['links_up']}/{len(STREAMS)} streams up",
+                sub=f"peer {args.peer}  ·  {snap['links_up']}/{len(STREAMS)} "
+                    f"streams up",
+                mos=mos, mos_c=mos_c, pqi=pqi, pqi_c=pqi_c)
+        paint_hero()
 
         up_s = int(snap["uptime"])
         t = snap["totals"]
@@ -3277,6 +3974,7 @@ def run_gui(engine, args):
             else:
                 anat_wan_var.set(f"measured WAN ({wan['kind']}): "
                                  f"{wan['detail']}")
+            draw_anatomy()   # the measured line lives on the canvas now
 
         if isolate_shown["on"]:
             for row in snap["rows"]:
@@ -3332,7 +4030,7 @@ def run_gui(engine, args):
         # streams), each direction's delay growth above its ~60 s best. The
         # clocks' unknown offset cancels, so only the MOVEMENT is meaningful.
         _draw_chart(owd_canvas, "One-way drift (ms)", "v",
-                    [("F", HPE_GREEN, "fwd→"), ("R", "#FF8300", "rtn←")],
+                    [("F", ACCENT_HI, "fwd→"), ("R", "#FF9F45", "rtn←")],
                     {"F": owd_f, "R": owd_r},
                     view_seconds, now, ymin_floor=2.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}",
@@ -3375,101 +4073,195 @@ def run_mesh_gui(engine, args):
     peers = engine.peers
 
     root = tk.Tk()
+    _resolve_fonts(root)
     _set_window_icon(root)
     root.title(f"Network Vitals {__version__}  -  mesh, {len(peers)} peers")
-    root.geometry("1150x760")
+    root.geometry("1260x820")
     root.minsize(700, 500)
     root.configure(bg=BG)
+    GlassButton = _glass_widgets()["button"]
 
-    # ---- header -----------------------------------------------------------
-    header = tk.Frame(root, bg=BG, padx=14, pady=10)
-    header.pack(fill="x", side="top")
-    ekg = tk.Canvas(header, width=54, height=34, bg=BG, highlightthickness=0)
-    ekg.pack(side="left", padx=(0, 10))
-    _draw_ekg(ekg)
-    tk.Label(header, text="Network Vitals — mesh", fg=TXT, bg=BG,
-             font=(FONT, 17, "bold"), anchor="w").pack(side="left")
-    mesh_sub = tk.StringVar(value="")
-    tk.Label(header, textvariable=mesh_sub, fg=TXT_DIM, bg=BG,
-             font=(FONT, 10)).pack(side="left", padx=(16, 0))
+    # ---- hero band --------------------------------------------------------
+    HERO_H = 82
+    hero = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0, height=HERO_H)
+    hero.pack(fill="x", side="top")
+    mesh_state = {"sub": "", "worst": None}
 
-    def mkbtn(text, cmd):
-        return tk.Button(header, text=text, command=cmd,
-                         bg=PANEL_HI, fg=TXT, activebackground=HPE_GREEN_DK,
-                         activeforeground="white", relief="flat", bd=0,
-                         highlightthickness=0, padx=12, pady=5,
-                         font=(FONT, 9, "bold"), cursor="hand2")
+    def paint_hero(_e=None):
+        w = hero.winfo_width()
+        if w < 10:
+            return
+        hero.delete("all")
+        _draw_aurora(hero, w, HERO_H)
+        _draw_ekg(hero, dx=20, dy=HERO_H / 2 - 20, width=2)
+        title = hero.create_text(84, HERO_H / 2 - 9, anchor="w",
+                                 text="Network Vitals", fill=TXT,
+                                 font=(FONT, 18, "bold"))
+        hero.create_text(85, HERO_H / 2 + 13, anchor="w",
+                         text=mesh_state["sub"] or f"{len(peers)} peers",
+                         fill=TXT_DIM, font=(FONT, 9))
+        # "mesh" badge, so the two window types are never confused at a
+        # glance. Placed off the measured title box, not a guessed offset -
+        # the resolved UI face is not known until the window exists.
+        bx = hero.bbox(title)[2] + 12
+        bid = hero.create_text(bx + 10, HERO_H / 2 - 8, text="MESH",
+                               fill=ACCENT_HI, font=(FONT, 8, "bold"),
+                               anchor="w")
+        bb = hero.bbox(bid)
+        _round_rect(hero, bx, bb[1] - 5, bb[2] + 10, bb[3] + 5, 9,
+                    fill=_over(ACCENT, BG, 0.20),
+                    outline=_over(ACCENT, BG, 0.45))
+        hero.tag_raise(bid)
+        worst = mesh_state["worst"]
+        if worst is not None and w >= 560:
+            _score_orb(hero, w - 22 - 30, HERO_H / 2, 30, worst[0],
+                       score_color(worst[0]), base=BG)
+            hero.create_text(w - 88, HERO_H / 2 - 9, anchor="e",
+                             text="WORST PAIR", fill=TXT_FAINT,
+                             font=(FONT, 7, "bold"))
+            hero.create_text(w - 88, HERO_H / 2 + 9, anchor="e",
+                             text=worst[1], fill=TXT, font=(FONT, 12, "bold"))
+
+    hero.bind("<Configure>", paint_hero)
+
+    tools = tk.Frame(root, bg=BG, height=40)
+    tools.pack(fill="x", side="top", padx=14, pady=(2, 8))
+    tools.pack_propagate(False)
 
     def do_update():
         open_update_dialog(root, args.update_url,
                            relaunch_argv=getattr(args, "_argv", None))
 
-    mkbtn("⟳  Update", do_update).pack(side="right")
-    mkbtn("↺  Reset / Clear", engine.reset).pack(side="right", padx=(0, 6))
+    _flow_layout(tools, [GlassButton(tools, text="↺  Reset", command=engine.reset),
+                         GlassButton(tools, text="⟳  Update", command=do_update)])
 
     # ---- pair matrix: one row per peer, click to select --------------------
     # Local vantage only (phase 1): this node's half of the full N x N mesh.
-    COLS = [("peer", "Peer", 20, "w"), ("score", "Score", 6, "center"),
-            ("label", "", 10, "w"), ("rtt", "RTT ms", 8, "e"),
-            ("loss", "Loss %", 8, "e"), ("jit", "Jitter", 8, "e"),
-            ("up", "Up", 6, "center"), ("flag", "", 34, "w")]
-    rowsF = tk.Frame(root, bg=BG, padx=12, pady=4)
-    rowsF.pack(fill="x")
-    rowsF.columnconfigure(len(COLS) - 1, weight=1)
-    for c, (key, title, width, anchor) in enumerate(COLS):
-        tk.Label(rowsF, text=title, width=width, anchor=anchor, bg=BG,
-                 fg=HPE_GREEN, font=(FONT, 9, "bold")).grid(
-            row=0, column=c, sticky="nsew", padx=1)
-
+    # Drawn on a Canvas rather than assembled from Labels: a selected row can
+    # then be a lit glass slab with a rounded edge and an accent rail, which
+    # no grid of opaque Labels can be.
+    COLS = [("peer", "Peer", 0.24, "w"), ("score", "Score", 0.09, "center"),
+            ("label", "State", 0.13, "w"), ("rtt", "RTT ms", 0.10, "e"),
+            ("loss", "Loss %", 0.10, "e"), ("jit", "Jitter", 0.10, "e"),
+            ("up", "Up", 0.08, "center"), ("flag", "", 0.16, "w")]
+    ROW_H, HEAD_H = 34, 24
+    matrix = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0,
+                       height=HEAD_H + ROW_H * len(peers) + 22)
+    matrix.pack(fill="x", padx=14)
     sel = {"peer": peers[0]}
-    row_widgets = {}
+    rows_data = {p: {} for p in peers}
+
+    def _col_x(w):
+        """Resolve the fractional column widths against the current width."""
+        x0, inner = 14, w - 28 - 24
+        out = []
+        x = x0 + 12
+        for key, title, frac, anchor in COLS:
+            out.append((key, title, x, x + inner * frac, anchor))
+            x += inner * frac
+        return out
+
+    def draw_matrix(_e=None):
+        w = matrix.winfo_width()
+        if w < 40:
+            return
+        matrix.delete("all")
+        h = HEAD_H + ROW_H * len(peers) + 14
+        _glass(matrix, 4, 4, w - 4, h, r=RADIUS, base=BG, glow=ACCENT_2,
+               glow_alpha=0.10)
+        surf = _mix(PANEL_TOP, PANEL_LO, 0.45)
+        cols = _col_x(w)
+        for key, title, cx0, cx1, anchor in cols:
+            tx = {"w": cx0, "e": cx1 - 8, "center": (cx0 + cx1) / 2}[anchor]
+            matrix.create_text(tx, 4 + HEAD_H / 2 + 4, anchor=(
+                {"w": "w", "e": "e", "center": "center"}[anchor]),
+                text=title, fill=TXT_FAINT, font=(FONT, 8, "bold"))
+        for i, p in enumerate(peers):
+            y0 = 4 + HEAD_H + 6 + i * ROW_H
+            y1 = y0 + ROW_H - 4
+            d = rows_data[p]
+            on = (p == sel["peer"])
+            if on:
+                _rr_gradient(matrix, 14, y0, w - 14, y1, RADIUS_SM,
+                             _over(ACCENT, surf, 0.17),
+                             _over(ACCENT, surf, 0.07), step=2)
+                _round_rect(matrix, 14, y0, w - 14, y1, RADIUS_SM, fill="",
+                            outline=_over(ACCENT, surf, 0.40), width=1)
+                matrix.create_line(19, y0 + 7, 19, y1 - 7, fill=ACCENT_HI,
+                                   width=3, capstyle="round")
+            elif i % 2:
+                _rr_gradient(matrix, 14, y0, w - 14, y1, RADIUS_SM,
+                             _over(GLASS, surf, 0.035),
+                             _over(GLASS, surf, 0.035), step=3)
+            cy = (y0 + y1) / 2
+            for key, _t, cx0, cx1, anchor in cols:
+                val = d.get(key, "-")
+                if key == "score":
+                    col = d.get("score_color") or TXT_FAINT
+                    mx = (cx0 + cx1) / 2
+                    _round_rect(matrix, mx - 21, cy - 11, mx + 21, cy + 11, 9,
+                                fill=_over(col, surf, 0.20),
+                                outline=_over(col, surf, 0.50))
+                    matrix.create_text(mx, cy, text=val, fill=col,
+                                       font=(FONT, 11, "bold"))
+                    continue
+                fill, font = TXT, (FONT, 10)
+                if key == "peer":
+                    fill, font = (TXT if on else _mix(TXT, TXT_DIM, 0.3)), \
+                                 (FONT, 10, "bold")
+                elif key == "flag":
+                    fill, font = WARN, (FONT, 8, "bold")
+                elif key in ("label", "up"):
+                    fill = TXT_DIM
+                tx = {"w": cx0, "e": cx1 - 8, "center": (cx0 + cx1) / 2}[anchor]
+                matrix.create_text(tx, cy, text=val, fill=fill, font=font,
+                                   anchor={"w": "w", "e": "e",
+                                           "center": "center"}[anchor])
+
+    def on_matrix_click(event):
+        i = int((event.y - 4 - HEAD_H - 6) // ROW_H)
+        if 0 <= i < len(peers):
+            sel["peer"] = peers[i]
+            draw_matrix()
+
+    matrix.bind("<Configure>", draw_matrix)
+    matrix.bind("<Button-1>", on_matrix_click)
+    matrix.configure(cursor="hand2")
 
     def select_peer(p):
         sel["peer"] = p
-        for peer, w in row_widgets.items():
-            on = peer == p
-            w["peer"].configure(text=("▶ " if on else "  ") + peer)
-            for key, lbl in w.items():
-                if key != "score":
-                    lbl.configure(bg=PANEL_HI if on else PANEL)
-
-    for r, p in enumerate(peers, start=1):
-        w = {}
-        for c, (key, _t, width, anchor) in enumerate(COLS):
-            lbl = tk.Label(rowsF, text="", width=width, anchor=anchor,
-                           bg=PANEL, fg=TXT, font=(FONT, 10), pady=4, padx=4)
-            lbl.grid(row=r, column=c, sticky="nsew", padx=1, pady=1)
-            lbl.bind("<Button-1>", lambda _e, peer=p: select_peer(peer))
-            lbl.configure(cursor="hand2")
-            w[key] = lbl
-        w["flag"].configure(fg="#ffd27e", font=(FONT, 9))
-        row_widgets[p] = w
+        draw_matrix()
 
     # ---- footer + charts for the selected pair ----------------------------
-    footer = tk.Frame(root, bg=BG, padx=14, pady=6)
+    footer = tk.Frame(root, bg=BG, padx=18)
     footer.pack(fill="x", side="bottom")
+    rule = tk.Canvas(footer, bg=BG, highlightthickness=0, height=1)
+    rule.pack(fill="x", pady=(0, 8))
+    rule.bind("<Configure>", lambda _e: (rule.delete("all"),
+                                         _draw_hairline(rule, 0, 0,
+                                                        rule.winfo_width())))
     foot_var = tk.StringVar(value="")
     tk.Label(footer, textvariable=foot_var, fg=TXT_DIM, bg=BG,
-             font=(FONT, 9), anchor="w").pack(fill="x")
+             font=(FONT, 9), anchor="w").pack(fill="x", pady=(0, 10))
 
-    charts = tk.Frame(root, bg=BG, padx=12, pady=6)
+    charts = tk.Frame(root, bg=BG, padx=14, pady=6)
     charts.pack(fill="both", expand=True)
     charts.columnconfigure(0, weight=1)
     charts.rowconfigure(0, weight=3, uniform="charts")
     charts.rowconfigure(1, weight=2, uniform="charts")
-    lat_canvas = tk.Canvas(charts, bg=PANEL, highlightthickness=0,
+    lat_canvas = tk.Canvas(charts, bg=BG, highlightthickness=0,
                            width=100, height=80)
-    lat_canvas.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
+    lat_canvas.grid(row=0, column=0, sticky="nsew", pady=(0, 8))
     bottom = tk.Frame(charts, bg=BG)
     bottom.grid(row=1, column=0, sticky="nsew")
     bottom.rowconfigure(0, weight=1)
     canvases = []
     for c in range(3):
         bottom.columnconfigure(c, weight=1, uniform="bottom")
-        cv = tk.Canvas(bottom, bg=PANEL, highlightthickness=0,
+        cv = tk.Canvas(bottom, bg=BG, highlightthickness=0,
                        width=100, height=80)
         cv.grid(row=0, column=c, sticky="nsew",
-                padx=((0, 3), (3, 3), (3, 0))[c])
+                padx=((0, 4), (4, 4), (4, 0))[c])
         canvases.append(cv)
     loss_canvas, jit_canvas, owd_canvas = canvases
 
@@ -3477,8 +4269,9 @@ def run_mesh_gui(engine, args):
         worst = None
         for p in peers:
             snap = engine.snapshot(p)
-            w = row_widgets[p]
+            d = rows_data[p]
             t = snap["totals"]
+            d["peer"] = p
             if snap["links_up"]:
                 o = snap["overall"]
                 if worst is None or o < worst[0]:
@@ -3486,24 +4279,25 @@ def run_mesh_gui(engine, args):
                 live = [r for r in snap["rows"] if r["connected"]]
                 rtt = sum(r["rtt_avg"] for r in live) / len(live)
                 jit = max(r["jitter"] for r in live)
-                w["score"].configure(text=f"{o:.0f}", fg="white",
-                                     bg=score_color(o))
-                w["label"].configure(text=snap["overall_label"])
-                w["rtt"].configure(text=f"{rtt:.1f}")
-                w["jit"].configure(text=f"{jit:.1f}")
+                d["score"] = f"{o:.0f}"
+                d["score_color"] = score_color(o)
+                d["label"] = snap["overall_label"]
+                d["rtt"] = f"{rtt:.1f}"
+                d["jit"] = f"{jit:.1f}"
             else:
-                w["score"].configure(text="--", fg=TXT_DIM, bg="#555a61")
-                w["label"].configure(text="no link")
-                w["rtt"].configure(text="-")
-                w["jit"].configure(text="-")
-            w["loss"].configure(text=f"{t['loss_pct']:.2f}")
-            w["up"].configure(text=f"{snap['links_up']}/{len(STREAMS)}")
-            flag = ("⚠ UDP silent — blocked or old peer version"
-                    if snap["udp_silent"] else (snap["loss_pattern"] or ""))
-            w["flag"].configure(text=flag)
-        mesh_sub.set(f"{len(peers)} peers · worst pair: "
-                     f"{worst[1]} ({worst[0]:.0f})" if worst else
-                     f"{len(peers)} peers · waiting for links")
+                d["score"], d["score_color"] = "--", None
+                d["label"] = "no link"
+                d["rtt"] = d["jit"] = "-"
+            d["loss"] = f"{t['loss_pct']:.2f}"
+            d["up"] = f"{snap['links_up']}/{len(STREAMS)}"
+            d["flag"] = ("⚠ UDP silent — blocked or old peer version"
+                         if snap["udp_silent"] else (snap["loss_pattern"] or ""))
+        mesh_state["worst"] = worst
+        mesh_state["sub"] = (f"{len(peers)} peers  ·  worst pair "
+                             f"{worst[1]} ({worst[0]:.0f})" if worst else
+                             f"{len(peers)} peers  ·  waiting for links")
+        paint_hero()
+        draw_matrix()
 
         p = sel["peer"]
         snap = engine.snapshot(p)
@@ -3529,7 +4323,7 @@ def run_mesh_gui(engine, args):
                     view_seconds, now, ymin_floor=1.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
         _draw_chart(owd_canvas, "One-way drift (ms)", "v",
-                    [("F", HPE_GREEN, "fwd→"), ("R", "#FF8300", "rtn←")],
+                    [("F", ACCENT_HI, "fwd→"), ("R", "#FF9F45", "rtn←")],
                     {"F": owd_f, "R": owd_r},
                     view_seconds, now, ymin_floor=2.0, unit="",
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}")
@@ -4424,10 +5218,30 @@ def _open_tool_window(root, title, runner, thread_name):
     dlg = tk.Toplevel(root)
     dlg.title(title)
     dlg.configure(bg=BG)
-    txt = tk.Text(dlg, width=76, height=18, bg=PANEL, fg=TXT, relief="flat",
-                  font=("Consolas", 9), state="disabled", wrap="none",
-                  highlightthickness=0, padx=8, pady=8)
-    txt.pack(fill="both", expand=True, padx=10, pady=10)
+    _set_window_icon(dlg)
+    head = tk.Canvas(dlg, bg=BG, highlightthickness=0, bd=0, height=46)
+    head.pack(fill="x")
+
+    def _paint_head(_e=None):
+        w = head.winfo_width()
+        if w < 10:
+            return
+        head.delete("all")
+        _draw_aurora(head, w, 46)
+        _draw_ekg(head, dx=14, dy=6, width=2)
+        head.create_text(76, 23, anchor="w", text=title, fill=TXT,
+                         font=(FONT, 11, "bold"))
+
+    head.bind("<Configure>", _paint_head)
+    # The tool output is a terminal transcript, so it keeps a recessed well
+    # and a mono face rather than pretending to be a document.
+    txt = tk.Text(dlg, width=76, height=18, bg=_over("#000000", BG, 0.45),
+                  fg=TXT_DIM, relief="flat", font=(FONT_MONO, 9),
+                  state="disabled", wrap="none", highlightthickness=1,
+                  highlightbackground=GRID, highlightcolor=GRID,
+                  insertbackground=ACCENT_HI, padx=12, pady=10,
+                  selectbackground=_over(ACCENT, BG, 0.35))
+    txt.pack(fill="both", expand=True, padx=14, pady=(4, 14))
 
     def worker():
         try:
@@ -4476,29 +5290,36 @@ def open_update_dialog(root, update_url, relaunch_argv=None):
         except tk.TclError:
             pass
 
+    GlassButton = _glass_widgets()["button"]
+    GlassCard = _glass_widgets()["card"]
+
     dlg = tk.Toplevel(root)
     root._nq_update_dialog = dlg
     dlg.title("Network Vitals update")
-    dlg.configure(bg=BG, padx=18, pady=14)
+    dlg.configure(bg=BG)
+    _set_window_icon(dlg)
     dlg.resizable(False, False)
     dlg.transient(root)
 
-    tk.Label(dlg, text=f"Installed version: {__version__}", fg=TXT, bg=BG,
-             font=(FONT, 11, "bold")).pack(anchor="w")
+    card = GlassCard(dlg, glow=ACCENT, padx=20, pady=18)
+    card.pack(fill="both", expand=True, padx=14, pady=(14, 8))
+    SURF = card.surface
+    ver = tk.Frame(card.body, bg=SURF)
+    ver.pack(anchor="w", fill="x")
+    tk.Label(ver, text="INSTALLED", fg=TXT_FAINT, bg=SURF,
+             font=(FONT, 7, "bold")).pack(side="left", pady=(4, 0))
+    tk.Label(ver, text=f"v{__version__}", fg=TXT, bg=SURF,
+             font=(FONT, 13, "bold")).pack(side="left", padx=(8, 0))
     status_var = tk.StringVar(value="Checking ...")
-    tk.Label(dlg, textvariable=status_var, fg=TXT_DIM, bg=BG, font=(FONT, 10),
-             wraplength=430, justify="left").pack(anchor="w", pady=(6, 12))
+    tk.Label(card.body, textvariable=status_var, fg=TXT_DIM, bg=SURF,
+             font=(FONT, 10), wraplength=430, justify="left",
+             anchor="w").pack(anchor="w", fill="x", pady=(10, 0))
 
-    btns = tk.Frame(dlg, bg=BG)
-    btns.pack(anchor="e", fill="x")
+    btns = tk.Frame(dlg, bg=BG, padx=14, pady=(0))
+    btns.pack(anchor="e", fill="x", pady=(0, 10))
 
     def mkbtn(text, cmd, primary=False):
-        return tk.Button(btns, text=text, command=cmd,
-                         bg=(HPE_GREEN if primary else PANEL_HI),
-                         fg=("white" if primary else TXT),
-                         activebackground=HPE_GREEN_DK, activeforeground="white",
-                         relief="flat", bd=0, highlightthickness=0,
-                         padx=12, pady=5, font=(FONT, 9, "bold"), cursor="hand2")
+        return GlassButton(btns, text=text, command=cmd, primary=primary)
 
     state = {"manifest": None, "vstr": None}
     outcome = {}  # worker thread -> UI poll loop; workers never touch Tk
@@ -4542,11 +5363,11 @@ def open_update_dialog(root, update_url, relaunch_argv=None):
         status_var.set("Installing ...")
         threading.Thread(target=install_worker, daemon=True).start()
 
-    check_btn = mkbtn("Check again", do_check)
-    install_btn = mkbtn("Install and restart", do_install, primary=True)
+    check_btn = mkbtn("⟳  Check again", do_check)
+    install_btn = mkbtn("⭳  Install and restart", do_install, primary=True)
     close_btn = mkbtn("Close", dlg.destroy)
     close_btn.pack(side="right")
-    check_btn.pack(side="right", padx=(0, 6))
+    check_btn.pack(side="right", padx=(0, 2))
     # install_btn is packed only once an update is actually available
 
     def poll():
@@ -4559,7 +5380,7 @@ def open_update_dialog(root, update_url, relaunch_argv=None):
                 state["manifest"], state["vstr"] = val, val["version"]
                 status_var.set(f"Version {state['vstr']} is available.")
                 install_btn.configure(state="normal")
-                install_btn.pack(side="right", padx=(0, 6))
+                install_btn.pack(side="right", padx=(0, 2))
             else:
                 status_var.set(f"Update check failed: {val}")
         if "install" in outcome:
@@ -4611,65 +5432,102 @@ def run_launcher(update_url=UPDATE_URL):
         v = s.get(key, default)
         return bool(v) if isinstance(v, (bool, int)) else default
 
+    GlassButton = _glass_widgets()["button"]
+    GlassCard = _glass_widgets()["card"]
+    SURF = CARD_SURFACE                      # what the form sits on
+    WELL = _over("#000000", SURF, 0.28)      # recessed field fill
+
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
     except tk.TclError:
         pass
-    style.configure("NQ.TCombobox", fieldbackground=PANEL_HI, background=PANEL_HI,
-                    foreground=TXT, arrowcolor=TXT, bordercolor=GRID,
-                    lightcolor=PANEL_HI, darkcolor=PANEL_HI, insertcolor=TXT,
-                    selectbackground=HPE_GREEN_DK, selectforeground="white")
-    root.option_add("*TCombobox*Listbox.background", PANEL_HI)
+    style.configure("NQ.TCombobox", fieldbackground=WELL, background=WELL,
+                    foreground=TXT, arrowcolor=TXT_DIM,
+                    bordercolor=_over(GLASS, SURF, 0.16), lightcolor=WELL,
+                    darkcolor=WELL, insertcolor=ACCENT_HI,
+                    selectbackground=_over(ACCENT, SURF, 0.40),
+                    selectforeground=TXT, padding=4)
+    style.map("NQ.TCombobox", bordercolor=[("focus", ACCENT)],
+              arrowcolor=[("active", ACCENT_HI)])
+    root.option_add("*TCombobox*Listbox.background", WELL)
     root.option_add("*TCombobox*Listbox.foreground", TXT)
-    root.option_add("*TCombobox*Listbox.selectBackground", HPE_GREEN_DK)
-    root.option_add("*TCombobox*Listbox.selectForeground", "white")
+    root.option_add("*TCombobox*Listbox.selectBackground",
+                    _over(ACCENT, SURF, 0.40))
+    root.option_add("*TCombobox*Listbox.selectForeground", TXT)
 
-    # ---- header -----------------------------------------------------------
-    header = tk.Frame(root, bg=BG, padx=16, pady=12)
-    header.pack(fill="x")
-    ekg = tk.Canvas(header, width=54, height=34, bg=BG, highlightthickness=0)
-    ekg.pack(side="left", padx=(0, 10))
-    _draw_ekg(ekg)
-    tk.Label(header, text="Network Vitals", fg=TXT, bg=BG,
-             font=(FONT, 17, "bold")).pack(side="left")
-    tk.Label(header, text=f"v{__version__}", fg=TXT_DIM, bg=BG,
-             font=(FONT, 10)).pack(side="left", padx=(8, 0), pady=(7, 0))
+    # ---- hero band --------------------------------------------------------
+    HERO_H = 84
+    hero = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0, height=HERO_H,
+                     width=760)
+    hero.pack(fill="x")
     ips = local_ips()
-    if ips:
-        tk.Label(header, text="this machine:  " + "   ".join(ips[:3]),
-                 fg=TXT_DIM, bg=BG, font=(FONT, 9)).pack(side="right",
-                                                         pady=(9, 0))
 
-    body = tk.Frame(root, bg=BG, padx=18, pady=2)
-    body.pack(fill="x")
+    def paint_hero(_e=None):
+        w = hero.winfo_width()
+        if w < 10:
+            return
+        hero.delete("all")
+        _draw_aurora(hero, w, HERO_H)
+        _draw_ekg(hero, dx=20, dy=HERO_H / 2 - 20, width=2)
+        tid = hero.create_text(84, HERO_H / 2 - 8, anchor="w",
+                               text="Network Vitals", fill=TXT,
+                               font=(FONT, 18, "bold"))
+        hero.create_text(hero.bbox(tid)[2] + 9, HERO_H / 2 - 3, anchor="w",
+                         text=f"v{__version__}", fill=TXT_FAINT,
+                         font=(FONT, 9))
+        hero.create_text(85, HERO_H / 2 + 14, anchor="w",
+                         text="bidirectional path instrument — run the same "
+                              "app on both ends", fill=TXT_DIM,
+                         font=(FONT, 9))
+        if ips:
+            hero.create_text(w - 20, HERO_H / 2 - 8, anchor="e",
+                             text="THIS MACHINE", fill=TXT_FAINT,
+                             font=(FONT, 7, "bold"))
+            hero.create_text(w - 20, HERO_H / 2 + 10, anchor="e",
+                             text="   ".join(ips[:3]), fill=TXT_DIM,
+                             font=(FONT_MONO, 9))
+
+    hero.bind("<Configure>", paint_hero)
+
+    body_card = GlassCard(root, glow=ACCENT, padx=18, pady=16)
+    body_card.pack(fill="x", padx=14, pady=(2, 0))
+    body = body_card.body
 
     def mklabel(parent, text, row, dim=False):
-        tk.Label(parent, text=text, fg=(TXT_DIM if dim else TXT), bg=BG,
+        tk.Label(parent, text=text, fg=(TXT_DIM if dim else TXT), bg=SURF,
                  font=(FONT, 10)).grid(row=row, column=0, sticky="w",
-                                       pady=3, padx=(0, 10))
+                                       pady=4, padx=(0, 12))
 
     def mkhint(parent, text, row):
-        tk.Label(parent, text=text, fg=TXT_DIM, bg=BG,
+        tk.Label(parent, text=text, fg=TXT_FAINT, bg=SURF,
                  font=(FONT, 8)).grid(row=row, column=2, sticky="w",
-                                      padx=(10, 0))
+                                      padx=(12, 0))
 
     def mkentry(parent, var, row, width=16):
-        e = tk.Entry(parent, textvariable=var, width=width, bg=PANEL_HI,
-                     fg=TXT, insertbackground=TXT, relief="flat",
-                     highlightthickness=1, highlightbackground=GRID,
-                     highlightcolor=HPE_GREEN, font=(FONT, 10),
-                     disabledbackground=PANEL, disabledforeground=TXT_DIM)
-        e.grid(row=row, column=1, sticky="w", pady=3, ipady=2)
+        e = _glass_entry(tk, parent, var, width, SURF)
+        e.grid(row=row, column=1, sticky="w", pady=4, ipady=4)
         return e
 
-    def mkcheck(parent, text, var, row, column=1, columnspan=2):
-        c = tk.Checkbutton(parent, text=text, variable=var, bg=BG, fg=TXT,
-                           activebackground=BG, activeforeground=TXT,
-                           selectcolor=PANEL_HI, font=(FONT, 9),
-                           highlightthickness=0, anchor="w", cursor="hand2")
-        c.grid(row=row, column=column, columnspan=columnspan, sticky="w", pady=2)
-        return c
+    def mkcheck(parent, text, var, row, column=1, columnspan=2, hint=None):
+        """A glass toggle standing in for tk.Checkbutton: X11 draws that
+        widget's indicator with a hard 3D bevel no option can flatten."""
+        b = GlassButton(parent, text=text, base=SURF, toggle=True, size=9,
+                        check=True)
+
+        def flip():
+            var.set(not bool(var.get()))
+            b.set_on(bool(var.get()))
+
+        b.configure(command=flip)
+        b.set_on(bool(var.get()))
+        b.grid(row=row, column=column, columnspan=columnspan, sticky="w",
+               pady=1)
+        if hint:
+            tk.Label(parent, text=hint, fg=TXT_FAINT, bg=SURF,
+                     font=(FONT, 8)).grid(row=row, column=column + columnspan,
+                                          sticky="w", padx=(12, 0))
+        return b
 
     # ---- basic options ------------------------------------------------------
     peer_var = tk.StringVar(value=sstr("peer", ""))
@@ -4698,17 +5556,18 @@ def run_launcher(update_url=UPDATE_URL):
     mkhint(body, "total probe Mbps for the box - overrides Probes/sec "
                  "(blank = off)", 3)
 
-    mkcheck(body, "Don't fragment - drop oversized probes instead of "
-                  "splitting them (jumbo testing)", df_var, 4)
+    mkcheck(body, "Don't fragment", df_var, 4, column=1, columnspan=1,
+            hint="drop oversized probes instead of splitting them "
+                 "(jumbo testing)")
 
     # ---- advanced options (collapsed by default) ----------------------------
-    adv_btn = tk.Button(root, bg=BG, fg=TXT_DIM, activebackground=BG,
-                        activeforeground=TXT, relief="flat", bd=0,
-                        highlightthickness=0, font=(FONT, 9, "bold"),
-                        cursor="hand2", anchor="w", padx=18)
-    adv_btn.pack(fill="x", pady=(8, 0))
+    adv_row = tk.Frame(root, bg=BG)
+    adv_row.pack(fill="x", padx=14, pady=(10, 0))
+    adv_btn = GlassButton(adv_row, text="▸  Advanced options", size=9)
+    adv_btn.pack(side="left")
 
-    adv_frame = tk.Frame(root, bg=BG, padx=18, pady=2)
+    adv_card = GlassCard(root, glow=ACCENT, padx=18, pady=16)
+    adv_frame = adv_card.body
 
     bind_var = tk.StringVar(value=sstr("bind", "0.0.0.0"))
     udp_var = tk.StringVar(value=sstr("udp_ports", "%d,%d" % DEFAULT_UDP_PORTS))
@@ -4741,17 +5600,19 @@ def run_launcher(update_url=UPDATE_URL):
         mkhint(adv_frame, hint, i)
 
     r = len(rows)
-    mkcheck(adv_frame, "VXLAN encapsulation - carry all probe traffic inside "
-                       "a userspace VTEP (both ends)", vx_var, r, column=0,
-            columnspan=3)
+    mkcheck(adv_frame, "VXLAN encapsulation", vx_var, r, column=1,
+            columnspan=1,
+            hint="carry all probe traffic inside a userspace VTEP "
+                 "(both ends)")
     mklabel(adv_frame, "    VXLAN VNI", r + 1, dim=True)
     vni_entry = mkentry(adv_frame, vni_var, r + 1)
     mkhint(adv_frame, "must match on both ends", r + 1)
     mklabel(adv_frame, "    VXLAN UDP port", r + 2, dim=True)
     vxport_entry = mkentry(adv_frame, vxport_var, r + 2)
     mkhint(adv_frame, "outer tunnel port (default 4789)", r + 2)
-    mkcheck(adv_frame, "Console UI - run in a terminal instead of this "
-                       "dashboard", console_var, r + 3, column=0, columnspan=3)
+    mkcheck(adv_frame, "Console UI", console_var, r + 3, column=1,
+            columnspan=1,
+            hint="run in a terminal instead of this dashboard")
 
     def sync_vxlan(*_):
         st = "normal" if vx_var.get() else "disabled"
@@ -4763,11 +5624,13 @@ def run_launcher(update_url=UPDATE_URL):
 
     def show_adv():
         adv_btn.configure(text="▾  Advanced options")
-        adv_frame.pack(fill="x", after=adv_btn)
+        adv_btn.set_on(True)
+        adv_card.pack(fill="x", after=adv_row, padx=14, pady=(8, 0))
 
     def hide_adv():
         adv_btn.configure(text="▸  Advanced options")
-        adv_frame.pack_forget()
+        adv_btn.set_on(False)
+        adv_card.pack_forget()
 
     def toggle_adv():
         adv["on"] = not adv["on"]
@@ -4777,18 +5640,14 @@ def run_launcher(update_url=UPDATE_URL):
     (show_adv if adv["on"] else hide_adv)()
 
     # ---- bottom bar ---------------------------------------------------------
-    bar = tk.Frame(root, bg=BG, padx=18, pady=14)
+    bar = tk.Frame(root, bg=BG, padx=14, pady=10)
     bar.pack(fill="x", side="bottom")
 
     def mkbarbtn(text, cmd, primary=False):
-        return tk.Button(bar, text=text, command=cmd,
-                         bg=(HPE_GREEN if primary else PANEL_HI),
-                         fg=("white" if primary else TXT),
-                         activebackground=HPE_GREEN_DK, activeforeground="white",
-                         relief="flat", bd=0, highlightthickness=0,
-                         padx=(16 if primary else 12), pady=6,
-                         font=(FONT, 10 if primary else 9, "bold"),
-                         cursor="hand2")
+        return GlassButton(bar, text=text, command=cmd, primary=primary,
+                           size=(10 if primary else 9),
+                           pad_x=(20 if primary else 15),
+                           height=(34 if primary else 30))
 
     def collect():
         return {
@@ -4937,8 +5796,8 @@ def run_launcher(update_url=UPDATE_URL):
     mkbarbtn("⟳  Check for updates", do_update).pack(side="left")
     start_btn = mkbarbtn("▶  Start", do_start, primary=True)
     start_btn.pack(side="right")
-    mkbarbtn("MTU sweep", do_sweep).pack(side="right", padx=(0, 8))
-    mkbarbtn("Burst test", do_burst).pack(side="right", padx=(0, 8))
+    mkbarbtn("⤢  MTU sweep", do_sweep).pack(side="right", padx=(0, 4))
+    mkbarbtn("⚡  Burst test", do_burst).pack(side="right", padx=(0, 4))
 
     peer_box.focus_set()
     root.bind("<Return>", lambda _e: do_start())
@@ -6713,7 +7572,9 @@ def render_report_html(data):
             "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
             "<td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
             "<td>{}</td></tr>\n".format(
-                esc(r["name"]), "UP" if r["connected"] else "DOWN",
+                esc(r["name"]),
+                ('<span class="up">UP</span>' if r["connected"]
+                 else '<span class="down">DOWN</span>'),
                 num(r["rtt_avg"]), num(r["jitter"]), num(r["loss"], "{:.2f}"),
                 num(r["late"], "{:.2f}"), num(r["score"], "{:.0f}"),
                 num(r["mos"]) if r["mos"] is not None else "-",
@@ -6726,54 +7587,179 @@ def render_report_html(data):
     wan = data["wan"]
     wan_html = ""
     if wan:
-        wan_html = ("<p><b>WAN counters ({}):</b> tx {} pps · rx {} pps"
-                    "{}</p>".format(
-                        esc(wan["kind"]), num(wan["tx_pps"], "{:.0f}"),
-                        num(wan["rx_pps"], "{:.0f}"),
-                        f" · drops {num(wan['drop_pps'], '{:.1f}')} pps"
-                        if wan.get("drop_pps") is not None else ""))
+        wan_html = (
+            '<h2>WAN counters ({})</h2>\n<div class="card"><div class="chips">'
+            '<div class="chip"><span>tx</span><b>{} pps</b></div>'
+            '<div class="chip"><span>rx</span><b>{} pps</b></div>{}'
+            "</div></div>".format(
+                esc(wan["kind"]), num(wan["tx_pps"], "{:.0f}"),
+                num(wan["rx_pps"], "{:.0f}"),
+                '<div class="chip"><span>drops</span><b>{} pps</b></div>'.format(
+                    num(wan["drop_pps"], "{:.1f}"))
+                if wan.get("drop_pps") is not None else ""))
+    sc = score_color(o["score"] if isinstance(o["score"], (int, float)) else 0)
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Network Vitals report — {esc(data['peer'])}</title>
 <style>
-body {{ font-family: 'Segoe UI', sans-serif; background: #1a1d21;
-       color: #f2f4f5; margin: 2em; }}
-h1 {{ color: #01A982; }} h2 {{ color: #9aa3ad; margin-top: 1.4em; }}
-table {{ border-collapse: collapse; margin: 0.6em 0; }}
-th, td {{ border: 1px solid #363b44; padding: 5px 10px; text-align: right; }}
-th {{ background: #23272e; color: #01A982; }}
-td:first-child, th:first-child {{ text-align: left; }}
-.score {{ font-size: 2.4em; font-weight: bold; color: #01A982; }}
-.meta {{ color: #9aa3ad; font-size: 0.9em; }}
-ul {{ line-height: 1.6; }}
+/* Same design language as the live dashboard, expressed with the tools a
+   browser actually has: real blur, real alpha, real rounded corners. */
+:root {{
+  --bg: {BG}; --glass: 169,194,255; --accent: {ACCENT_HI};
+  --txt: {TXT}; --dim: {TXT_DIM}; --faint: {TXT_FAINT};
+  --card: rgba(var(--glass), .07); --stroke: rgba(var(--glass), .15);
+  --score: {sc};
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  font-family: 'Segoe UI Variable Text','Segoe UI',Inter,system-ui,sans-serif;
+  background: var(--bg); color: var(--txt); margin: 0;
+  padding: 0 0 5rem; line-height: 1.55;
+  /* the ambient aurora, one gradient per light source */
+  background-image:
+    radial-gradient(60rem 30rem at 5% -8%, rgba(1,169,130,.20), transparent 60%),
+    radial-gradient(50rem 26rem at 70% -14%, rgba(139,124,255,.14), transparent 60%),
+    radial-gradient(44rem 24rem at 100% 8%, rgba(56,189,248,.12), transparent 60%);
+  background-repeat: no-repeat;
+}}
+.wrap {{ max-width: 78rem; margin: 0 auto; padding: 0 2rem; }}
+header {{ padding: 3rem 0 1.6rem; }}
+h1 {{
+  font-size: 1.9rem; margin: 0; letter-spacing: -.02em; font-weight: 700;
+  display: flex; align-items: center; gap: .7rem;
+}}
+h1 svg {{
+  color: var(--accent); flex: none;
+  filter: drop-shadow(0 0 .5rem rgba(43,227,176,.55));
+}}
+h2 {{
+  font-size: .72rem; text-transform: uppercase; letter-spacing: .14em;
+  color: var(--faint); margin: 2.6rem 0 .8rem; font-weight: 700;
+}}
+.meta {{ color: var(--faint); font-size: .82rem; margin: .5rem 0 0; }}
+.meta code {{
+  font-family: {FONT_MONO!r},ui-monospace,monospace; font-size: .78rem;
+  background: rgba(0,0,0,.35); padding: .15rem .45rem; border-radius: .3rem;
+}}
+.card {{
+  background: var(--card); border: 1px solid var(--stroke);
+  border-radius: 1rem; padding: 1.4rem 1.6rem;
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+  box-shadow: 0 1px 0 rgba(255,255,255,.10) inset, 0 18px 40px rgba(0,0,0,.45);
+}}
+.hero {{ display: flex; align-items: center; gap: 2rem; flex-wrap: wrap; }}
+.orb {{
+  --pct: {(o['score'] if isinstance(o['score'], (int, float)) else 0) * 2.7}deg;
+  width: 8.4rem; height: 8.4rem; border-radius: 50%; flex: none;
+  display: grid; place-items: center; position: relative;
+  background:
+    conic-gradient(from 225deg, var(--score) var(--pct),
+                   rgba(0,0,0,.45) var(--pct) 270deg, transparent 270deg),
+    radial-gradient(circle at 50% 35%, rgba(var(--glass),.16), rgba(var(--glass),.05));
+  box-shadow: 0 0 3.5rem -.6rem var(--score);
+}}
+.orb::after {{
+  content: ""; position: absolute; inset: .55rem; border-radius: 50%;
+  background: var(--bg);
+  box-shadow: 0 1px 0 rgba(255,255,255,.09) inset;
+}}
+.orb b {{
+  position: relative; z-index: 1; font-size: 2.5rem; letter-spacing: -.03em;
+}}
+.verdict {{ flex: 1 1 16rem; }}
+.verdict .label {{ font-size: 1.9rem; font-weight: 700; letter-spacing: -.02em; }}
+.verdict .sub {{ color: var(--dim); font-size: .9rem; }}
+.chips {{ display: flex; gap: .6rem; flex-wrap: wrap; margin-top: .9rem; }}
+.chip {{
+  background: rgba(var(--glass), .09); border: 1px solid var(--stroke);
+  border-radius: .6rem; padding: .45rem .8rem; font-size: .82rem;
+}}
+.chip span {{
+  color: var(--faint); text-transform: uppercase; letter-spacing: .08em;
+  font-size: .64rem; font-weight: 700; margin-right: .45rem;
+}}
+.chip b {{ font-variant-numeric: tabular-nums; }}
+.scroll {{ overflow-x: auto; }}
+table {{ border-collapse: collapse; width: 100%; font-size: .86rem; }}
+th, td {{
+  padding: .6rem .8rem; text-align: right; white-space: nowrap;
+  border-bottom: 1px solid rgba(var(--glass), .08);
+  font-variant-numeric: tabular-nums;
+}}
+th {{
+  color: var(--faint); font-size: .66rem; text-transform: uppercase;
+  letter-spacing: .09em; border-bottom-color: var(--stroke);
+}}
+tbody tr:last-child td {{ border-bottom: 0; }}
+tbody tr:hover td {{ background: rgba(var(--glass), .05); }}
+td:first-child, th:first-child {{ text-align: left; font-weight: 600; }}
+.up {{ color: {ACCENT_HI}; }} .down {{ color: {DANGER}; }}
+ul {{ margin: 0; padding-left: 1.1rem; }}
+li {{ margin: .3rem 0; }}
+li b {{ color: {WARN}; font-weight: 600; }}
+footer {{ color: var(--faint); font-size: .76rem; margin-top: 2.6rem; }}
+@media (max-width: 40rem) {{
+  .wrap {{ padding: 0 1rem; }} .orb {{ width: 6.4rem; height: 6.4rem; }}
+  .orb b {{ font-size: 1.9rem; }}
+}}
 </style></head><body>
-<h1>Network Vitals — demo report</h1>
-<p class="meta">generated {esc(data['generated'])} · v{esc(data['version'])}
- · peer {esc(data['peer'])} · uptime {data['uptime_s']} s
- · <code>{esc(data['command_line'])}</code></p>
-<p><span class="score">{o['score']}</span> {esc(o['label'])}
- (worst {o['worst']}, {o['links_up']} streams up)
- · UDP MOS {num(o['udp_mos'])} · TCP PQI {num(o['tcp_pqi'], '{:.0f}')}
- · offered {data['offered_mbps']} Mbps{
-     ' / target ' + str(data['target_mbps']) if data['target_mbps'] else ''}</p>
+<div class="wrap">
+<header>
+  <h1><svg width="47" height="30" viewBox="0 0 54 34" fill="none"
+        aria-hidden="true"><polyline points="2,18 12,18 15,14 18,18 21,18
+        23,21 26,4 29,30 32,18 36,11 40,18 51,18" stroke="currentColor"
+        stroke-width="2.4" stroke-linecap="round"
+        stroke-linejoin="round"/></svg>Network Vitals <span
+    style="color:var(--faint);font-weight:400">report</span></h1>
+  <p class="meta">generated {esc(data['generated'])} · v{esc(data['version'])}
+   · peer {esc(data['peer'])} · uptime {data['uptime_s']} s ·
+   <code>{esc(data['command_line'])}</code></p>
+</header>
+
+<div class="card hero">
+  <div class="orb"><b>{o['score']}</b></div>
+  <div class="verdict">
+    <div class="label">{esc(o['label'])}</div>
+    <div class="sub">worst {o['worst']} · {o['links_up']} streams up ·
+      offered {data['offered_mbps']} Mbps{
+        ' / target ' + str(data['target_mbps']) if data['target_mbps'] else ''}</div>
+    <div class="chips">
+      <div class="chip"><span>UDP MOS</span><b>{num(o['udp_mos'])}</b></div>
+      <div class="chip"><span>TCP PQI</span><b>{num(o['tcp_pqi'], '{:.0f}')}</b></div>
+      <div class="chip"><span>Sent</span><b>{t['tx']:,}</b></div>
+      <div class="chip"><span>Lost</span><b>{t['lost']:,} ({t['loss_pct']:.2f}%)</b></div>
+    </div>
+  </div>
+</div>
 {wan_html}
 <h2>Streams</h2>
-<table><tr><th>Stream</th><th>Status</th><th>RTT ms</th><th>Jitter</th>
+<div class="card scroll">
+<table><thead><tr><th>Stream</th><th>Status</th><th>RTT ms</th><th>Jitter</th>
 <th>Loss %</th><th>Late %</th><th>Score</th><th>MOS</th><th>Sent</th>
-<th>Lost</th><th>DSCP rq→f/r</th></tr>
-{rows_html}</table>
+<th>Lost</th><th>DSCP rq→f/r</th></tr></thead>
+<tbody>
+{rows_html}</tbody></table>
+</div>
+
 <h2>Totals (since reset)</h2>
-<p>sent {t['tx']:,} · received {t['recv']:,} · lost {t['lost']:,}
- ({t['loss_pct']:.2f}%) · late {t['late']:,} ({t['late_pct']:.2f}%) ·
- forward {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%) · return {t['rtn_lost']:,}
- ({t['rtn_pct']:.2f}%)</p>
+<div class="card">
+<p style="margin:0">sent {t['tx']:,} · received {t['recv']:,} ·
+ lost {t['lost']:,} ({t['loss_pct']:.2f}%) · late {t['late']:,}
+ ({t['late_pct']:.2f}%) · forward {t['fwd_lost']:,} ({t['fwd_pct']:.2f}%) ·
+ return {t['rtn_lost']:,} ({t['rtn_pct']:.2f}%)</p>
 <p class="meta">lifetime: sent {t['life_tx']:,} · lost {t['life_lost']:,}
  ({t['life_loss_pct']:.2f}%) · late {t['life_late']:,}
  ({t['life_late_pct']:.2f}%)</p>
+</div>
+
 <h2>Diagnostics</h2>
-<ul>{diag_html}</ul>
-<p class="meta">Generated by Network Vitals v{esc(data['version'])} —
-the SD-WAN demo traffic instrument.</p>
+<div class="card"><ul>{diag_html}</ul></div>
+
+<footer>Generated by Network Vitals v{esc(data['version'])} —
+the SD-WAN demo traffic instrument.</footer>
+</div>
 </body></html>
 """
 
