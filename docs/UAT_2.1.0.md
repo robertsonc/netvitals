@@ -32,7 +32,10 @@ Legend for what a failure means:
 
 These were checked during the release and need no UAT time:
 
-- 127 unit tests pass on Linux, macOS and Windows across Python 3.8–3.12 (CI), plus flake8.
+- The unit suite passes on Linux, macOS and Windows across Python 3.8–3.12 (CI), plus flake8
+  and shellcheck. That includes behaviour tests for `tools/sign_release.sh` — pass-phrase
+  source validation, manifest canonicalisation, and the guarantee that a failed signing
+  leaves no signature behind — so the release tooling itself no longer rests on manual runs.
 - Signed-release integrity: signature verifies over the exact manifest bytes, tampered
   manifest and tampered signature both rejected, artifact SHA-256 matches the signed
   manifest, artifact byte-identical to `git show v2.1.0:netquality.py`, artifact compiles.
