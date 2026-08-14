@@ -35,6 +35,7 @@ Local loopback smoke test (one machine, Linux only - two loopback aliases):
 import argparse
 import array
 import base64
+import functools
 import hashlib
 import hmac
 import json
@@ -2305,6 +2306,13 @@ class Engine:
 #   * ambient glow   - radial washes bled behind accents and live chart lines
 
 
+# Every colour in this UI is arithmetic, and the arithmetic is deterministic:
+# a gradient asks for the same ~180 blends on every repaint, a radial wash for
+# the same falloff steps, the theme for the same handful of tints. Memoising
+# the three primitives turns all of that into dict hits from the second call
+# onward - the single cheapest win available here, and exactly output-
+# identical because they are pure functions of hashable arguments.
+@functools.lru_cache(maxsize=4096)
 def _rgb(c):
     """'#rrggbb' -> (r, g, b)."""
     c = c.lstrip("#")
@@ -2316,6 +2324,7 @@ def _hexc(t):
     return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(v)))) for v in t)
 
 
+@functools.lru_cache(maxsize=8192)
 def _mix(c1, c2, t):
     """Blend two colours: t=0 -> c1, t=1 -> c2."""
     a, b = _rgb(c1), _rgb(c2)
@@ -2443,8 +2452,13 @@ def _rr_points(x0, y0, x1, y1, r):
 
 
 def _round_rect(canvas, x0, y0, x1, y1, r=RADIUS, **kw):
-    """Filled and/or outlined rounded rectangle."""
+    """Filled and/or outlined rounded rectangle.
+
+    splinesteps=4 rather than Tk's default 12: the worst-case chord error on
+    a 16 px corner is 0.08 px, so the curve is identical on screen while Tk
+    flattens and re-rasterises a third of the vertices."""
     kw.setdefault("outline", "")
+    kw.setdefault("splinesteps", 4)
     return canvas.create_polygon(*_rr_points(x0, y0, x1, y1, r), smooth=True,
                                  **kw)
 
@@ -2466,6 +2480,11 @@ def _rr_gradient(canvas, x0, y0, x1, y1, r, top, bottom, step=2, tint=None,
     optional `tint` washes the lit top of the pane with an accent colour,
     which is what sells the surface as translucent rather than merely dark;
     because it rides on the scanlines it is clipped for free."""
+    if tint is None and top == bottom:
+        # A "gradient" with equal endpoints is a fill; emitting one line per
+        # scanline for it is pure waste (and the rounded silhouette comes out
+        # cleaner as a real curve than as stepped scanline insets).
+        return _round_rect(canvas, x0, y0, x1, y1, r, fill=top, **kw)
     h = max(1.0, y1 - y0)
     step = max(1, int(step))
     y = y0
@@ -2481,7 +2500,7 @@ def _rr_gradient(canvas, x0, y0, x1, y1, r, top, bottom, step=2, tint=None,
 
 
 def _shadow(canvas, x0, y0, x1, y1, r=RADIUS, base=BG, spread=9, dy=4,
-            layers=6, strength=0.55):
+            layers=6, strength=0.55, **kw):
     """Soft drop shadow: concentric rounded rects fading into `base`.
 
     Drawn outermost-first so each opaque ring covers the one before it - the
@@ -2490,12 +2509,17 @@ def _shadow(canvas, x0, y0, x1, y1, r=RADIUS, base=BG, spread=9, dy=4,
         g = i / float(layers)                 # 1.0 = outermost, faintest
         pad = spread * g
         a = strength * 0.05 * (1.0 - g + 0.35)
+        col = _over("#000000", base, a)
+        if col == base:
+            # Against a near-black base most of this ramp quantises to the
+            # backdrop itself: the layer is a real spline that renders no
+            # visible pixel. Skip it, and stay correct if the base lightens.
+            continue
         _round_rect(canvas, x0 - pad, y0 - pad + dy * g, x1 + pad,
-                    y1 + pad + dy * g, r + pad,
-                    fill=_over("#000000", base, a))
+                    y1 + pad + dy * g, r + pad, fill=col, **kw)
 
 
-def _radial(canvas, cx, cy, rad, color, base, alpha=0.5, steps=16):
+def _radial(canvas, cx, cy, rad, color, base, alpha=0.5, steps=16, **kw):
     """A soft radial wash - the ambient light bleeding through the glass.
 
     `base` must be the colour actually underneath, since the falloff is
@@ -2507,27 +2531,27 @@ def _radial(canvas, cx, cy, rad, color, base, alpha=0.5, steps=16):
             continue
         rr = rad * g
         canvas.create_oval(cx - rr, cy - rr, cx + rr, cy + rr,
-                           fill=_over(color, base, a), outline="")
+                           fill=_over(color, base, a), outline="", **kw)
 
 
 def _glass(canvas, x0, y0, x1, y1, r=RADIUS, base=BG, top=PANEL_TOP,
            bottom=PANEL_LO, border=GRID, specular=True, shadow=True,
-           glow=None, glow_alpha=0.16, step=2):
+           glow=None, glow_alpha=0.16, step=2, **kw):
     """The house card: shadow, gradient glass body, hairline, specular edge.
 
     Everything a compositor would do for a frosted pane, resolved to flat
     colours: `glow` washes the lit top of the pane with an accent, `specular`
     is the 1 px highlight where the light catches the top bevel."""
     if shadow:
-        _shadow(canvas, x0, y0, x1, y1, r, base=base)
+        _shadow(canvas, x0, y0, x1, y1, r, base=base, **kw)
     _rr_gradient(canvas, x0, y0, x1, y1, r, top, bottom, step=step,
-                 tint=glow, tint_alpha=glow_alpha)
+                 tint=glow, tint_alpha=glow_alpha, **kw)
     if border:
         _round_rect(canvas, x0, y0, x1, y1, r, fill="", outline=border,
-                    width=1)
+                    width=1, **kw)
     if specular:
         canvas.create_line(x0 + r * 0.75, y0 + 1, x1 - r * 0.75, y0 + 1,
-                           fill=STROKE_HI, width=1)
+                           fill=STROKE_HI, width=1, **kw)
 
 
 def _draw_ekg(canvas, color=ACCENT_HI, width=2, glow=True, base=BG, dx=0, dy=0):
@@ -2586,7 +2610,8 @@ def _draw_hairline(canvas, x0, y, x1, base=BG, color=GLASS, alpha=0.16,
                            fill=_over(color, base, a), width=1)
 
 
-def _score_orb(canvas, cx, cy, rad, score, color, base=BG, caption=None):
+def _score_orb(canvas, cx, cy, rad, score, color, base=BG, caption=None,
+               **kw):
     """The headline health readout: a glowing arc gauge wrapped round the
     score. The ring gives the bare number a scale to sit on, and the glow is
     what makes the state readable across a demo room."""
@@ -2596,46 +2621,50 @@ def _score_orb(canvas, cx, cy, rad, score, color, base=BG, caption=None):
     if not dead:
         # Kept inside ~1.35r: a wider bloom gets sliced by the canvas edge in
         # a header band, and a clipped glow reads as a rendering seam.
-        _radial(canvas, cx, cy, rad * 1.35, col, base, alpha=0.40, steps=14)
+        _radial(canvas, cx, cy, rad * 1.35, col, base, alpha=0.40, steps=14,
+                **kw)
     # the glass disc the ring is inlaid into
     _rr_gradient(canvas, cx - rad, cy - rad, cx + rad, cy + rad, rad,
-                 _over(GLASS, base, 0.17), _over(GLASS, base, 0.045), step=2)
+                 _over(GLASS, base, 0.17), _over(GLASS, base, 0.045), step=2,
+                 **kw)
     canvas.create_oval(cx - rad, cy - rad, cx + rad, cy + rad, fill="",
-                       outline=_over(GLASS, base, 0.20), width=1)
+                       outline=_over(GLASS, base, 0.20), width=1, **kw)
 
     ring = rad - 6
     box = (cx - ring, cy - ring, cx + ring, cy + ring)
     canvas.create_arc(*box, start=225, extent=-270, style="arc", width=5,
-                      outline=_over("#000000", _over(GLASS, base, 0.11), 0.45))
+                      outline=_over("#000000", _over(GLASS, base, 0.11), 0.45),
+                      **kw)
     if not dead:
         frac = max(0.0, min(1.0, score / 100.0))
         ext = -270.0 * frac
         if ext:
             for wid, a in ((12, 0.20), (8, 0.38)):   # glow under the arc
                 canvas.create_arc(*box, start=225, extent=ext, style="arc",
-                                  width=wid,
+                                  width=wid, **kw,
                                   outline=_over(col, _over(GLASS, base, 0.10), a))
             canvas.create_arc(*box, start=225, extent=ext, style="arc",
-                              width=5, outline=col)
+                              width=5, outline=col, **kw)
     canvas.create_text(cx, cy - (2 if caption else 0), anchor="center",
                        text=("--" if dead else f"{score:.0f}"),
                        fill=(TXT_FAINT if dead else TXT),
-                       font=(FONT, max(14, int(rad * 0.62)), "bold"))
+                       font=(FONT, max(14, int(rad * 0.62)), "bold"), **kw)
     if caption:
         canvas.create_text(cx, cy + rad * 0.52, anchor="center", text=caption,
-                           fill=TXT_FAINT, font=(FONT, 7, "bold"))
+                           fill=TXT_FAINT, font=(FONT, 7, "bold"), **kw)
 
 
-def _metric_chip(canvas, x0, y0, x1, y1, label, value, color=None, base=BG):
+def _metric_chip(canvas, x0, y0, x1, y1, label, value, color=None, base=BG,
+                 **kw):
     """Small glass tile: a caption beside a number. Used for the UDP MOS /
     TCP PQI pair in the header."""
     _glass(canvas, x0, y0, x1, y1, r=RADIUS_SM, base=base,
            top=_over(GLASS, base, 0.11), bottom=_over(GLASS, base, 0.05),
-           glow=color, glow_alpha=0.13, shadow=False)
+           glow=color, glow_alpha=0.13, shadow=False, **kw)
     canvas.create_text(x0 + 11, (y0 + y1) / 2.0, anchor="w", text=label,
-                       fill=TXT_FAINT, font=(FONT, 7, "bold"))
+                       fill=TXT_FAINT, font=(FONT, 7, "bold"), **kw)
     canvas.create_text(x1 - 11, (y0 + y1) / 2.0, anchor="e", text=value,
-                       fill=(color or TXT), font=(FONT, 13, "bold"))
+                       fill=(color or TXT), font=(FONT, 13, "bold"), **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -2645,6 +2674,13 @@ def _metric_chip(canvas, x0, y0, x1, y1, label, value, color=None, base=BG):
 # ---------------------------------------------------------------------------
 _GLASS_WIDGETS = {}
 _GLOW_PAD = 5      # slack around a pill so its outer glow has room to render
+
+# Set while a window drag is in flight. Every surface in this UI is painted by
+# hand, one canvas item per gradient scanline, and an opaque resize delivers a
+# <Configure> for every intermediate size - tens per second. Repainting on
+# each of them is what makes a drag feel like treacle, so the handlers stand
+# down while this is true and one settle pass repaints everything at the end.
+_RESIZING = [False]
 
 
 def _glass_widgets():
@@ -2865,17 +2901,28 @@ def _glass_widgets():
                 super().configure(**kw)
 
         def _repaint(self, _e=None):
+            if _RESIZING[0]:
+                return
             w, h = self.winfo_width(), self.winfo_height()
             if w < 20 or h < 20:
                 return
-            self.delete("all")            # window items survive: only unmapped
+            # Delete the DRAWN items only. delete("all") would take the
+            # canvas window item with them, which unmaps and remaps the hosted
+            # widget - a full map round trip plus an expose of the whole table
+            # on every repaint, and a visible flicker with it.
             m = _GLOW_PAD
+            if self._win is None:
+                self._win = self.create_window(m + self._padx, m + self._pady,
+                                               window=self.body, anchor="nw")
+            for item in self.find_all():
+                if item != self._win:
+                    self.delete(item)
             _glass(self, m, m, w - m, h - m, r=self._r, base=self._base,
                    top=self._top, bottom=self._bot, glow=self._glow,
                    glow_alpha=0.09, shadow=self._shadow, step=2)
-            self._win = self.create_window(m + self._padx, m + self._pady,
-                                           window=self.body, anchor="nw",
-                                           width=max(10, w - 2 * (m + self._padx)))
+            self.coords(self._win, m + self._padx, m + self._pady)
+            self.itemconfigure(self._win,
+                               width=max(10, w - 2 * (m + self._padx)))
 
     _GLASS_WIDGETS.update(button=GlassButton, card=GlassCard)
     return _GLASS_WIDGETS
@@ -2932,6 +2979,8 @@ def _flow_layout(container, widgets, gap_x=3, gap_y=4):
     state = {"h": -1}
 
     def relayout(_e=None):
+        if _RESIZING[0]:
+            return
         w = container.winfo_width()
         if w <= 1:
             return
@@ -3090,7 +3139,8 @@ def _legend_step(canvas):
 def _legend_show(canvas, on):
     st = _legend_state(canvas)
     st["target"] = 1.0 if on else 0.0
-    if not on:
+    if not on and st.get("cursor"):
+        st["cursor"] = ""
         canvas.configure(cursor="")
     if st["job"] is None and st["alpha"] != st["target"]:
         try:
@@ -3113,8 +3163,13 @@ def _legend_motion(canvas, event):
     st = _legend_state(canvas)
     if st["alpha"] < 0.4:
         return
-    canvas.configure(cursor=("hand2" if _legend_hit(canvas, event.x, event.y)
-                             is not None else ""))
+    # Motion fires hundreds of times a second while the pointer crosses a
+    # chart. Setting the cursor is a Tcl round trip plus an X attribute
+    # change, so only do it when the answer actually changes.
+    want = "hand2" if _legend_hit(canvas, event.x, event.y) is not None else ""
+    if want != st.get("cursor"):
+        st["cursor"] = want
+        canvas.configure(cursor=want)
 
 
 def _legend_items(key, series, samples_by_sid, value_fmt, unit, band,
@@ -3184,9 +3239,12 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
         # the pane instead of printed on it.
         wx0, wy0 = pad_l - 9, pad_t - 9
         wx1, wy1 = pad_r + 10, pad_b + 9
+        # This ramp crosses only ~17 8-bit quantisation steps over the whole
+        # well, so a 2 px sample is ten times finer than anything that can
+        # render. step=8 is still 2x oversampled and drops ~120 items.
         _rr_gradient(canvas, wx0, wy0, wx1, wy1, RADIUS_SM,
                      _over("#000000", surface, 0.38),
-                     _over("#000000", surface, 0.20), step=2)
+                     _over("#000000", surface, 0.20), step=8)
         canvas.create_line(wx0 + 8, wy0 + 1, wx1 - 8, wy0 + 1,
                            fill=_over("#000000", surface, 0.52), width=1)
         canvas._nq_chrome = chrome_key
@@ -3194,7 +3252,26 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
         # so remembering the last chrome id is enough to sweep the data away
         # on the next tick without tagging every single item.
         canvas._nq_static = max(canvas.find_all() or [0])
+        canvas._nq_last = None
     else:
+        # The history sampler appends once a SECOND, but the UI ticks twice a
+        # second, so half of all redraws would re-render byte-identical data
+        # for a sub-pixel shift of the time axis. Skip those. The pixel test
+        # is what keeps it honest at a short --history, where half a second
+        # of scroll is a visible jump rather than a rounding error.
+        newest = 0.0
+        for _sid, _c, _n in series:
+            ss = samples_by_sid.get(_sid)
+            if ss:
+                newest = max(newest, ss[-1]["t"])
+        if band:
+            newest = max(newest, band[-1]["t"])
+        state_key = (newest, len(markers) if markers else 0)
+        last = getattr(canvas, "_nq_last", None)
+        if (last is not None and last[0] == state_key
+                and (now - last[1]) * pw / max(1e-3, view_seconds) < 1.5):
+            return
+        canvas._nq_last = (state_key, now)
         stale = [i for i in canvas.find_all() if i > canvas._nq_static]
         if stale:
             canvas.delete(*stale)
@@ -3274,16 +3351,27 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
         fill = _over(BAND_FILL, well, 0.26)
         edge = _over(BAND_FILL, well, 0.44)
         for run in runs:
-            # Decimate long runs: ~200 vertices per edge is visually identical
-            # and keeps the polygon cheap on a 2 Hz redraw.
-            step = max(1, len(run) // 200)
-            pts = run[::step]
-            if pts[-1] is not run[-1]:
-                pts.append(run[-1])
-            if len(pts) < 2:
+            if len(run) < 2:
                 continue
-            top = [c for tt, lo, hi in pts for c in (X(tt), Y(hi))]
-            bot = [c for tt, lo, hi in reversed(pts) for c in (X(tt), Y(lo))]
+            # Bucket the band the same way, taking the max of `hi` and the min
+            # of `lo` per column: the shaded region can then only ever get
+            # more conservative, never under-report its own spread.
+            nb = max(2, min(len(run), int(pw / 12)))
+            cols = []
+            stepf = len(run) / float(nb)
+            for b in range(nb):
+                i0, i1 = int(b * stepf), min(len(run), int((b + 1) * stepf))
+                if i1 <= i0:
+                    continue
+                chunk = run[i0:i1]
+                cols.append((chunk[0][0], min(c[1] for c in chunk),
+                             max(c[2] for c in chunk)))
+            if cols[-1][0] != run[-1][0]:
+                cols.append(run[-1])
+            if len(cols) < 2:
+                continue
+            top = [c for tt, lo, hi in cols for c in (X(tt), Y(hi))]
+            bot = [c for tt, lo, hi in reversed(cols) for c in (X(tt), Y(lo))]
             canvas.create_polygon(*top, *bot, fill=fill, outline="")
             canvas.create_line(*top, fill=edge, width=1)
 
@@ -3318,16 +3406,42 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
     halos = ((6, 0.10), (4, 0.20)) if not g["tight"] else ((4, 0.18),)
     fill_area = len(series) <= 2
 
-    def _thin(flat, keep):
-        """Subsample a flat [x0,y0,x1,y1,...] polyline to ~`keep` vertices,
-        always retaining the last point so the line still ends where the data
-        does."""
+    def _envelope(flat, buckets):
+        """Reduce a flat [x0,y0,x1,y1,...] polyline to a min/max envelope of
+        `buckets` columns.
+
+        Index striding - the obvious way to thin a line - drops whichever
+        samples fall between strides, and on these charts that is exactly the
+        latency spike the operator is looking for. Keeping the extreme y in
+        each column preserves the silhouette instead, so the halo still flares
+        around a spike; it is only ever used for the decorative strokes, never
+        for the data line itself.
+
+        The old strided version quietly did nothing at the default sampling
+        rate: integer `n // keep` with keep = pw/6 evaluates to 1 for a
+        5-minute, 1 Hz history, so every halo was drawn at full resolution.
+        """
         n = len(flat) // 2
-        step = max(1, n // max(2, keep))
-        if step == 1:
-            return flat
-        out = [c for i in range(0, n, step) for c in flat[i * 2:i * 2 + 2]]
-        if out[-2:] != flat[-2:]:
+        if buckets < 2 or n <= buckets * 2:
+            return flat                       # already at or below target
+        step = n / float(buckets)
+        out = []
+        for b in range(buckets):
+            i0, i1 = int(b * step), min(n, int((b + 1) * step))
+            if i1 <= i0:
+                continue
+            lo = hi = i0
+            for i in range(i0 + 1, i1):
+                y = flat[i * 2 + 1]
+                if y < flat[lo * 2 + 1]:
+                    lo = i
+                elif y > flat[hi * 2 + 1]:
+                    hi = i
+            a, z = (lo, hi) if lo <= hi else (hi, lo)   # keep left-to-right
+            out.extend((flat[a * 2], flat[a * 2 + 1]))
+            if z != a:
+                out.extend((flat[z * 2], flat[z * 2 + 1]))
+        if out[-2:] != flat[-2:]:             # always end where the data ends
             out.extend(flat[-2:])
         return out
 
@@ -3351,7 +3465,7 @@ def _draw_chart(canvas, title, key, series, samples_by_sid, view_seconds, now,
                 poly = list(run) + [run[-2], pad_b, run[0], pad_b]
                 canvas.create_polygon(*poly, fill=_over(color, well, 0.13),
                                       outline="")
-            halo_pts = _thin(run, int(pw / 6))
+            halo_pts = _envelope(run, int(pw / 12))
             for wid, a in halos:
                 canvas.create_line(*halo_pts, fill=_over(color, well, a),
                                    width=wid, capstyle="round",
@@ -3429,32 +3543,57 @@ def run_gui(engine, args):
     hero_state = {"score": None, "label": "Starting…", "sub": "", "detail": "",
                   "mos": None, "pqi": None, "mos_c": None, "pqi_c": None}
 
+    # The band splits into three layers by how often each actually changes,
+    # because a full repaint is ~175 canvas items and the refresh loop was
+    # paying for all of it twice a second to move nothing:
+    #   * backdrop  - aurora + brand lockup: a pure function of the width
+    #   * orb       - only when the displayed integer score or its band moves
+    #   * readouts  - text and chips, genuinely per-tick but cheap
+    hero_cache = {"w": None, "orb": None, "fg": None}
+
     def paint_hero(_event=None):
         w = hero.winfo_width()
         if w < 10:
             return
         h = HERO_H
-        hero.delete("all")
-        _draw_aurora(hero, w, h)
 
-        # brand lockup
-        _draw_ekg(hero, dx=20, dy=h / 2 - 24, width=2)
-        hero.create_text(84, h / 2 - 12, anchor="w", text="Network Vitals",
-                         fill=TXT, font=(FONT, 19, "bold"))
-        hero.create_text(85, h / 2 + 12, anchor="w",
+        if hero_cache["w"] != w:          # backdrop: width-invariant otherwise
+            hero_cache.update(w=w, orb=None, fg=None)
+            hero.delete("all")
+            _draw_aurora(hero, w, h)
+            _draw_ekg(hero, dx=20, dy=h / 2 - 24, width=2)
+            hero.create_text(84, h / 2 - 12, anchor="w", text="Network Vitals",
+                             fill=TXT, font=(FONT, 19, "bold"))
+
+        score = hero_state["score"]
+        col = score_color(score) if score is not None else TXT_DIM
+        rad = 38
+        cx = w - 22 - rad
+        # The arc sweeps 2.7 deg per point and the label is a rounded integer,
+        # so anything finer than a whole point is literally not renderable.
+        orb_key = (None if score is None else round(score), col)
+        if hero_cache["orb"] != orb_key:
+            hero_cache["orb"] = orb_key
+            hero.delete("heroorb")
+            _score_orb(hero, cx, h / 2, rad, score, col, base=BG,
+                       tags="heroorb")
+
+        fg_key = (hero_state["sub"], hero_state["label"], hero_state["detail"],
+                  hero_state["mos"], hero_state["mos_c"], hero_state["pqi"],
+                  hero_state["pqi_c"])
+        if hero_cache["fg"] == fg_key:
+            return
+        hero_cache["fg"] = fg_key
+        hero.delete("herofg")
+
+        hero.create_text(85, h / 2 + 12, anchor="w", tags="herofg",
                          text=hero_state["sub"] or f"peer {args.peer}",
                          fill=TXT_DIM, font=(FONT, 9))
 
         # Right-hand readout cluster, laid out right to left so the orb - the
         # one thing worth seeing from the back of a room - always owns the
         # corner, and the softer readouts drop off as the window narrows.
-        score = hero_state["score"]
-        col = score_color(score) if score is not None else TXT_DIM
-        rad = 38
-        cx = w - 22 - rad
-        _score_orb(hero, cx, h / 2, rad, score, col, base=BG)
         x = cx - rad - 22
-
         if w >= 640:                      # experience text block
             left = x
             for dy, text, fill, font in (
@@ -3462,7 +3601,7 @@ def run_gui(engine, args):
                     (-4, hero_state["label"], TXT, (FONT, 17, "bold")),
                     (18, hero_state["detail"], TXT_DIM, (FONT, 9))):
                 tid = hero.create_text(x, h / 2 + dy, anchor="e", text=text,
-                                       fill=fill, font=font)
+                                       fill=fill, font=font, tags="herofg")
                 left = min(left, hero.bbox(tid)[0])
             x = left - 20
 
@@ -3470,12 +3609,13 @@ def run_gui(engine, args):
             cw, ch = 122, 32
             _metric_chip(hero, x - cw, h / 2 - ch - 3, x, h / 2 - 3,
                          "UDP MOS", hero_state["mos"] or "--",
-                         hero_state["mos_c"] or TXT_FAINT)
+                         hero_state["mos_c"] or TXT_FAINT, tags="herofg")
             _metric_chip(hero, x - cw, h / 2 + 3, x, h / 2 + ch + 3,
                          "TCP PQI", hero_state["pqi"] or "--",
-                         hero_state["pqi_c"] or TXT_FAINT)
+                         hero_state["pqi_c"] or TXT_FAINT, tags="herofg")
 
-    hero.bind("<Configure>", paint_hero)
+    hero.bind("<Configure>",
+              lambda _e: None if _RESIZING[0] else paint_hero())
 
     # ---- toolbar ----------------------------------------------------------
     # Its own row, always: the old header shuffled the buttons in and out of
@@ -3559,8 +3699,9 @@ def run_gui(engine, args):
 
     upd_btn = GlassButton(toolbar, text="⟳  Update", command=do_update)
 
-    _flow_layout(toolbar, [reset_btn, totals_btn, isolate_btn, anatomy_btn,
-                           topo_btn, load_btn, fit_btn, rep_btn, upd_btn])
+    _toolbar_relayout = _flow_layout(
+        toolbar, [reset_btn, totals_btn, isolate_btn, anatomy_btn, topo_btn,
+                  load_btn, fit_btn, rep_btn, upd_btn])
 
     # ---- footer (pinned to the bottom, before charts claim the middle) ----
     # Two short left-anchored lines instead of one mega-line: a label centers
@@ -3570,9 +3711,9 @@ def run_gui(engine, args):
     footer.pack(fill="x", side="bottom")
     rule = tk.Canvas(footer, bg=BG, highlightthickness=0, height=1)
     rule.pack(fill="x", pady=(0, 8))
-    rule.bind("<Configure>", lambda _e: (rule.delete("all"),
-                                         _draw_hairline(rule, 0, 0,
-                                                        rule.winfo_width())))
+    rule.bind("<Configure>", lambda _e: None if _RESIZING[0] else
+              (rule.delete("all"),
+               _draw_hairline(rule, 0, 0, rule.winfo_width())))
     warn_var = tk.StringVar(value="")
     warn_lbl = tk.Label(footer, textvariable=warn_var, fg=WARN, bg=BG,
                         font=(FONT, 9, "bold"), anchor="w")
@@ -3742,7 +3883,8 @@ def run_gui(engine, args):
         c.create_text(x0, y4 + 54, anchor="w", fill=TXT_FAINT, font=(FONT, 9),
                       text=anat_wan_var.get())
 
-    anat_canvas.bind("<Configure>", draw_anatomy)
+    anat_canvas.bind("<Configure>",
+                     lambda _e: None if _RESIZING[0] else draw_anatomy())
     # Measured WAN line inside the anatomy canvas (1.9.0): live counters
     # from --wan-counters next to the model's prediction - the loop closer.
     anat_wan_var = tk.StringVar(value="")
@@ -3822,7 +3964,8 @@ def run_gui(engine, args):
         c.create_text(20, y0 + bh + 26, anchor="w", fill=TXT_DIM,
                       font=(FONT, 9), text=wan_txt)
 
-    topo_canvas.bind("<Configure>", draw_topology)
+    topo_canvas.bind("<Configure>",
+                     lambda _e: None if _RESIZING[0] else draw_topology())
 
     # ---- sustained load panel (hidden; the burst generator made resident) --
     # A known-quantity UDP load offered WHILE the scored streams keep
@@ -4172,12 +4315,51 @@ def run_gui(engine, args):
                     value_fmt=lambda v: f"{v:.1f}" if v < 10 else f"{v:.0f}",
                     markers=marks)
 
+    # ---- resize coalescing --------------------------------------------------
+    # A toplevel's name is in every descendant's bindtags, so this fires for
+    # child <Configure>s too - and it fires on window MOVES, which currently
+    # cost nothing and must keep costing nothing. Hence both filters.
+    RESIZE_SETTLE_MS = 110
+    resize = {"job": None, "wh": None}
+
+    def _resize_settle():
+        resize["job"] = None
+        _RESIZING[0] = False
+        try:
+            _toolbar_relayout()
+            paint_hero()
+            rule.delete("all")
+            _draw_hairline(rule, 0, 0, rule.winfo_width())
+            for _card in (totals_frame, iso_frame, load_frame):
+                if _card.winfo_ismapped():
+                    _card._repaint()
+            draw_anatomy()
+            draw_topology()
+            refresh_body()
+        except tk.TclError:
+            pass                       # window went away mid-drag
+
+    def _on_root_configure(event):
+        if event.widget is not root:
+            return
+        wh = (event.width, event.height)
+        if wh == resize["wh"]:
+            return                     # a move, not a resize
+        resize["wh"] = wh
+        _RESIZING[0] = True
+        if resize["job"] is not None:
+            root.after_cancel(resize["job"])
+        resize["job"] = root.after(RESIZE_SETTLE_MS, _resize_settle)
+
+    root.bind("<Configure>", _on_root_configure)
+
     def refresh():
         # One bad tick must not kill the whole update chain: on an unattended
         # demo screen a single swallowed exception used to freeze the UI on
         # stale numbers forever while probing kept running underneath.
         try:
-            refresh_body()
+            if not _RESIZING[0]:
+                refresh_body()   # the settle pass repaints once, at final size
         except tk.TclError:
             return  # window is being torn down
         except Exception:
@@ -4222,11 +4404,20 @@ def run_mesh_gui(engine, args):
     hero = tk.Canvas(root, bg=BG, highlightthickness=0, bd=0, height=HERO_H)
     hero.pack(fill="x", side="top")
     mesh_state = {"sub": "", "worst": None}
+    mesh_hero_sig = {"v": None}
 
     def paint_hero(_e=None):
         w = hero.winfo_width()
         if w < 10:
             return
+        # Everything here is a pure function of these values, and the refresh
+        # loop calls it twice a second whether they moved or not.
+        worst = mesh_state["worst"]
+        sig = (w, mesh_state["sub"],
+               None if worst is None else (round(worst[0]), worst[1]))
+        if sig == mesh_hero_sig["v"]:
+            return
+        mesh_hero_sig["v"] = sig
         hero.delete("all")
         _draw_aurora(hero, w, HERO_H)
         _draw_ekg(hero, dx=20, dy=HERO_H / 2 - 20, width=2)
@@ -4297,10 +4488,17 @@ def run_mesh_gui(engine, args):
             x += inner * frac
         return out
 
+    matrix_sig = {"v": None}
+
     def draw_matrix(_e=None):
         w = matrix.winfo_width()
         if w < 40:
             return
+        sig = (w, sel["peer"],
+               tuple(tuple(sorted(rows_data[pp].items())) for pp in peers))
+        if sig == matrix_sig["v"]:
+            return
+        matrix_sig["v"] = sig
         matrix.delete("all")
         h = HEAD_H + ROW_H * len(peers) + 14
         _glass(matrix, 4, 4, w - 4, h, r=RADIUS, base=BG, glow=ACCENT_2,
@@ -4373,9 +4571,9 @@ def run_mesh_gui(engine, args):
     footer.pack(fill="x", side="bottom")
     rule = tk.Canvas(footer, bg=BG, highlightthickness=0, height=1)
     rule.pack(fill="x", pady=(0, 8))
-    rule.bind("<Configure>", lambda _e: (rule.delete("all"),
-                                         _draw_hairline(rule, 0, 0,
-                                                        rule.winfo_width())))
+    rule.bind("<Configure>", lambda _e: None if _RESIZING[0] else
+              (rule.delete("all"),
+               _draw_hairline(rule, 0, 0, rule.winfo_width())))
     foot_var = tk.StringVar(value="")
     tk.Label(footer, textvariable=foot_var, fg=TXT_DIM, bg=BG,
              font=(FONT, 9), anchor="w").pack(fill="x", pady=(0, 10))
