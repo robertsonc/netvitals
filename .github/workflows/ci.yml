@@ -1,8 +1,9 @@
 name: CI
 
 # Network Vitals is a single, pure-stdlib script (no third-party runtime deps),
-# so CI just needs a Python and — for the signed-update tests — openssl, both of
-# which the GitHub-hosted runners already provide.
+# so CI just needs a Python and — for the signed-update tests, and for exercising
+# tools/sign_release.sh — openssl, both of which the GitHub-hosted runners already
+# provide. The release script is also shellchecked; see the `shellcheck` job.
 
 on:
   push:
@@ -69,3 +70,29 @@ jobs:
       # the intentional platform-availability import probes.
       - name: Run flake8
         run: python -m flake8 --select=F netquality.py tests
+
+  shellcheck:
+    name: shellcheck (tools/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ShellCheck ships on the GitHub-hosted ubuntu images; install only if that
+      # ever stops being true, so the common path stays fast.
+      - name: Ensure shellcheck
+        run: |
+          command -v shellcheck >/dev/null \
+            || { sudo apt-get update -qq && sudo apt-get install -y shellcheck; }
+          shellcheck --version
+      # Default severity (error, warning, info and style) - tools/ is one small
+      # script and it is clean at that level, so there is nothing to gain by
+      # relaxing it.
+      - name: Lint shell scripts
+        run: shellcheck tools/*.sh
+      - name: Check they are executable and have a shebang
+        run: |
+          status=0
+          for f in tools/*.sh; do
+            [ -x "$f" ] || { echo "not executable: $f" >&2; status=1; }
+            head -1 "$f" | grep -q '^#!' || { echo "no shebang: $f" >&2; status=1; }
+          done
+          exit "$status"
