@@ -1,0 +1,4 @@
+{
+  "name": "Network Vitals",
+  "install": "bash .cursor/install.sh"
+}
