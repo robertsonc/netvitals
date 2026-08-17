@@ -43,10 +43,11 @@ The dashboard shows **four live + history charts**:
   against a min-filtered baseline, and residual clock slew at tens of ppm is
   ~1 ms/min — negligible against real queueing).
 
-plus, in the header:
+plus, in the **HPE Demo Instrument** web dashboard (default; opens in your
+browser with a small desktop dock — set `NV_UI=tk` for the legacy glass UI):
 
-- a big colour-coded **Experience score** (0–100, green = excellent → red = bad),
-  drawn as a glowing arc gauge so the state is readable from across a room,
+- a room-readable **Experience** meter (0–100, HPE green = excellent → amber/red
+  when the path hurts),
 - a **UDP MOS** (E-model, averaged over the UDP streams) and a **TCP PQI** —
   MOS is a media metric and the wrong lens for TCP, which converts loss into
   delay via retransmission, so TCP streams get a **Path Quality Index**
@@ -61,26 +62,21 @@ plus, in the header:
   - TCP connection-establishment time (every reconnect is timed, plus a
     throwaway handshake is sampled every ~15 s per TCP port; establishment
     well beyond the RTT means SYN loss),
-- a **Reset** button that wipes the charts and all accumulated
-  loss/latency/jitter stats so a demo can start from a clean slate,
-- a **Totals** button that toggles a per-stream table of the since-reset
-  counters (sent / received / lost / late / loss %). The bottom status bar
-  always shows the aggregate **since reset** counters (cleared by
-  **Reset**) *and* the **lifetime** counters (never cleared while the
-  app runs), so the loss over the whole run stays visible across resets.
-- an **Isolate** button that splits each stream's round-trip loss into a
-  **forward** component (probes that never reached the peer) and a **return**
-  component (echoes that never made it back), and names the failing leg — see
-  *Locating loss* below.
-- an **Anatomy** button that toggles a byte-proportional wire view of one
-  probe through an EdgeConnect SD-WAN fabric: the LAN packet on top and the
-  predicted tunnel packets (slices + encapsulation overhead) below, with the
-  packet amplification factor and predicted WAN pps — see *Wire anatomy*
-  below.
-- a **Load** button that toggles a sustained-load panel: a known-quantity
-  UDP load (in Mbps, optionally square-waved on/off) offered *while* the
-  scored streams keep measuring, so the charts show what the load does to
-  the path — see *Sustained load* below.
+- **Reset** and **Report** as primary actions, plus a **Tools** menu for the
+  engineer panels (so an SE mid-demo is not hunting nine peer-level buttons):
+  - **Totals** — per-stream since-reset counters (sent / received / lost /
+    late / loss %). The bottom status bar always shows aggregate **since
+    reset** counters (cleared by **Reset**) *and* **lifetime** counters
+    (never cleared while the app runs).
+  - **Isolate** — splits each stream's round-trip loss into **forward**
+    (probes that never reached the peer) vs **return** (echoes that never
+    made it back) — see *Locating loss* below.
+  - **Anatomy** — byte-proportional wire view of one probe through an
+    EdgeConnect SD-WAN fabric — see *Wire anatomy* below.
+  - **Topology** — Host → EC → fabric strip with live numbers.
+  - **Load** — sustained-load panel (known-quantity UDP, optional square
+    wave) while scored streams keep measuring — see *Sustained load* below.
+  - **Fit charts** / **Update** — layout reclaim and signed self-update.
 
 Charts keep a rolling history (default 5 minutes, `--history`). The window
 resizes freely; the charts grow and shrink with it.
@@ -138,10 +134,11 @@ and the loss chart. (The lifetime totals always show the true raw counts.)
 - **Restart-proof loss isolation.** The forward/return loss split survives
   peer restarts, the Reset button, and deep packet reordering; the peer's
   lifetime counters are re-baselined automatically.
-- **Fit charts button.** If the charts ever end up mis-sized, ⤢ Fit charts
-  collapses the Totals/Isolate tables and re-fits the charts to the current
-  window. (The underlying layout bug — charts staying tiny after closing
-  Totals — is also fixed.)
+- **Fit charts.** Under **Tools → Fit charts**, collapses open panels and
+  re-fits the chart grid to the current window.
+- **Web UI pack.** `tools/embed_ui.py` folds `ui/` + `nv_webui.py` into
+  `netquality.py` as a signed-update-friendly zip so a field Update that
+  replaces only this file still ships the HPE Demo Instrument UI.
 - **Single instance per port.** On Windows a second accidentally-launched
   instance now fails to bind instead of silently splitting packets with the
   first one (which used to read as huge random loss on both).

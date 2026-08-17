@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+THESIS: Mesh first viewport is the worst pair — SE finds the weak link fast.
+OWN-WORLD: HPE Demo Instrument.
+STORY: Pick a peer pair, read its Experience, dig into the same charts/tools.
+FORM: HPE Demo Instrument mesh
+-->
+<title>Network Vitals — Mesh</title>
+<link rel="stylesheet" href="/css/tokens.css">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<div class="app" id="app">
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 54 34" fill="none" aria-hidden="true">
+        <polyline points="2,18 12,18 15,14 18,18 21,18 23,21 26,4 29,30 32,18 36,11 40,18 51,18"
+          stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div>
+        <h1>Network Vitals <span class="pill on" style="margin-left:8px">Mesh</span></h1>
+        <div class="sub" id="peerSub">—</div>
+      </div>
+    </div>
+    <div class="topbar-meta">
+      <span class="pill" id="streamPill">0 peers</span>
+      <span id="versionTag"></span>
+    </div>
+  </header>
+
+  <section class="meter-band">
+    <div class="meter-row">
+      <div>
+        <div class="meter-label">Worst pair experience</div>
+        <div class="meter-score idle" id="scoreNum">—</div>
+        <div class="meter-verdict" id="scoreLabel">Waiting for peers</div>
+        <div class="meter-detail" id="scoreDetail">Select a pair below</div>
+        <div class="meter-track"><div class="meter-fill" id="scoreFill"></div></div>
+      </div>
+      <div class="meter-side">
+        <div class="chip"><span>Selected</span><b id="selPeer">—</b></div>
+        <div class="chip"><span>Pairs up</span><b id="pairsUp">—</b></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="actions">
+    <button type="button" class="btn" id="btnReset">Reset</button>
+    <button type="button" class="btn" id="btnReport">Report</button>
+    <button type="button" class="btn" id="btnUpdate">Update</button>
+  </div>
+
+  <div class="panel open" id="panel-pairs" style="max-height:none">
+    <h3>Peer pairs (this node’s vantage)</h3>
+    <div class="table-wrap">
+      <table class="data" id="pairsTable">
+        <thead><tr>
+          <th></th><th>Peer</th><th>Up</th><th>Score</th><th>Label</th>
+          <th>RTT ms</th><th>Loss %</th><th>Jitter</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <section class="charts" id="charts">
+    <div class="chart-card">
+      <header>
+        <h2>Latency (RTT, ms) — selected pair</h2>
+        <div class="legend" id="legLat"></div>
+      </header>
+      <canvas id="cLat"></canvas>
+    </div>
+    <div class="chart-row">
+      <div class="chart-card">
+        <header><h2>Loss + late (%)</h2></header>
+        <canvas id="cLoss"></canvas>
+      </div>
+      <div class="chart-card">
+        <header><h2>Jitter (ms)</h2></header>
+        <canvas id="cJit"></canvas>
+      </div>
+      <div class="chart-card">
+        <header>
+          <h2>One-way drift (ms)</h2>
+          <div class="legend">
+            <span><i style="background:#1ec9a0"></i>fwd→</span>
+            <span><i style="background:#e6a23c"></i>rtn←</span>
+          </div>
+        </header>
+        <canvas id="cOwd"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div id="footPath">—</div>
+    <div class="faint" id="footCnt">—</div>
+  </footer>
+</div>
+<script src="/js/charts.js"></script>
+<script src="/js/mesh.js"></script>
+</body>
+</html>
