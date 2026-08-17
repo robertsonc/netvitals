@@ -9,6 +9,7 @@ main module later without changing the HTTP contract.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import socket
@@ -25,16 +26,28 @@ def _ui_root():
     return os.path.join(here, "ui")
 
 
+def _ui_bundle():
+    try:
+        from ui._bundle import UI_BUNDLE  # type: ignore
+        return UI_BUNDLE
+    except Exception:
+        return {}
+
+
 def _read_ui(path):
-    """Read a UI file from the sibling ui/ tree."""
+    """Read a UI file from the sibling ui/ tree, else from the embed bundle."""
     root = _ui_root()
-    full = os.path.normpath(os.path.join(root, path.lstrip("/")))
-    if not full.startswith(os.path.normpath(root) + os.sep) and full != os.path.normpath(root):
-        return None
-    if not os.path.isfile(full):
-        return None
-    with open(full, "rb") as fh:
-        return fh.read()
+    rel = path.lstrip("/")
+    full = os.path.normpath(os.path.join(root, rel))
+    if full.startswith(os.path.normpath(root) + os.sep) or full == os.path.normpath(root):
+        if os.path.isfile(full):
+            with open(full, "rb") as fh:
+                return fh.read()
+    bundle = _ui_bundle()
+    b64 = bundle.get(rel)
+    if b64:
+        return base64.b64decode(b64)
+    return None
 
 
 _CONTENT_TYPES = {
