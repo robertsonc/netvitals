@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+THESIS: First viewport is a broadcast path meter — room-readable Experience — not a glowing orb header.
+OWN-WORLD: HPE Demo Instrument — cool charcoal, flat panels, #01A982 accent, no aurora/violet glass.
+STORY: SE sees path health instantly; Tools drawer holds engineer depth; exec reads the big number.
+FIRST VIEWPORT: topbar (HPE+name+peer) → EXPERIENCE meter + MOS/PQI → Reset/Report/Tools → charts.
+FORM: HPE Demo Instrument · seed deferred · FINISH: unreviewed and undocumented is unfinished.
+-->
+<title>Network Vitals</title>
+<link rel="stylesheet" href="/css/tokens.css">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<div class="app" id="app">
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 54 34" fill="none" aria-hidden="true">
+        <polyline points="2,18 12,18 15,14 18,18 21,18 23,21 26,4 29,30 32,18 36,11 40,18 51,18"
+          stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div>
+        <h1>Network Vitals</h1>
+        <div class="sub" id="peerSub">peer —</div>
+      </div>
+    </div>
+    <div class="topbar-meta">
+      <span class="pill" id="streamPill">0/0 up</span>
+      <span id="versionTag"></span>
+    </div>
+  </header>
+
+  <section class="meter-band" id="meterBand">
+    <div class="meter-row">
+      <div>
+        <div class="meter-label">Experience</div>
+        <div class="meter-score idle" id="scoreNum">—</div>
+        <div class="meter-verdict" id="scoreLabel">Waiting for peer</div>
+        <div class="meter-detail" id="scoreDetail">Start Network Vitals on the peer workstation</div>
+        <div class="meter-track"><div class="meter-fill" id="scoreFill"></div></div>
+      </div>
+      <div class="meter-side">
+        <div class="chip"><span>UDP MOS</span><b id="mosVal">—</b></div>
+        <div class="chip"><span>TCP PQI</span><b id="pqiVal">—</b></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="actions" id="actions">
+    <button type="button" class="btn" id="btnReset">Reset</button>
+    <button type="button" class="btn" id="btnReport">Report</button>
+    <button type="button" class="btn" id="btnTools">Tools ▾</button>
+    <div class="menu" id="toolsMenu" role="menu">
+      <button type="button" data-panel="totals">Totals</button>
+      <button type="button" data-panel="isolate">Isolate</button>
+      <button type="button" data-panel="anatomy">Anatomy</button>
+      <button type="button" data-panel="topology">Topology</button>
+      <button type="button" data-panel="load">Load</button>
+      <button type="button" data-action="fit">Fit charts</button>
+      <button type="button" data-action="update">Update</button>
+    </div>
+  </div>
+
+  <div class="warn-rail" id="warnRail"></div>
+
+  <div class="panel" id="panel-totals">
+    <h3>Totals (since reset)</h3>
+    <div class="table-wrap">
+      <table class="data" id="totalsTable">
+        <thead><tr>
+          <th>Stream</th><th>Sent</th><th>Recv</th><th>Lost</th><th>Late</th><th>Loss %</th>
+          <th>Size</th><th>DSCP</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-isolate">
+    <h3>Loss isolation</h3>
+    <div class="table-wrap">
+      <table class="data" id="isoTable">
+        <thead><tr>
+          <th>Stream</th><th>Sent</th><th>Fwd lost</th><th>Fwd %</th><th>Rtn lost</th><th>Rtn %</th><th>Where</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="panel" id="panel-anatomy">
+    <h3>Wire anatomy</h3>
+    <div id="anatBody" class="empty">Open while a run is active to see LAN → WAN encapsulation.</div>
+  </div>
+
+  <div class="panel" id="panel-topology">
+    <h3>Topology</h3>
+    <div id="topoBody" class="empty">Host → EdgeConnect → fabric → peer</div>
+  </div>
+
+  <div class="panel" id="panel-load">
+    <h3>Sustained load</h3>
+    <div class="load-form">
+      <label>Mbps <input type="number" id="loadMbps" value="5" min="0.1" max="1000" step="0.1"></label>
+      <label><input type="checkbox" id="loadSquare"> square wave</label>
+      <label>on s <input type="number" id="loadOn" value="10" min="0.1" step="0.1"></label>
+      <label>off s <input type="number" id="loadOff" value="10" min="0.1" step="0.1"></label>
+      <button type="button" class="btn primary" id="btnLoad">Start load</button>
+      <span id="loadStatus" class="faint">idle</span>
+    </div>
+  </div>
+
+  <section class="charts" id="charts">
+    <div class="chart-card">
+      <header>
+        <h2>Latency (RTT, ms)</h2>
+        <div class="legend" id="legLat"></div>
+      </header>
+      <canvas id="cLat"></canvas>
+    </div>
+    <div class="chart-row">
+      <div class="chart-card">
+        <header><h2>Loss + late (%)</h2></header>
+        <canvas id="cLoss"></canvas>
+      </div>
+      <div class="chart-card">
+        <header><h2>Jitter (ms)</h2></header>
+        <canvas id="cJit"></canvas>
+      </div>
+      <div class="chart-card">
+        <header>
+          <h2>One-way drift (ms)</h2>
+          <div class="legend">
+            <span><i style="background:#1ec9a0"></i>fwd→</span>
+            <span><i style="background:#e6a23c"></i>rtn←</span>
+          </div>
+        </header>
+        <canvas id="cOwd"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div id="footPath">—</div>
+    <div class="faint" id="footCnt">—</div>
+  </footer>
+</div>
+<script src="/js/charts.js"></script>
+<script src="/js/dashboard.js"></script>
+</body>
+</html>

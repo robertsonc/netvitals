@@ -3514,6 +3514,20 @@ def _set_window_icon(root):
 
 
 def run_gui(engine, args):
+    """Live dashboard. Default: HPE Demo Instrument web UI (loopback + browser
+    / Tk dock). Set NV_UI=tk to force the legacy glass Tk dashboard."""
+    ui = (os.environ.get("NV_UI") or "web").strip().lower()
+    if ui != "tk":
+        try:
+            import nv_webui
+            return nv_webui.run_web_dashboard(sys.modules[__name__], engine, args)
+        except Exception as e:
+            print(f"web UI unavailable ({e}) - falling back to Tk dashboard.",
+                  file=sys.stderr)
+    return run_gui_tk(engine, args)
+
+
+def run_gui_tk(engine, args):
     import tkinter as tk
     from tkinter import ttk
 
@@ -4383,6 +4397,18 @@ def run_gui(engine, args):
 # Mesh GUI (--peers): a row per pair, charts for the selected pair
 # ---------------------------------------------------------------------------
 def run_mesh_gui(engine, args):
+    ui = (os.environ.get("NV_UI") or "web").strip().lower()
+    if ui != "tk":
+        try:
+            import nv_webui
+            return nv_webui.run_web_mesh(sys.modules[__name__], engine, args)
+        except Exception as e:
+            print(f"web UI unavailable ({e}) - falling back to Tk mesh UI.",
+                  file=sys.stderr)
+    return run_mesh_gui_tk(engine, args)
+
+
+def run_mesh_gui_tk(engine, args):
     import tkinter as tk
 
     view_seconds = float(args.history)
@@ -5741,6 +5767,20 @@ def run_launcher(update_url=UPDATE_URL):
     touching a command line. Returns the argv list to run with, or None when
     the window was closed (or the run was handed to a new console process).
     Raises RuntimeError when no display is available."""
+    ui = (os.environ.get("NV_UI") or "web").strip().lower()
+    if ui != "tk":
+        try:
+            import nv_webui
+            return nv_webui.run_web_launcher(sys.modules[__name__],
+                                            update_url=update_url)
+        except Exception as e:
+            print(f"web launcher unavailable ({e}) - falling back to Tk.",
+                  file=sys.stderr)
+    return run_launcher_tk(update_url)
+
+
+def run_launcher_tk(update_url=UPDATE_URL):
+    """Legacy glass Tk launcher."""
     import tkinter as tk
     from tkinter import messagebox, ttk
 
@@ -7937,78 +7977,59 @@ def render_report_html(data):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Network Vitals report — {esc(data['peer'])}</title>
 <style>
-/* Same design language as the live dashboard, expressed with the tools a
-   browser actually has: real blur, real alpha, real rounded corners. */
+/* HPE Demo Instrument — shared with the live web dashboard (restrained). */
 :root {{
-  --bg: {BG}; --glass: 169,194,255; --accent: {ACCENT_HI};
-  --txt: {TXT}; --dim: {TXT_DIM}; --faint: {TXT_FAINT};
-  --card: rgba(var(--glass), .07); --stroke: rgba(var(--glass), .15);
+  --bg: #0d1218; --surface: #1a2330; --stroke: #2a3545;
+  --accent: #01a982; --accent-hi: #1ec9a0;
+  --txt: #e8eef5; --dim: #8b9aab; --faint: #5c6b7d;
   --score: {sc};
 }}
 * {{ box-sizing: border-box; }}
 body {{
-  font-family: 'Segoe UI Variable Text','Segoe UI',Inter,system-ui,sans-serif;
-  background: var(--bg); color: var(--txt); margin: 0;
-  padding: 0 0 5rem; line-height: 1.55;
-  /* the ambient aurora, one gradient per light source */
-  background-image:
-    radial-gradient(60rem 30rem at 5% -8%, rgba(1,169,130,.20), transparent 60%),
-    radial-gradient(50rem 26rem at 70% -14%, rgba(139,124,255,.14), transparent 60%),
-    radial-gradient(44rem 24rem at 100% 8%, rgba(56,189,248,.12), transparent 60%);
-  background-repeat: no-repeat;
+  font-family: 'Segoe UI Variable Text','Segoe UI',system-ui,sans-serif;
+  background:
+    radial-gradient(80rem 28rem at 0% -20%, rgba(1,169,130,.07), transparent 55%),
+    var(--bg);
+  color: var(--txt); margin: 0; padding: 0 0 5rem; line-height: 1.45;
 }}
 .wrap {{ max-width: 78rem; margin: 0 auto; padding: 0 2rem; }}
-header {{ padding: 3rem 0 1.6rem; }}
+header {{ padding: 2.4rem 0 1.4rem; }}
 h1 {{
-  font-size: 1.9rem; margin: 0; letter-spacing: -.02em; font-weight: 700;
+  font-size: 1.7rem; margin: 0; letter-spacing: -.02em; font-weight: 650;
   display: flex; align-items: center; gap: .7rem;
 }}
-h1 svg {{
-  color: var(--accent); flex: none;
-  filter: drop-shadow(0 0 .5rem rgba(43,227,176,.55));
-}}
+h1 svg {{ color: var(--accent); flex: none; }}
 h2 {{
-  font-size: .72rem; text-transform: uppercase; letter-spacing: .14em;
-  color: var(--faint); margin: 2.6rem 0 .8rem; font-weight: 700;
+  font-size: .7rem; text-transform: uppercase; letter-spacing: .12em;
+  color: var(--faint); margin: 2.2rem 0 .75rem; font-weight: 700;
 }}
 .meta {{ color: var(--faint); font-size: .82rem; margin: .5rem 0 0; }}
 .meta code {{
   font-family: {FONT_MONO!r},ui-monospace,monospace; font-size: .78rem;
-  background: rgba(0,0,0,.35); padding: .15rem .45rem; border-radius: .3rem;
+  background: var(--surface); padding: .15rem .45rem; border-radius: .3rem;
 }}
 .card {{
-  background: var(--card); border: 1px solid var(--stroke);
-  border-radius: 1rem; padding: 1.4rem 1.6rem;
-  backdrop-filter: blur(18px) saturate(140%);
-  -webkit-backdrop-filter: blur(18px) saturate(140%);
-  box-shadow: 0 1px 0 rgba(255,255,255,.10) inset, 0 18px 40px rgba(0,0,0,.45);
+  background: var(--surface); border: 1px solid var(--stroke);
+  border-radius: 10px; padding: 1.25rem 1.4rem;
 }}
-.hero {{ display: flex; align-items: center; gap: 2rem; flex-wrap: wrap; }}
+.hero {{ display: flex; align-items: center; gap: 1.75rem; flex-wrap: wrap; }}
 .orb {{
-  --pct: {(o['score'] if isinstance(o['score'], (int, float)) else 0) * 2.7}deg;
-  width: 8.4rem; height: 8.4rem; border-radius: 50%; flex: none;
+  width: 7.5rem; height: 7.5rem; border-radius: 50%; flex: none;
   display: grid; place-items: center; position: relative;
-  background:
-    conic-gradient(from 225deg, var(--score) var(--pct),
-                   rgba(0,0,0,.45) var(--pct) 270deg, transparent 270deg),
-    radial-gradient(circle at 50% 35%, rgba(var(--glass),.16), rgba(var(--glass),.05));
-  box-shadow: 0 0 3.5rem -.6rem var(--score);
-}}
-.orb::after {{
-  content: ""; position: absolute; inset: .55rem; border-radius: 50%;
-  background: var(--bg);
-  box-shadow: 0 1px 0 rgba(255,255,255,.09) inset;
+  border: 3px solid var(--score);
+  background: #141b24;
 }}
 .orb b {{
-  position: relative; z-index: 1; font-size: 2.5rem; letter-spacing: -.03em;
+  font-size: 2.4rem; letter-spacing: -.03em; font-weight: 650;
+  font-variant-numeric: tabular-nums; color: var(--score);
 }}
 .verdict {{ flex: 1 1 16rem; }}
-.verdict .label {{ font-size: 1.9rem; font-weight: 700; letter-spacing: -.02em; }}
+.verdict .label {{ font-size: 1.75rem; font-weight: 650; letter-spacing: -.02em; }}
 .verdict .sub {{ color: var(--dim); font-size: .9rem; }}
 .chips {{ display: flex; gap: .6rem; flex-wrap: wrap; margin-top: .9rem; }}
 .chip {{
-  background: rgba(var(--glass), .09); border: 1px solid var(--stroke);
-  border-radius: .6rem; padding: .45rem .8rem; font-size: .82rem;
+  background: #141b24; border: 1px solid var(--stroke);
+  border-radius: 6px; padding: .45rem .8rem; font-size: .82rem;
 }}
 .chip span {{
   color: var(--faint); text-transform: uppercase; letter-spacing: .08em;
@@ -8018,25 +8039,25 @@ h2 {{
 .scroll {{ overflow-x: auto; }}
 table {{ border-collapse: collapse; width: 100%; font-size: .86rem; }}
 th, td {{
-  padding: .6rem .8rem; text-align: right; white-space: nowrap;
-  border-bottom: 1px solid rgba(var(--glass), .08);
+  padding: .55rem .75rem; text-align: right; white-space: nowrap;
+  border-bottom: 1px solid var(--stroke);
   font-variant-numeric: tabular-nums;
 }}
 th {{
   color: var(--faint); font-size: .66rem; text-transform: uppercase;
-  letter-spacing: .09em; border-bottom-color: var(--stroke);
+  letter-spacing: .09em;
 }}
 tbody tr:last-child td {{ border-bottom: 0; }}
-tbody tr:hover td {{ background: rgba(var(--glass), .05); }}
+tbody tr:hover td {{ background: rgba(1,169,130,.06); }}
 td:first-child, th:first-child {{ text-align: left; font-weight: 600; }}
-.up {{ color: {ACCENT_HI}; }} .down {{ color: {DANGER}; }}
+.up {{ color: var(--accent-hi); }} .down {{ color: #e45757; }}
 ul {{ margin: 0; padding-left: 1.1rem; }}
 li {{ margin: .3rem 0; }}
-li b {{ color: {WARN}; font-weight: 600; }}
-footer {{ color: var(--faint); font-size: .76rem; margin-top: 2.6rem; }}
+li b {{ color: #e6a23c; font-weight: 600; }}
+footer {{ color: var(--faint); font-size: .76rem; margin-top: 2.4rem; }}
 @media (max-width: 40rem) {{
-  .wrap {{ padding: 0 1rem; }} .orb {{ width: 6.4rem; height: 6.4rem; }}
-  .orb b {{ font-size: 1.9rem; }}
+  .wrap {{ padding: 0 1rem; }} .orb {{ width: 5.8rem; height: 5.8rem; }}
+  .orb b {{ font-size: 1.8rem; }}
 }}
 </style></head><body>
 <div class="wrap">

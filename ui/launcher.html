@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+THESIS: Launcher first screen is peer → Start; advanced stays secondary.
+OWN-WORLD: HPE Demo Instrument (shared tokens).
+STORY: SE picks the other workstation and starts measuring in seconds.
+FIRST VIEWPORT: brand hero, peer field, essentials, primary Start.
+FORM: HPE Demo Instrument
+-->
+<title>Network Vitals — Launch</title>
+<link rel="stylesheet" href="/css/tokens.css">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+<div class="app">
+  <div class="launch">
+    <div class="hero">
+      <div class="brand" style="margin-bottom:12px">
+        <svg class="brand-mark" viewBox="0 0 54 34" fill="none" aria-hidden="true">
+          <polyline points="2,18 12,18 15,14 18,18 21,18 23,21 26,4 29,30 32,18 36,11 40,18 51,18"
+            stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div>
+          <h1>Network Vitals <span style="color:var(--txt-faint);font-weight:500;font-size:0.95rem" id="ver"></span></h1>
+        </div>
+      </div>
+      <p>Bidirectional path instrument — run the same app on both ends.</p>
+      <p style="color:var(--txt-faint);font-size:0.8rem;margin-top:6px" id="localIps"></p>
+    </div>
+
+    <form id="launchForm" autocomplete="off">
+      <div class="form-grid">
+        <label for="peer">Peer IP / host</label>
+        <input id="peer" name="peer" list="recentPeers" required placeholder="10.0.0.2">
+        <datalist id="recentPeers"></datalist>
+        <div class="hint">the other workstation running Network Vitals</div>
+
+        <label for="size">Probe size (B)</label>
+        <input id="size" name="size" value="200">
+        <div class="hint">200 default · 1472 fills a 1500 MTU · 8972 a 9000 jumbo</div>
+
+        <label for="pps">Probes/sec</label>
+        <input id="pps" name="pps" value="50">
+        <div class="hint">per stream (default 50)</div>
+
+        <label for="mbps">Target Mbps</label>
+        <input id="mbps" name="mbps" value="" placeholder="optional">
+        <div class="hint">total probe Mbps — overrides Probes/sec when set</div>
+
+        <label></label>
+        <label style="color:var(--txt)"><input type="checkbox" id="df" name="dont_fragment"> Don't fragment</label>
+      </div>
+
+      <div class="adv">
+        <button type="button" class="btn ghost" id="btnAdv">▸ Advanced options</button>
+        <div id="advPanel" style="display:none;margin-top:14px">
+          <div class="form-grid">
+            <label for="bind">Bind address</label>
+            <input id="bind" value="0.0.0.0">
+            <label for="udp">UDP ports</label>
+            <input id="udp" value="30201,30202">
+            <label for="tcp">TCP ports</label>
+            <input id="tcp" value="30101,30102">
+            <label for="profiles">Profiles</label>
+            <input id="profiles" value="" placeholder="voice,video,bulk…">
+            <label for="dscp">DSCP</label>
+            <input id="dscp" value="" placeholder="EF,AF41,…">
+            <label for="window">Window (s)</label>
+            <input id="window" value="10">
+            <label for="timeout">Probe timeout (s)</label>
+            <input id="timeout" value="2">
+            <label for="deadband">Loss deadband (%)</label>
+            <input id="deadband" value="0.5">
+            <label for="history">Chart history (s)</label>
+            <input id="history" value="300">
+            <label for="refresh">UI refresh (ms)</label>
+            <input id="refresh" value="500">
+            <label></label>
+            <label style="color:var(--txt)"><input type="checkbox" id="vxlan"> VXLAN encapsulation</label>
+            <label for="vni">VXLAN VNI</label>
+            <input id="vni" value="100">
+            <label for="vxport">VXLAN UDP port</label>
+            <input id="vxport" value="4789">
+            <label></label>
+            <label style="color:var(--txt)"><input type="checkbox" id="console"> Console UI</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="launch-bar">
+        <button type="button" class="btn" id="btnUpdate">Update</button>
+        <button type="submit" class="btn primary" id="btnStart">Start</button>
+      </div>
+      <p id="err" style="color:var(--danger);margin-top:12px;display:none"></p>
+    </form>
+  </div>
+</div>
+<script src="/js/launcher.js"></script>
+</body>
+</html>

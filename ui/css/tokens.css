@@ -1,0 +1,38 @@
+/* Network Vitals — HPE Demo Instrument tokens
+   THESIS: broadcast path meter + restrained enterprise chrome; refuse neon glass.
+   OWN-WORLD: cool charcoal ground, flat panels, HPE green accent only for OK/primary.
+   FORM: HPE Demo Instrument */
+:root {
+  --bg: #0d1218;
+  --bg-elev: #141b24;
+  --surface: #1a2330;
+  --surface-2: #222c3a;
+  --stroke: #2a3545;
+  --stroke-hi: #3a475a;
+  --txt: #e8eef5;
+  --txt-dim: #8b9aab;
+  --txt-faint: #5c6b7d;
+  --accent: #01a982;
+  --accent-hi: #1ec9a0;
+  --accent-muted: rgba(1, 169, 130, 0.16);
+  --warn: #e6a23c;
+  --warn-muted: rgba(230, 162, 60, 0.14);
+  --danger: #e45757;
+  --danger-muted: rgba(228, 87, 87, 0.14);
+  --ok: #01a982;
+  --radius: 10px;
+  --radius-sm: 6px;
+  --font: "Segoe UI Variable Text", "Segoe UI", "Helvetica Neue", system-ui, sans-serif;
+  --mono: "Cascadia Mono", "Consolas", "SF Mono", ui-monospace, monospace;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --stream-0: #4db6a0;
+  --stream-1: #6a9fbf;
+  --stream-2: #c4a35a;
+  --stream-3: #b07a8c;
+  --transition: 160ms ease;
+}
