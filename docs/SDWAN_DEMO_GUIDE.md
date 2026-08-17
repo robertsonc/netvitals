@@ -400,17 +400,19 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
   the whole-run truth stays available.
 - **Loss deadband** (0.5 % default): sub-threshold blips read as 0 for the
   score, loss chart *and* the loss-pattern line; raw counts always kept.
-- **Totals / Isolate / Anatomy / Fit charts** toggles; ⟳ Update in-app.
+- **Totals / Isolate / Anatomy / Topology / Load / Fit charts** live under
+  the dashboard **Tools** menu (HPE Demo Instrument web UI); Update is also
+  there (and on the launcher). Set `NV_UI=tk` for the legacy glass chrome.
 - **Single instance per port**: a second accidental launch fails loudly.
 - **Start-order freedom**: either side can start/stop/reboot at any time.
 
-### T15. Sustained load with the charts watching (⚡ Load, 1.7.0)
+### T15. Sustained load with the charts watching (Tools → Load, 1.7.0)
 
 - **Demonstrates:** what a known load does to the path *while the scored
   streams keep measuring* — start the load, watch latency band / jitter /
   one-way drift react on the live charts, stop it, watch them recover. The
   square wave is the calibration pattern for WAN-side counter attribution.
-- **Run:** dashboard → **⚡ Load** → enter Mbps (and optionally square-wave
+- **Run:** dashboard → **Tools → Load** → enter Mbps (and optionally square-wave
   on/off seconds, default 10/10) → *Start load*.
 - **Traffic:** continuous paced 1200-byte UDP TEST probes from an ephemeral
   port to the peer's first UDP port — the burst-test machinery made

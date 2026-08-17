@@ -80,5 +80,34 @@ class TestHttpSmoke(unittest.TestCase):
             httpd.server_close()
 
 
+class TestMeshPayload(unittest.TestCase):
+    def test_mesh_payload_lists_peers(self):
+        args = nq.parse_args(["--peers", "127.0.0.1,127.0.0.2", "--no-gui"])
+        engine = nq.Engine(peers=["127.0.0.1", "127.0.0.2"], size=200, pps=5,
+                           history_seconds=30)
+        try:
+            payload = nv_webui.build_mesh_payload(nq, engine, args, "127.0.0.1")
+            self.assertEqual(payload["mesh"]["peers"],
+                             ["127.0.0.1", "127.0.0.2"])
+            self.assertEqual(len(payload["mesh"]["rows"]), 2)
+            self.assertEqual(payload["snap"]["peer"], "127.0.0.1")
+        finally:
+            engine.shutdown()
+
+
+class TestEmbeddedZip(unittest.TestCase):
+    def test_embedded_zip_round_trips(self):
+        self.assertGreater(len(nq._NV_WEBUI_ZIP_B64), 1000)
+        import base64
+        import io
+        import zipfile
+        data = base64.b64decode(nq._NV_WEBUI_ZIP_B64)
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            names = set(zf.namelist())
+        self.assertIn("nv_webui.py", names)
+        self.assertIn("ui/dashboard.html", names)
+        self.assertIn("ui/launcher.html", names)
+
+
 if __name__ == "__main__":
     unittest.main()

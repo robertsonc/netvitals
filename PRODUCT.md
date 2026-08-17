@@ -62,4 +62,6 @@ Not a generic speed test. A **known-quantity, bidirectional, multi-stream path i
 ## Open decisions / follow-ups
 
 - Host resolved: **browser + Tk dock** (WebView2 deferred; no pip).
-- Signed update still replaces only `netquality.py`. Full UI refresh for field installs needs `tools/embed_ui.py` inlined into the artifact (follow-up) so `ui/` + `nv_webui.py` travel with the signed file.
+- Signed Update parity: `tools/embed_ui.py` packs `ui/` + `nv_webui.py` into
+  `netquality.py` as `_NV_WEBUI_ZIP_B64`; `_ensure_nv_webui()` extracts on
+  demand when the sibling module is missing.

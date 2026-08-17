@@ -232,6 +232,72 @@ class _UiContext:
         self.launcher_result = kw.get("launcher_result")  # dict with argv
         self.shutdown = threading.Event()
         self.update_url = kw.get("update_url") or nv.UPDATE_URL
+        self.selected_peer = kw.get("selected_peer")
+
+
+def build_mesh_payload(nv, engine, args, selected_peer=None):
+    """Per-peer summary rows + full dashboard payload for the selected pair."""
+    peers = list(engine.peers)
+    selected = selected_peer or (peers[0] if peers else None)
+    rows = []
+    worst = None
+    pairs_up = 0
+    for peer in peers:
+        snap = engine.snapshot(peer)
+        up = snap["links_up"] > 0
+        if up:
+            pairs_up += 1
+        live = [r for r in snap["rows"] if r.get("connected")]
+        rtt = (sum(r["rtt_avg"] for r in live) / len(live)) if live else None
+        jit = (max(r["jitter"] for r in live) if live else None)
+        score = snap["overall"] if up else None
+        row = {
+            "peer": peer,
+            "up": up,
+            "links_up": snap["links_up"],
+            "stream_count": len(nv.STREAMS),
+            "score": score,
+            "label": snap["overall_label"],
+            "rtt": rtt,
+            "jitter": jit,
+            "loss_pct": snap["totals"]["loss_pct"],
+        }
+        rows.append(row)
+        if score is not None and (worst is None or score < worst["score"]):
+            worst = {"peer": peer, "score": score, "label": snap["overall_label"]}
+
+    # Reuse dashboard payload builder against the selected peer by temporarily
+    # pointing engine.peer for history accessors that default to self.peer —
+    # history_copy/extra_history_copy already accept peer=.
+    payload = build_dashboard_payload(nv, engine, args, load_gen=None)
+    # Rebuild snap/history for the selected peer explicitly
+    if selected:
+        snap = engine.snapshot(selected)
+        warn, level = _warning_from_snap(nv, snap)
+        out = dict(snap)
+        out["rows"] = _enrich_rows(nv, snap)
+        out["warning"] = warn
+        out["warning_level"] = level
+        out["stream_count"] = len(nv.STREAMS)
+        out["ports"] = nv.ports_summary()
+        out["anatomy"] = _anatomy_payload(nv, engine, args, snap)
+        out["topology"] = _topology_payload(snap)
+        hist = engine.history_copy(selected)
+        owd_f, owd_r, band = engine.extra_history_copy(selected)
+        payload["snap"] = _json_safe(out)
+        payload["history"] = {str(k): _json_safe(v) for k, v in hist.items()}
+        payload["owd_f"] = _json_safe(owd_f)
+        payload["owd_r"] = _json_safe(owd_r)
+        payload["band"] = _json_safe(band)
+
+    payload["mesh"] = {
+        "peers": peers,
+        "rows": rows,
+        "worst": worst,
+        "pairs_up": pairs_up,
+        "selected": selected,
+    }
+    return payload
 
 
 def make_handler(ctx: _UiContext):
@@ -260,10 +326,15 @@ def make_handler(ctx: _UiContext):
 
         def do_GET(self):
             try:
-                path = urlparse(self.path).path
+                parsed = urlparse(self.path)
+                path = parsed.path
                 if path == "/" or path == "/index.html":
-                    page = ("launcher.html" if ctx.mode == "launcher"
-                            else "dashboard.html")
+                    if ctx.mode == "launcher":
+                        page = "launcher.html"
+                    elif ctx.mode == "mesh":
+                        page = "mesh.html"
+                    else:
+                        page = "dashboard.html"
                     data = _read_ui(page)
                     if not data:
                         self._send(500, b"UI assets missing (ui/ not found)",
@@ -295,6 +366,16 @@ def make_handler(ctx: _UiContext):
                 if path == "/api/snapshot" and ctx.engine is not None:
                     payload = build_dashboard_payload(
                         nv, ctx.engine, ctx.args, ctx.load_gen)
+                    self._send(200, json.dumps(payload).encode("utf-8"))
+                    return
+                if path == "/api/mesh/snapshot" and ctx.engine is not None:
+                    from urllib.parse import parse_qs
+                    qs = parse_qs(parsed.query or "")
+                    peer = (qs.get("peer") or [None])[0] or ctx.selected_peer
+                    if peer and peer not in ctx.engine.peers:
+                        peer = ctx.engine.peers[0]
+                    ctx.selected_peer = peer
+                    payload = build_mesh_payload(nv, ctx.engine, ctx.args, peer)
                     self._send(200, json.dumps(payload).encode("utf-8"))
                     return
                 if path == "/api/launcher/bootstrap" and ctx.mode == "launcher":
@@ -339,6 +420,13 @@ def make_handler(ctx: _UiContext):
         def do_POST(self):
             try:
                 path = urlparse(self.path).path
+                if path == "/api/mesh/select" and ctx.engine is not None:
+                    body = self._read_json()
+                    peer = (body.get("peer") or "").strip()
+                    if peer in ctx.engine.peers:
+                        ctx.selected_peer = peer
+                    self._send(200, b'{"ok":true}')
+                    return
                 if path == "/api/reset" and ctx.engine is not None:
                     ctx.engine.reset()
                     self._send(200, b'{"ok":true}')
@@ -546,9 +634,12 @@ def run_web_dashboard(nv, engine, args):
 
 
 def run_web_mesh(nv, engine, args):
-    # Mesh uses the same dashboard payload against the first peer for v1;
-    # pair selection can deepen later without changing the host.
-    run_web_dashboard(nv, engine, args)
+    ctx = _UiContext(
+        "mesh", nv, engine=engine, args=args,
+        selected_peer=engine.peers[0] if engine.peers else None,
+        update_url=getattr(args, "update_url", None))
+    _run_server(ctx, title=f"Network Vitals {nv.__version__} — mesh, "
+                f"{len(engine.peers)} peers")
 
 
 def run_web_launcher(nv, update_url=None):
