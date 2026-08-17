@@ -11,10 +11,12 @@ both workstations. Each instance continuously sends AND receives:
 
 Every stream is a probe -> echo loop, so round-trip time (and therefore latency,
 loss and jitter) is measured without needing the two clocks to be synchronized.
-A realtime GUI (Tkinter, ships with Windows Python) shows per-stream loss,
-latency and jitter, plus an overall connection quality score (ITU-T E-model
-R-factor / MOS). If no display is available it falls back to a console UI
-(keys: r = reset counters, q = quit; shows since-reset AND lifetime totals).
+A realtime GUI shows per-stream loss, latency and jitter, plus an overall
+connection quality score (ITU-T E-model R-factor / MOS). The default UI is the
+HPE Demo Instrument web dashboard (loopback HTTP + browser, with a small Tk
+dock); set NV_UI=tk for the legacy glass Tk UI. If no display is available it
+falls back to a console UI (keys: r = reset counters, q = quit; shows
+since-reset AND lifetime totals).
 
 With --vxlan on both ends, all probe traffic is carried inside genuine VXLAN
 encapsulation between the hosts (userspace VTEP, no admin rights) - used to

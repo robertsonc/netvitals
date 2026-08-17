@@ -59,6 +59,7 @@ Not a generic speed test. A **known-quantity, bidirectional, multi-stream path i
 - Keyboard focus for primary actions where the stack allows
 - Prefer real text in the web UI over canvas-only labels for the main chrome
 
-## Open decisions
+## Open decisions / follow-ups
 
-- Exact native host for embedded UI (WebView2 vs browser+Tk dock) — resolve in implementation spike, same visual system either way
+- Host resolved: **browser + Tk dock** (WebView2 deferred; no pip).
+- Signed update still replaces only `netquality.py`. Full UI refresh for field installs needs `tools/embed_ui.py` inlined into the artifact (follow-up) so `ui/` + `nv_webui.py` travel with the signed file.

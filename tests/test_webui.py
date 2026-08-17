@@ -21,8 +21,9 @@ class TestUiAssets(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(root, rel)), rel)
 
     def test_tokens_are_hpe_green(self):
-        css = open(os.path.join(nv_webui._ui_root(), "css/tokens.css"),
-                   encoding="utf-8").read()
+        path = os.path.join(nv_webui._ui_root(), "css/tokens.css")
+        with open(path, encoding="utf-8") as fh:
+            css = fh.read()
         self.assertIn("#01a982", css.lower())
         self.assertNotIn("#8B7CFF", css)  # no violet accent in new world
 

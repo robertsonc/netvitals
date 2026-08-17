@@ -11,3 +11,4 @@ lastpeer.txt
 # output (artifact + manifest + signature), published as release assets, not tracked here.
 *.pem
 release/
+ui/_bundle.py
