@@ -1,12 +1,15 @@
 """Smoke tests for the HPE Demo Instrument web UI bridge."""
 import json
 import os
+import subprocess
 import sys
+import textwrap
 import threading
 import unittest
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
 import netquality as nq  # noqa: E402
 import nv_webui  # noqa: E402
 
@@ -92,6 +95,77 @@ class TestMeshPayload(unittest.TestCase):
             self.assertEqual(payload["snap"]["peer"], "127.0.0.1")
         finally:
             engine.shutdown()
+
+
+class TestDockTeardown(unittest.TestCase):
+    """The Tk dock must never be reclaimed by a worker thread's GC.
+
+    Regression test for the 3.0.0 crash: starting a session from the web
+    launcher hands off launcher -> dashboard inside ONE process. The
+    launcher dock's Tk root, destroyed at handoff, formed reference cycles
+    (root/widgets/callbacks), so it was reclaimed by whichever thread next
+    triggered the cyclic GC. Once traffic starts, that is an HTTP worker or
+    probe/load thread - _tkinter then deletes the Tcl interpreter on the
+    wrong thread and Tcl abort()s the whole process:
+        Tcl_AsyncDelete: async handler deleted by the wrong thread
+    A C-level abort cannot be asserted in-process, so the scenario runs in
+    a subprocess: without the fix in nv_webui it dies with SIGABRT (rc 134
+    / -6), with the fix it exits 0.
+    """
+
+    def test_dock_teardown_survives_worker_thread_gc(self):
+        script = textwrap.dedent("""
+            import sys, threading, time
+            sys.path.insert(0, %r)
+            import netquality as nq
+            import nv_webui
+
+            nv_webui._open_host = lambda url: None  # no browser tabs from CI
+
+            # Headless boxes never build a dock, so the hazard cannot exist
+            # there - report a skip instead of passing vacuously.
+            _keep_probe = []  # keep the probe root out of the GC experiment
+            try:
+                import tkinter
+                probe = tkinter.Tk()
+                probe.destroy()
+                _keep_probe.append(probe)
+            except Exception:
+                print("SKIP-NO-DISPLAY")
+                raise SystemExit(0)
+
+            ctx = nv_webui._UiContext(
+                "launcher", nq, launcher_result={"argv": None},
+                args=type("A", (), {"_argv": []})())
+            # "Click Start" shortly after the dock is up.
+            threading.Timer(1.0, ctx.shutdown.set).start()
+
+            # Allocation churn on background threads, standing in for the
+            # ThreadingHTTPServer handlers + probe/load threads of a running
+            # session: makes the cyclic GC fire off the main thread.
+            stop = threading.Event()
+            def churn():
+                while not stop.is_set():
+                    _ = [{"k": i} for i in range(500)]
+            for _ in range(4):
+                threading.Thread(target=churn, daemon=True).start()
+
+            nv_webui._run_server(ctx, title="dock teardown test")
+            time.sleep(3.0)  # the post-handoff window where 3.0.0 aborted
+            stop.set()
+            print("OK")
+        """ % (REPO,))
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120,
+            cwd=REPO, text=True)
+        if "SKIP-NO-DISPLAY" in proc.stdout:
+            self.skipTest("no display: Tk dock never built here")
+        self.assertEqual(
+            proc.returncode, 0,
+            f"dock teardown crashed the process (rc={proc.returncode})\n"
+            f"stderr:\n{proc.stderr}")
+        self.assertIn("OK", proc.stdout)
 
 
 class TestEmbeddedZip(unittest.TestCase):
