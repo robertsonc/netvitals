@@ -10,6 +10,7 @@ main module later without changing the HTTP contract.
 from __future__ import annotations
 
 import base64
+import gc
 import json
 import os
 import socket
@@ -550,21 +551,37 @@ def _open_host(url):
         pass
 
 
-def _run_server(ctx, title="Network Vitals"):
-    port = _pick_port()
-    handler = make_handler(ctx)
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
-    url = f"http://127.0.0.1:{port}/"
-    thread = threading.Thread(target=httpd.serve_forever, name="nv-ui", daemon=True)
-    thread.start()
-    _open_host(url)
+# Tk roots of docks whose mainloop has run. A destroyed-but-unreferenced Tk
+# root is CYCLIC garbage (widgets, callbacks and the root reference each
+# other), so it is reclaimed by whichever thread happens to trigger the
+# cyclic GC next - and once a session runs, that is almost always an HTTP
+# worker or probe/load thread, not the main thread that created the Tcl
+# interpreter. _tkinter then finalizes the interpreter off-thread and Tcl
+# aborts the whole process: "Tcl_AsyncDelete: async handler deleted by the
+# wrong thread". Pinning each root here keeps the interpreter alive until
+# process exit (main thread), where deleting it is safe. The cost is one
+# small dead interpreter per dock - at most two per run (launcher, then
+# dashboard/mesh).
+_TK_DOCKS = []
 
-    # Tiny Tk dock: keeps a process window + Quit on machines with a display.
-    dock = {"root": None}
+
+def _run_dock(ctx, url, title):
+    """Tiny Tk dock: keeps a process window + Quit on machines with a display.
+
+    Runs the Tk mainloop on the calling (main) thread until ctx.shutdown or
+    the window is closed. Returns True when a dock ran its mainloop, False
+    when Tk is unavailable (headless) so the caller can block on the
+    shutdown event instead. All Tk locals die with this frame; the caller
+    gc.collect()s right after so the widget cycles are reclaimed on this
+    thread, never on a worker thread (see _TK_DOCKS above).
+    """
     try:
         import tkinter as tk
         root = tk.Tk()
-        dock["root"] = root
+    except Exception:
+        return False
+    _TK_DOCKS.append(root)
+    try:
         nv = ctx.nv
         nv._resolve_fonts(root)
         nv._set_window_icon(root)
@@ -599,7 +616,30 @@ def _run_server(ctx, title="Network Vitals"):
         root.protocol("WM_DELETE_WINDOW", quit_app)
         root.after(200, poll)
         root.mainloop()
+        return True
     except Exception:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        return False
+
+
+def _run_server(ctx, title="Network Vitals"):
+    port = _pick_port()
+    handler = make_handler(ctx)
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    url = f"http://127.0.0.1:{port}/"
+    thread = threading.Thread(target=httpd.serve_forever, name="nv-ui", daemon=True)
+    thread.start()
+    _open_host(url)
+
+    ran_dock = _run_dock(ctx, url, title)
+    # Collect the dock's widget cycles NOW, on the thread that owns the Tcl
+    # interpreter, before the launcher->dashboard handoff (or teardown)
+    # hands the CPU to allocation-heavy worker threads.
+    gc.collect()
+    if not ran_dock:
         # Headless / no Tk: block until shutdown (e.g. launcher start).
         while not ctx.shutdown.wait(0.5):
             pass
