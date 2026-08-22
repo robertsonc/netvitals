@@ -3,10 +3,13 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
+import types
 import unittest
 import urllib.request
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
@@ -120,7 +123,7 @@ class TestDockTeardown(unittest.TestCase):
             import netquality as nq
             import nv_webui
 
-            nv_webui._open_host = lambda url: None  # no browser tabs from CI
+            nv_webui._open_host = lambda *a, **k: None  # no browser windows from CI
 
             # Headless boxes never build a dock, so the hazard cannot exist
             # there - report a skip instead of passing vacuously.
@@ -166,6 +169,95 @@ class TestDockTeardown(unittest.TestCase):
             f"dock teardown crashed the process (rc={proc.returncode})\n"
             f"stderr:\n{proc.stderr}")
         self.assertIn("OK", proc.stdout)
+
+
+class TestAppModeHost(unittest.TestCase):
+    """_open_host prefers a frameless Chromium app-mode window over a tab."""
+
+    URL = "http://127.0.0.1:12345/"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        # A stand-in for the injected netquality module: only config_dir()
+        # is consulted by _open_host, and pointing it at a tempdir keeps the
+        # test away from the real per-user profile.
+        self.fake_nv = types.SimpleNamespace(
+            config_dir=lambda: self.tmp.name)
+        # The app window needs a display on Linux; give the guard one so the
+        # test behaves the same on headless CI runners.
+        patch_env = mock.patch.dict(os.environ, {"DISPLAY": ":0"})
+        patch_env.start()
+        self.addCleanup(patch_env.stop)
+        os.environ.pop("NV_APPWIN", None)
+
+    def test_app_mode_launches_chromium_app_window(self):
+        with mock.patch.object(nv_webui, "_find_chromium",
+                               return_value="/fake/msedge"), \
+             mock.patch.object(nv_webui.subprocess, "Popen") as popen, \
+             mock.patch.object(nv_webui.webbrowser, "open") as web:
+            nv_webui._open_host(self.URL, self.fake_nv)
+        web.assert_not_called()
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[0], "/fake/msedge")
+        self.assertIn("--app=" + self.URL, argv)
+        self.assertIn("--no-first-run", argv)
+        profile = os.path.join(self.tmp.name, "appwin")
+        self.assertIn("--user-data-dir=" + profile, argv)
+        # Fresh profile: the first window gets the instrument geometry ...
+        self.assertIn("--window-size=1280,860", argv)
+        with mock.patch.object(nv_webui, "_find_chromium",
+                               return_value="/fake/msedge"), \
+             mock.patch.object(nv_webui.subprocess, "Popen") as popen2, \
+             mock.patch.object(nv_webui.webbrowser, "open"):
+            nv_webui._open_host(self.URL, self.fake_nv)
+        # ... later opens keep whatever size the operator resized to.
+        self.assertNotIn("--window-size=1280,860", popen2.call_args[0][0])
+
+    def test_no_chromium_falls_back_to_browser_tab(self):
+        with mock.patch.object(nv_webui, "_find_chromium",
+                               return_value=None), \
+             mock.patch.object(nv_webui.subprocess, "Popen") as popen, \
+             mock.patch.object(nv_webui.webbrowser, "open") as web:
+            nv_webui._open_host(self.URL, self.fake_nv)
+        popen.assert_not_called()
+        web.assert_called_once_with(self.URL)
+
+    def test_nv_appwin_0_forces_browser_tab(self):
+        with mock.patch.dict(os.environ, {"NV_APPWIN": "0"}), \
+             mock.patch.object(nv_webui, "_find_chromium",
+                               return_value="/fake/msedge"), \
+             mock.patch.object(nv_webui.subprocess, "Popen") as popen, \
+             mock.patch.object(nv_webui.webbrowser, "open") as web:
+            nv_webui._open_host(self.URL, self.fake_nv)
+        popen.assert_not_called()
+        web.assert_called_once_with(self.URL)
+
+    def test_popen_failure_falls_back_to_browser_tab(self):
+        with mock.patch.object(nv_webui, "_find_chromium",
+                               return_value="/fake/msedge"), \
+             mock.patch.object(nv_webui.subprocess, "Popen",
+                               side_effect=OSError("gone")), \
+             mock.patch.object(nv_webui.webbrowser, "open") as web:
+            nv_webui._open_host(self.URL, self.fake_nv)
+        web.assert_called_once_with(self.URL)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux-only guard")
+    def test_headless_linux_skips_app_mode(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("DISPLAY", "WAYLAND_DISPLAY")}
+        with mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(nv_webui, "_find_chromium") as find, \
+             mock.patch.object(nv_webui.webbrowser, "open") as web:
+            nv_webui._open_host(self.URL, self.fake_nv)
+        find.assert_not_called()
+        web.assert_called_once_with(self.URL)
+
+    def test_candidate_discovery_is_safe_on_this_platform(self):
+        # Never raises, never returns a directory; content is host-specific.
+        exe = nv_webui._find_chromium()
+        if exe is not None:
+            self.assertTrue(os.path.isfile(exe))
 
 
 class TestEmbeddedZip(unittest.TestCase):

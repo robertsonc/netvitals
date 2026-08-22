@@ -43,8 +43,10 @@ The dashboard shows **four live + history charts**:
   against a min-filtered baseline, and residual clock slew at tens of ppm is
   ~1 ms/min — negligible against real queueing).
 
-plus, in the **HPE Demo Instrument** web dashboard (default; opens in your
-browser with a small desktop dock — set `NV_UI=tk` for the legacy glass UI):
+plus, in the **HPE Demo Instrument** web dashboard (default; opens as a
+frameless app window when Edge/Chrome/Chromium is installed — a plain browser
+tab otherwise, or with `NV_APPWIN=0` — with a small desktop dock; set
+`NV_UI=tk` for the legacy glass UI):
 
 - a room-readable **Experience** meter (0–100, HPE green = excellent → amber/red
   when the path hurts),

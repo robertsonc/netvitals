@@ -13,7 +13,10 @@ import base64
 import gc
 import json
 import os
+import shutil
 import socket
+import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -543,8 +546,103 @@ def make_handler(ctx: _UiContext):
     return Handler
 
 
-def _open_host(url):
-    """Open the UI: prefer default browser (cross-platform, no pip)."""
+def _display_ok():
+    """Whether a GUI browser window can appear at all on this platform."""
+    if sys.platform in ("win32", "darwin"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _chromium_candidates():
+    """Ordered candidate paths to a Chromium-family browser.
+
+    App mode (`--app=URL`) is a Chromium feature (Firefox removed its SSB
+    equivalent), so candidates are Edge / Chrome / Chromium / Brave. Windows
+    is the demo platform of record and always ships Edge, so the app window
+    works out of the box there; Edge leads the Windows order for that reason.
+    """
+    if sys.platform == "win32":
+        paths = []
+        try:
+            import winreg
+            for exe in ("msedge.exe", "chrome.exe", "brave.exe"):
+                for root in (winreg.HKEY_CURRENT_USER,
+                             winreg.HKEY_LOCAL_MACHINE):
+                    try:
+                        key = (r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+                               "\\App Paths\\" + exe)
+                        with winreg.OpenKey(root, key) as k:
+                            paths.append(winreg.QueryValueEx(k, None)[0])
+                    except OSError:
+                        pass
+        except ImportError:
+            pass
+        for env in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            base = os.environ.get(env)
+            if base:
+                paths.append(os.path.join(
+                    base, "Microsoft", "Edge", "Application", "msedge.exe"))
+                paths.append(os.path.join(
+                    base, "Google", "Chrome", "Application", "chrome.exe"))
+        return paths
+    if sys.platform == "darwin":
+        return [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        ]
+    return [shutil.which(name) for name in (
+        "google-chrome", "google-chrome-stable", "microsoft-edge",
+        "microsoft-edge-stable", "chromium", "chromium-browser",
+        "brave-browser")]
+
+
+def _find_chromium():
+    for path in _chromium_candidates():
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _open_host(url, nv=None):
+    """Open the UI: a frameless Chromium app-mode window when possible, else
+    the default browser tab (cross-platform, no pip either way).
+
+    `--app` gives the dashboard its own window - no tab strip or address
+    bar, its own taskbar entry - so it reads as an instrument, not a web
+    page (PRODUCT.md's native-window intent without the deferred WebView2
+    interop). A dedicated `--user-data-dir` under the NetVitals config dir
+    keeps the window independent of the user's browsing session: it opens
+    reliably even while their browser is running, remembers the instrument
+    window's geometry, and carries no extensions or restored tabs. Set
+    NV_APPWIN=0 to force the plain browser-tab behaviour.
+    """
+    appwin_off = (os.environ.get("NV_APPWIN") or "").strip().lower() in (
+        "0", "false", "no", "off")
+    exe = None if appwin_off or not _display_ok() else _find_chromium()
+    if exe:
+        argv = [exe, "--app=" + url,
+                "--no-first-run", "--no-default-browser-check"]
+        if nv is not None:
+            try:
+                profile = os.path.join(nv.config_dir(), "appwin")
+                # Size the window only on first run; afterwards Chromium
+                # restores the geometry the operator chose, per profile.
+                fresh = not os.path.isdir(profile)
+                os.makedirs(profile, exist_ok=True)
+                argv.append("--user-data-dir=" + profile)
+                if fresh:
+                    argv.append("--window-size=1280,860")
+            except OSError:
+                pass
+        try:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            return
+        except OSError:
+            pass
     try:
         webbrowser.open(url)
     except Exception:
@@ -596,7 +694,7 @@ def _run_dock(ctx, url, title):
         bar.pack(fill="x", padx=16, pady=12)
 
         def open_again():
-            _open_host(url)
+            _open_host(url, nv)
 
         def quit_app():
             ctx.shutdown.set()
@@ -632,7 +730,7 @@ def _run_server(ctx, title="Network Vitals"):
     url = f"http://127.0.0.1:{port}/"
     thread = threading.Thread(target=httpd.serve_forever, name="nv-ui", daemon=True)
     thread.start()
-    _open_host(url)
+    _open_host(url, ctx.nv)
 
     ran_dock = _run_dock(ctx, url, title)
     # Collect the dock's widget cycles NOW, on the thread that owns the Tcl
