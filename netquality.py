@@ -54,7 +54,7 @@ import time
 import traceback
 from collections import deque
 
-__version__ = "3.0.1"
+__version__ = "3.1.0"
 
 # Where --update / --check-update look for the latest SIGNED release manifest. The
 # manifest is verified against UPDATE_PUBKEY before anything is installed (fail closed),
