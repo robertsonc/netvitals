@@ -61,7 +61,9 @@ Not a generic speed test. A **known-quantity, bidirectional, multi-stream path i
 
 ## Open decisions / follow-ups
 
-- Host resolved: **browser + Tk dock** (WebView2 deferred; no pip).
+- Host resolved: **Chromium app-mode window (Edge/Chrome `--app`, dedicated
+  profile) + Tk dock**, plain browser-tab fallback (`NV_APPWIN=0` forces it;
+  WebView2 deferred; no pip).
 - Signed Update parity: `tools/embed_ui.py` packs `ui/` + `nv_webui.py` into
   `netquality.py` as `_NV_WEBUI_ZIP_B64`; `_ensure_nv_webui()` extracts on
   demand when the sibling module is missing.

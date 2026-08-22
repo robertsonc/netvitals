@@ -52,7 +52,7 @@ Top status rail → monumental Experience meter + MOS/PQI → Reset / Report / T
 
 ## 5. Stack
 
-Web UI in `ui/` served by `nv_webui.py` over loopback; Tk dock for process chrome. `NV_UI=tk` forces legacy glass UI.
+Web UI in `ui/` served by `nv_webui.py` over loopback, opened as a frameless Chromium app-mode window (`msedge`/`chrome --app`, dedicated profile dir) when one is installed — else a browser tab, and `NV_APPWIN=0` forces the tab; Tk dock for process chrome. `NV_UI=tk` forces legacy glass UI.
 
 ## 6. Anti-patterns
 
