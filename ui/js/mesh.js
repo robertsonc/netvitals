@@ -43,11 +43,14 @@
       const tr = document.createElement("tr");
       if (row.peer === state.peer) tr.style.background = "rgba(1,169,130,0.10)";
       if (!row.up) tr.className = "bad";
+      const pub = row.role === "public";
+      const egress = pub && row.egress && row.egress.length
+        ? ` · egress ${row.egress.join(", ")}` : "";
       tr.innerHTML = `<td><input type="radio" name="pair" value="${row.peer}" ${row.peer === state.peer ? "checked" : ""}></td>
-        <td>${row.peer}</td>
+        <td>${row.peer}${pub ? ' <span class="pill on">public</span>' : ""}</td>
         <td>${row.links_up}/${row.stream_count}</td>
         <td>${row.score == null ? "—" : Math.round(row.score)}</td>
-        <td>${row.label}</td>
+        <td>${row.label}${egress}</td>
         <td>${row.rtt == null ? "—" : Number(row.rtt).toFixed(1)}</td>
         <td>${Number(row.loss_pct).toFixed(2)}</td>
         <td>${row.jitter == null ? "—" : Number(row.jitter).toFixed(1)}</td>`;

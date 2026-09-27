@@ -29,6 +29,13 @@ encapsulation** between the hosts (userspace VTEP, no admin rights) — see
 *VXLAN encapsulation* below for using it to demonstrate transparent
 fragmentation.
 
+With `--public HOST` the same streams **also** run, in parallel, to a
+**public endpoint** — a `--responder` on a public IP reached through **local
+internet breakout or SSE** instead of the SD-WAN fabric. The dashboard
+switches between the private and public path and shows the **egress IP**
+the responder saw, so DIA vs SSE is visible on screen — see *Public
+endpoint* below.
+
 The dashboard shows **four live + history charts**:
 
 - **Latency (RTT, ms)** — one line per stream, over a shaded **p5–p95 band**
@@ -130,7 +137,10 @@ and the loss chart. (The lifetime totals always show the true raw counts.)
 - **Peer-only traffic.** Both the UDP and TCP listeners only answer the
   configured `--peer` address. Other hosts on the LAN can't skew the stats or
   use the tool as a packet reflector. (Run `--mtu-sweep` from the paired
-  machine for the same reason.)
+  machine for the same reason.) A `--responder` can't know its clients'
+  post-NAT addresses in advance, so it answers an explicit `--allow` CIDR
+  list instead, with bounded flow/connection tables — see *Public
+  endpoint*.
 - **Mixed `--size` values interoperate.** TCP message framing is
   self-describing, so the two ends may run different probe sizes.
 - **Restart-proof loss isolation.** The forward/return loss split survives
@@ -403,6 +413,14 @@ Bad below.
                    without it the graphical launch window opens instead)
 --peers A,B,...    MESH: probe every listed peer at once (see "Mesh mode");
                    each node runs with its own list of the other nodes
+--public HOST      ALSO probe a public endpoint (a --responder on a public
+                   IP) in parallel, via local breakout / SSE (see "Public
+                   endpoint"); native transport only
+--responder        run as a reflect-only public endpoint: answer --allow'ed
+                   sources, never originate, report each flow's observed
+                   (post-NAT) source address back; headless
+--allow LIST       with --responder: IPv4 addresses/CIDRs to answer, or
+                   'any' (not recommended on an internet-facing host)
 --tcp-pps N        TCP probes/s per stream (default: same as --pps; the UDP
                    50 pps default deliberately matches G.711 voice cadence,
                    TCP models an interactive app - tune independently)
@@ -898,6 +916,124 @@ Notes:
   peer in the list.
 - Probe load scales with the peer count: N peers = N × the usual per-pair
   rate (at defaults, ~80 KB/s each way per peer).
+
+## Public endpoint: local breakout & SSE (`--public`, `--responder`)
+
+Site to site, the probes follow the **private** path: host → EdgeConnect →
+fabric overlay → EdgeConnect → peer. `--public` adds a second destination
+that the SD-WAN treats as **internet** traffic, so the same known-quantity
+streams exercise **local breakout (DIA)** or an **SSE** service, in parallel
+with the fabric traffic:
+
+```mermaid
+flowchart LR
+  A["Branch host<br/>--peer 10.0.0.2 --public 203.0.113.10"] --> EC["EdgeConnect<br/>(branch)"]
+  EC -- "private: fabric overlay" --> HQ["EdgeConnect<br/>(HQ/DC)"] --> B["Peer host 10.0.0.2<br/>--peer 10.0.0.1"]
+  EC -- "public: local breakout (DIA, NAT)" --> NET(("Internet"))
+  EC -- "public: SSE tunnel" --> SSE["SSE PoP<br/>FWaaS + NAT"] --> NET
+  NET --> R["Responder 203.0.113.10<br/>--responder --allow ..."]
+```
+
+**Why a responder, not any internet host?** Loss, jitter, MOS and loss
+isolation need something that echoes probes. A SaaS front door won't, and
+blasting known-quantity UDP at someone else's server isn't acceptable. So
+the public endpoint is a Network Vitals instance you control (a small
+cloud VM or a DMZ host) in **responder** mode. It differs from a normal node
+because the branch's probes reach it **source-NATed** — from the
+EdgeConnect's WAN address (DIA) or the SSE egress address — and nothing can
+be sent back to the branch through that NAT:
+
+- it **only reflects** (never originates), on the same UDP/TCP ports;
+- it admits sources by an explicit **`--allow` CIDR list** (the post-NAT
+  addresses it will see), not a configured peer;
+- it tracks forward-loss gaps **per client flow** (UDP src ip:port, TCP per
+  connection), so several branches — or two SEs behind one SSE egress IP —
+  never share a sequence space;
+- every echo reports the **source address it saw**, which the branch shows
+  as the path's **egress IP**: the EdgeConnect WAN address means local
+  breakout, an SSE-owned address means the SSE service carried it. More
+  than one address means flows are breaking out different uplinks or
+  egress IPs.
+
+### Setup
+
+1. **Responder** (Linux or Windows, public IP, headless):
+
+   ```
+   python3 netquality.py --responder --allow 198.51.100.7,203.0.113.64/28
+   ```
+
+   List the EdgeConnect's internet WAN address(es) for DIA and your SSE
+   tenant's egress range for SSE. Open **UDP 30201–30202 and TCP
+   30101–30102 inbound from those sources only** in the VM's security
+   group / firewall. The responder logs sources as they come and go, a
+   status line per source every 30 s, and — the one you'll need when the
+   egress moves — the **first refused probe from each unknown address**,
+   so you know exactly what to add to `--allow`. `--allow any` works but
+   warns: echoes are never larger than probes (no amplification), yet
+   anyone could bounce traffic off the host.
+
+2. **Branch host**: add the public endpoint next to the private peer — the
+   launcher's *Public endpoint* field, or
+
+   ```
+   python netquality.py --peer 10.0.0.2 --public 203.0.113.10
+   ```
+
+   The private peer runs exactly as before (`--peer 10.0.0.1` on its side);
+   `--peers A,B --public C` works too (the mesh view adds a *public* row).
+
+3. **EdgeConnect policy**: the public endpoint's **destination IP** is what
+   classifies it. Match it (or the probe ports) in the Business Intent
+   Overlay whose internet-traffic policy you want to show — breakout
+   locally, backhaul over the fabric, or hand off to the SSE service — and
+   flip that policy mid-demo: the egress IP and the public path's RTT
+   change on screen while the private path doesn't move.
+
+### What the dashboard shows
+
+- A **path strip** under the Experience meter: *Private · SD-WAN fabric*
+  and *Public · breakout / SSE*, each with its score, RTT, loss — and the
+  egress IP on the public tile. Both scores stay visible to the room;
+  clicking one points the meter, charts, Totals/Isolate/Topology panels and
+  footer at that path.
+- The **Load** panel gets a *target* selector (it follows the path on
+  screen), so the sustained-load generator can load the breakout/SSE path
+  too — the responder echoes load probes like any peer.
+- A **public-path warning** when the responder never answers (after 15 s:
+  responder running? `--allow` covers your egress? breakout/SSE policy and
+  cloud firewall pass the probe ports?), and a public-specific **UDP
+  silent** message — typical when an SSE firewall passes only web ports.
+- The console UI adds a `PUBLIC ...` line; the report adds a *Public path*
+  card; the legacy Tk UI (`NV_UI=tk`) shows the two paths as mesh rows.
+
+### Caveats
+
+- **SSE must pass the probe ports.** An SSE's secure web gateway handles
+  HTTP/HTTPS; custom UDP/TCP ports need a firewall-as-a-service rule
+  permitting them (check what your SSE tenant forwards from an EdgeConnect
+  tunnel). Don't move the probes to TCP 443: a gateway that intercepts 443
+  expects TLS and will reset the raw probe protocol, and UDP 443 (QUIC) is
+  commonly blocked by policy to force TCP fallback.
+- **The SSE egress IP can change** with the PoP (failover, geo). The
+  responder's refusal log names the new address.
+- **The public path is measured from the branch only.** The responder has
+  no dashboard; RTT, jitter, loss, loss isolation (forward gaps per flow —
+  a TCP reconnect starts a new flow), one-way drift and size verification
+  all work as usual. DSCP readback works when the responder runs on
+  POSIX: it reports what arrived, so remarking/bleaching on the internet
+  path shows up. On a Windows **branch**, qWAVE UDP marking is applied
+  toward the private peer only (the same per-destination limit as mesh).
+- **Probe load doubles**: each endpoint gets the full stream set (`--mbps`
+  is per endpoint), and the responder's echoes are cloud egress — roughly
+  4 GB/day per branch at the defaults (4 streams × 50 pps × ~230 B at the
+  IP level), plus any Load runs.
+- **WAN counters** (`--wan-counters`) include breakout traffic on the
+  same uplink; the *predicted* WAN pps covers the fabric streams only.
+- Native transport only (`--vxlan` can't carry it), and scenario load
+  stages still target the private peer. The one-shot tools can be pointed
+  at a responder directly (`--peer <responder> --burst-test`): it echoes
+  their test probes.
 
 ## Windows firewall
 

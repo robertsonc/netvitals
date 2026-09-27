@@ -539,6 +539,34 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
 - **Show:** the self-contained HTML opens anywhere; the JSON feeds
   before/after diffs and CI-style acceptance checks.
 
+### T25. Local breakout vs SSE, side by side with the fabric (3.2.0)
+
+- **Demonstrates:** internet-bound traffic taking the path the Business
+  Intent Overlay's internet policy says — local breakout (DIA), SSE, or
+  backhaul — measured live *in parallel* with the site-to-site fabric
+  traffic, with the egress IP proving which path carried it.
+- **Run:** a responder on a public IP (cloud VM / DMZ):
+  `--responder --allow <EC WAN IPs>,<SSE egress range>`; on the branch,
+  `--peer <private peer> --public <responder IP>` (launcher: *Public
+  endpoint*). Match the responder's IP in the overlay whose internet
+  policy you'll flip.
+- **Traffic:** the full stream set to the responder as well as the
+  private peer — same ports, profiles, DSCP and rates, so the two paths
+  carry identical known-quantity traffic (probe load doubles; `--mbps` is
+  per endpoint). The responder only reflects; the branch measures.
+- **Show:** the path strip under the Experience meter — private vs public
+  scores both on screen; flip the internet policy DIA → SSE and watch the
+  public tile's **egress IP** change to the SSE address and its RTT step
+  up by the PoP detour while the private tile doesn't move. Tools → Load
+  with *target: public endpoint* loads the breakout uplink without
+  touching the fabric streams.
+- **Caveats:** the SSE must forward the probe ports (FWaaS rule for
+  non-web UDP/TCP — a web-only SSE shows *UDP silent on the public path*);
+  never move probes to TCP 443 (SWG interception expects TLS); the SSE
+  egress IP moves with the PoP (the responder logs refused addresses to
+  add to `--allow`); native transport only; cloud egress ≈ 4 GB/day per
+  branch at the defaults.
+
 ## 2.4 Constraint summary (read before scripting a demo)
 
 | Constraint | Detail |
@@ -551,6 +579,7 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
 | Privilege boundaries (2.0.0) | frag sniffer needs root/admin (raw capture); the sweep's ICMP verdict needs Linux (IP_RECVERR, no root); FEC verdict needs a drop-reporting counter source |
 | Version parity | both ends ≥ 1.5.0; VXLAN both-ends-or-neither, same VNI/port |
 | Burst test / Load | both directions carry the offered load (echoes are full-size); burst DF is opt-in via `--dont-fragment` |
+| Public endpoint (3.2.0) | needs a `--responder` you control on a public IP with `--allow` covering the post-NAT egress; native transport only; the SSE must forward the probe ports; Windows branches mark UDP DSCP toward the private peer only (qWAVE is per destination) |
 
 ---
 

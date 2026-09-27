@@ -36,7 +36,11 @@ FORM: HPE Demo Instrument
         <label for="peer">Peer IP / host</label>
         <input id="peer" name="peer" list="recentPeers" required placeholder="10.0.0.2">
         <datalist id="recentPeers"></datalist>
-        <div class="hint">the other workstation running Network Vitals</div>
+        <div class="hint">the other workstation running Network Vitals — the private path across the SD-WAN fabric</div>
+
+        <label for="public">Public endpoint</label>
+        <input id="public" name="public" placeholder="optional — 203.0.113.10">
+        <div class="hint">a Network Vitals <code>--responder</code> on a public IP, probed in parallel via local breakout / SSE</div>
 
         <label for="size">Probe size (B)</label>
         <input id="size" name="size" value="200">

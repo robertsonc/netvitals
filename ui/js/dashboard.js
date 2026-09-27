@@ -6,6 +6,13 @@
     viewSeconds: 300,
     refreshMs: 500,
     loadRunning: false,
+    path: "private",   // "private" (fabric peer) | "public" (breakout/SSE)
+    hasPublic: false,
+  };
+
+  const PATH_ROLE = {
+    private: "Private · SD-WAN fabric",
+    public: "Public · breakout / SSE",
   };
 
   function scoreClass(score) {
@@ -92,6 +99,7 @@
           square: $("loadSquare").checked,
           on_s: Number($("loadOn").value),
           off_s: Number($("loadOff").value),
+          target: state.hasPublic ? $("loadTarget").value : "private",
         };
         const res = await api("/api/load/start", {
           method: "POST",
@@ -106,26 +114,80 @@
     };
   }
 
-  function renderMeter(snap) {
+  function renderMeter(snap, paths) {
     const up = snap.links_up > 0;
     const score = up ? snap.overall : null;
+    const isPublic = snap.role === "public";
     const el = $("scoreNum");
     el.textContent = score == null ? "—" : Math.round(score);
     el.className = "meter-score " + scoreClass(score);
-    $("scoreLabel").textContent = up ? snap.overall_label : "Waiting for peer";
+    $("meterBand").querySelector(".meter-label").textContent = paths
+      ? `Experience · ${isPublic ? "public path" : "private path"}` : "Experience";
+    $("scoreLabel").textContent = up ? snap.overall_label
+      : (isPublic ? "Waiting for public endpoint" : "Waiting for peer");
+    const egress = isPublic && snap.egress && snap.egress.length
+      ? ` · egress ${snap.egress.join(", ")}` : "";
     $("scoreDetail").textContent = up
-      ? `worst ${Math.round(snap.worst)} · ${snap.links_up}/${snap.stream_count} streams up`
-      : `peer ${snap.peer} — no streams up yet`;
+      ? `worst ${Math.round(snap.worst)} · ${snap.links_up}/${snap.stream_count} streams up${egress}`
+      : `${isPublic ? "public endpoint" : "peer"} ${snap.peer} — no streams up yet`;
     const fill = $("scoreFill");
     fill.style.width = (score == null ? 0 : Math.max(0, Math.min(100, score))) + "%";
     fill.style.background = score == null ? "var(--stroke-hi)"
       : score >= 80 ? "var(--accent)" : score >= 50 ? "var(--warn)" : "var(--danger)";
     $("mosVal").textContent = snap.udp_mos == null ? "—" : Number(snap.udp_mos).toFixed(1);
     $("pqiVal").textContent = snap.tcp_pqi == null ? "—" : Math.round(snap.tcp_pqi);
-    $("peerSub").textContent = `peer ${snap.peer} · ${snap.links_up}/${snap.stream_count} streams up`;
+    $("peerSub").textContent = paths
+      ? `private ${paths[0].peer} · public ${paths[1].peer}`
+      : `peer ${snap.peer} · ${snap.links_up}/${snap.stream_count} streams up`;
     const pill = $("streamPill");
     pill.textContent = `${snap.links_up}/${snap.stream_count} up`;
     pill.className = "pill " + (snap.links_up ? "on" : "");
+  }
+
+  function pathMeta(p) {
+    if (!p.up) return `${p.peer} · no echoes yet`;
+    const rtt = p.rtt == null ? "—" : Number(p.rtt).toFixed(1);
+    let meta = `${p.peer} · RTT ${rtt} ms · loss ${Number(p.loss_pct).toFixed(2)}%`;
+    if (p.role === "public" && p.egress && p.egress.length) {
+      meta += ` · egress ${p.egress.join(", ")}`;
+    }
+    return meta;
+  }
+
+  function renderPaths(paths) {
+    const box = $("paths");
+    state.hasPublic = !!paths;
+    if (!paths) { box.hidden = true; return; }
+    box.hidden = false;
+    if (!box.children.length) {
+      for (const p of paths) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "path";
+        btn.dataset.path = p.role;
+        btn.innerHTML = '<span class="path-role"></span><b class="path-score"></b>'
+          + '<span class="path-meta"></span>';
+        btn.querySelector(".path-role").textContent = PATH_ROLE[p.role] || p.role;
+        btn.onclick = () => {
+          if (state.path === p.role) return;
+          state.path = p.role;
+          // Load follows the path on screen unless a run is already going.
+          if (!state.loadRunning) $("loadTarget").value = p.role;
+          tick();
+        };
+        box.appendChild(btn);
+      }
+    }
+    for (const p of paths) {
+      const btn = box.querySelector(`[data-path="${p.role}"]`);
+      if (!btn) continue;
+      btn.setAttribute("aria-pressed", String(state.path === p.role));
+      const sc = btn.querySelector(".path-score");
+      sc.textContent = p.score == null ? "—" : Math.round(p.score);
+      sc.className = "path-score " + scoreClass(p.score);
+      btn.querySelector(".path-meta").textContent = pathMeta(p);
+      btn.title = `${PATH_ROLE[p.role] || p.role}: ${p.label}`;
+    }
   }
 
   function renderWarn(snap) {
@@ -176,8 +238,9 @@
     let load = ` · probe load ${snap.offered_mbps.toFixed(2)} Mbps`;
     if (snap.target_mbps) load += ` / target ${snap.target_mbps}`;
     const vx = snap.vxlan ? ` · VXLAN vni ${snap.vxlan.vni} udp/${snap.vxlan.port}` : "";
+    const who = snap.role === "public" ? "public" : "peer";
     $("footPath").textContent =
-      `peer ${snap.peer} · ${snap.ports} · frame ${snap.frame_size} B DF ${snap.dont_fragment ? "on" : "off"} · size ${snap.size_status}${vx}${load}`;
+      `${who} ${snap.peer} · ${snap.ports} · frame ${snap.frame_size} B DF ${snap.dont_fragment ? "on" : "off"} · size ${snap.size_status}${vx}${load}`;
     $("footCnt").textContent =
       `since reset  sent ${t.tx.toLocaleString()}  lost ${t.lost.toLocaleString()} (${t.loss_pct.toFixed(2)}%)  late ${t.late.toLocaleString()} (${t.late_pct.toFixed(2)}%)   ·   lifetime  sent ${t.life_tx.toLocaleString()}  lost ${t.life_lost.toLocaleString()} (${t.life_loss_pct.toFixed(2)}%)`;
   }
@@ -193,6 +256,12 @@
        <p style="color:var(--txt-dim)">${a.predict}</p>
        <p style="color:var(--txt-faint)">${a.noec}</p>
        ${a.wan_line ? `<p style="color:var(--txt-faint)">${a.wan_line}</p>` : ""}`;
+    if (a.note) {
+      const note = document.createElement("p");
+      note.style.color = "var(--warn)";
+      note.textContent = a.note;
+      $("anatBody").prepend(note);
+    }
   }
 
   function renderTopo(snap) {
@@ -237,10 +306,13 @@
 
   async function tick() {
     try {
-      const payload = await api("/api/snapshot");
+      const q = state.path === "public" ? "?path=public" : "";
+      const payload = await api("/api/snapshot" + q);
       state.viewSeconds = payload.view_seconds || state.viewSeconds;
       state.series = payload.series || [];
-      renderMeter(payload.snap);
+      if (!payload.paths) state.path = "private";
+      renderPaths(payload.paths);
+      renderMeter(payload.snap, payload.paths);
       renderWarn(payload.snap);
       renderTables(payload.snap);
       renderFooter(payload.snap);
@@ -248,6 +320,9 @@
       renderTopo(payload.snap);
       renderCharts(payload);
       if (payload.load) {
+        $("loadTargetWrap").hidden = !payload.load.public;
+        if (payload.load.running) $("loadTarget").value = payload.load.target;
+        $("loadTarget").disabled = !!payload.load.running;
         state.loadRunning = !!payload.load.running;
         $("btnLoad").textContent = state.loadRunning ? "Stop load" : "Start load";
         if (payload.load.status) $("loadStatus").textContent = payload.load.status;

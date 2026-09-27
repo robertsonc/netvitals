@@ -13,6 +13,7 @@
   function collect() {
     return {
       peer: $("peer").value.trim(),
+      public: $("public").value.trim(),
       size: $("size").value.trim(),
       pps: $("pps").value.trim(),
       mbps: $("mbps").value.trim(),
@@ -76,6 +77,7 @@
     }
     const s = b.settings || {};
     if (s.peer) $("peer").value = s.peer;
+    if (s.public) $("public").value = s.public;
     if (s.size != null) $("size").value = s.size;
     if (s.pps != null) $("pps").value = s.pps;
     if (s.mbps) $("mbps").value = s.mbps;

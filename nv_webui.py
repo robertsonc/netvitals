@@ -22,7 +22,7 @@ import time
 import traceback
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 
 def _ui_root():
@@ -93,12 +93,23 @@ def _pick_port():
 
 
 def _warning_from_snap(nv, snap):
+    public = snap.get("role") == "public"
     bleached = []
     for r in snap["rows"]:
         if (r.get("dscp_req") is not None and r.get("fwd_tos") is not None
                 and (r["fwd_tos"] >> 2) != r["dscp_req"]):
             bleached.append(r)
+    if public and not snap["links_up"]:
+        hint = nv.public_silent_hint({"up": False}, snap["uptime"])
+        if hint:
+            return (hint[0].upper() + hint[1:], "bad")
     if snap.get("udp_silent"):
+        if public:
+            # Common on the public path: SSE firewalls often pass only web
+            # ports, and cloud security groups are TCP-first by default.
+            return ("UDP silent on the public path while TCP is up — the "
+                    "breakout/SSE policy or the responder's cloud firewall "
+                    "drops the UDP probe ports", "bad")
         return ("UDP silent while TCP is up — UDP blocked in the path "
                 "(firewall/ACL) or the peer runs an outdated version; "
                 "update BOTH ends", "bad")
@@ -145,16 +156,27 @@ def _anatomy_payload(nv, engine, args, snap):
     wan_line = ""
     if snap.get("wan"):
         wan_line = f"measured WAN: {snap['wan']}"
+    note = ""
+    if snap.get("role") == "public":
+        note = ("Public path: breakout traffic does not ride the fabric "
+                "overlay — local breakout sends it natively (NAT only), SSE "
+                "carries it in the SSE tunnel (IPsec/GRE overhead this model "
+                "does not cover). The slicing model below is the private "
+                "path's.")
     return {
         "inner": inner, "parts": parts, "df": df, "verb": verb, "n": n,
         "wan_total": wan_total, "tax": tax, "predict": predict, "noec": noec,
-        "wan_line": wan_line, "pieces": pieces,
+        "wan_line": wan_line, "pieces": pieces, "note": note,
     }
 
 
 def _topology_payload(snap):
     t = snap["totals"]
-    summary = (f"{snap['peer']}  ·  {snap['links_up']} streams up  ·  "
+    where = (f"public {snap['peer']} via breakout/SSE"
+             if snap.get("role") == "public" else snap["peer"])
+    if snap.get("egress"):
+        where += f" (egress {', '.join(snap['egress'])})"
+    summary = (f"{where}  ·  {snap['links_up']} streams up  ·  "
                f"Experience {snap['overall']:.0f} ({snap['overall_label']})")
     detail = (f"loss {t['loss_pct']:.2f}%  ·  fwd {t['fwd_pct']:.2f}%  ·  "
               f"rtn {t['rtn_pct']:.2f}%  ·  offered {snap['offered_mbps']:.2f} Mbps")
@@ -175,8 +197,10 @@ def _enrich_rows(nv, snap):
     return rows
 
 
-def build_dashboard_payload(nv, engine, args, load_gen=None):
-    snap = engine.snapshot()
+def _pair_snap(nv, engine, args, peer):
+    """The dashboard's view of one pair: the engine snapshot plus the
+    warning line, enriched rows and the panel payloads."""
+    snap = engine.snapshot(peer)
     warn, level = _warning_from_snap(nv, snap)
     out = dict(snap)
     out["rows"] = _enrich_rows(nv, snap)
@@ -186,9 +210,27 @@ def build_dashboard_payload(nv, engine, args, load_gen=None):
     out["ports"] = nv.ports_summary()
     out["anatomy"] = _anatomy_payload(nv, engine, args, snap)
     out["topology"] = _topology_payload(snap)
+    return out
 
-    hist = engine.history_copy()
-    owd_f, owd_r, band = engine.extra_history_copy()
+
+def _paths_payload(engine):
+    """The private/public path strip: one summary per endpoint, or None
+    when no --public endpoint is configured."""
+    if not engine.public:
+        return None
+    return [_json_safe(engine.path_summary(p))
+            for p in (engine.peer, engine.public)]
+
+
+def build_dashboard_payload(nv, engine, args, load_gen=None, peer=None):
+    """Payload for one pair - the private peer by default, or `peer` (the
+    --public endpoint when the dashboard's path switcher selects it)."""
+    if peer not in engine.peers:
+        peer = engine.peer
+    out = _pair_snap(nv, engine, args, peer)
+
+    hist = engine.history_copy(peer)
+    owd_f, owd_r, band = engine.extra_history_copy(peer)
     marks = engine.markers_copy()
     series = [{"id": sid, "label": name.split("-")[1],
                "color": ["#4db6a0", "#6a9fbf", "#c4a35a", "#b07a8c"][sid % 4]}
@@ -199,12 +241,17 @@ def build_dashboard_payload(nv, engine, args, load_gen=None):
     load = None
     if load_gen is not None:
         st = load_gen.status() if load_gen.running else {"running": False}
+        target = ("public" if engine.public and load_gen.peer == engine.public
+                  else "private")
         load = {
             "running": load_gen.running,
             "status": ("running · "
                        f"{st.get('achieved_mbps', 0):.2f} Mbps achieved"
+                       f" → {load_gen.peer}"
                        if load_gen.running else "idle"),
             "disabled": bool(engine.vxlan),
+            "target": target,
+            "public": engine.public,
         }
         if engine.vxlan:
             load["status"] = ("unavailable in VXLAN mode "
@@ -222,6 +269,7 @@ def build_dashboard_payload(nv, engine, args, load_gen=None):
         "band": _json_safe(band),
         "markers": _json_safe(marks),
         "snap": _json_safe(out),
+        "paths": _paths_payload(engine),
         "load": load,
     }
 
@@ -247,52 +295,18 @@ def build_mesh_payload(nv, engine, args, selected_peer=None):
     worst = None
     pairs_up = 0
     for peer in peers:
-        snap = engine.snapshot(peer)
-        up = snap["links_up"] > 0
-        if up:
+        row = engine.path_summary(peer)
+        if row["up"]:
             pairs_up += 1
-        live = [r for r in snap["rows"] if r.get("connected")]
-        rtt = (sum(r["rtt_avg"] for r in live) / len(live)) if live else None
-        jit = (max(r["jitter"] for r in live) if live else None)
-        score = snap["overall"] if up else None
-        row = {
-            "peer": peer,
-            "up": up,
-            "links_up": snap["links_up"],
-            "stream_count": len(nv.STREAMS),
-            "score": score,
-            "label": snap["overall_label"],
-            "rtt": rtt,
-            "jitter": jit,
-            "loss_pct": snap["totals"]["loss_pct"],
-        }
-        rows.append(row)
+        rows.append(_json_safe(row))
+        score = row["score"]
         if score is not None and (worst is None or score < worst["score"]):
-            worst = {"peer": peer, "score": score, "label": snap["overall_label"]}
+            worst = {"peer": peer, "score": score, "label": row["label"]}
 
-    # Reuse dashboard payload builder against the selected peer by temporarily
-    # pointing engine.peer for history accessors that default to self.peer —
-    # history_copy/extra_history_copy already accept peer=.
-    payload = build_dashboard_payload(nv, engine, args, load_gen=None)
-    # Rebuild snap/history for the selected peer explicitly
-    if selected:
-        snap = engine.snapshot(selected)
-        warn, level = _warning_from_snap(nv, snap)
-        out = dict(snap)
-        out["rows"] = _enrich_rows(nv, snap)
-        out["warning"] = warn
-        out["warning_level"] = level
-        out["stream_count"] = len(nv.STREAMS)
-        out["ports"] = nv.ports_summary()
-        out["anatomy"] = _anatomy_payload(nv, engine, args, snap)
-        out["topology"] = _topology_payload(snap)
-        hist = engine.history_copy(selected)
-        owd_f, owd_r, band = engine.extra_history_copy(selected)
-        payload["snap"] = _json_safe(out)
-        payload["history"] = {str(k): _json_safe(v) for k, v in hist.items()}
-        payload["owd_f"] = _json_safe(owd_f)
-        payload["owd_r"] = _json_safe(owd_r)
-        payload["band"] = _json_safe(band)
+    # The selected pair's snapshot, charts and panels are exactly the
+    # dashboard's view of that pair.
+    payload = build_dashboard_payload(nv, engine, args, load_gen=None,
+                                      peer=selected)
 
     payload["mesh"] = {
         "peers": peers,
@@ -368,12 +382,15 @@ def make_handler(ctx: _UiContext):
                         self._send(200, fh.read(), _ctype(full))
                     return
                 if path == "/api/snapshot" and ctx.engine is not None:
+                    qs = parse_qs(parsed.query or "")
+                    which = (qs.get("path") or ["private"])[0]
+                    peer = (ctx.engine.public if which == "public"
+                            else ctx.engine.peer)
                     payload = build_dashboard_payload(
-                        nv, ctx.engine, ctx.args, ctx.load_gen)
+                        nv, ctx.engine, ctx.args, ctx.load_gen, peer=peer)
                     self._send(200, json.dumps(payload).encode("utf-8"))
                     return
                 if path == "/api/mesh/snapshot" and ctx.engine is not None:
-                    from urllib.parse import parse_qs
                     qs = parse_qs(parsed.query or "")
                     peer = (qs.get("peer") or [None])[0] or ctx.selected_peer
                     if peer and peer not in ctx.engine.peers:
@@ -463,7 +480,15 @@ def make_handler(ctx: _UiContext):
                                 "error": "square wave needs positive on/off seconds",
                             }).encode("utf-8"))
                             return
-                    err = ctx.load_gen.start(mbps, on_s, off_s)
+                    target = ctx.engine.peer
+                    if body.get("target") == "public":
+                        if not ctx.engine.public:
+                            self._send(200, json.dumps({
+                                "error": "no public endpoint configured",
+                            }).encode("utf-8"))
+                            return
+                        target = ctx.engine.public
+                    err = ctx.load_gen.start(mbps, on_s, off_s, peer=target)
                     self._send(200, json.dumps({
                         "ok": not err, "error": err,
                     }).encode("utf-8"))
@@ -489,6 +514,7 @@ def make_handler(ctx: _UiContext):
                         s = nv.load_settings()
                         s.update({
                             "peer": vals.get("peer", ""),
+                            "public": vals.get("public", ""),
                             "size": vals.get("size", "200"),
                             "pps": vals.get("pps", "50"),
                             "mbps": vals.get("mbps", ""),
@@ -764,8 +790,10 @@ def run_web_dashboard(nv, engine, args):
     ctx = _UiContext("dashboard", nv, engine=engine, args=args,
                      load_gen=load_gen,
                      update_url=getattr(args, "update_url", None))
+    public = f" · public {engine.public}" if engine.public else ""
     try:
-        _run_server(ctx, title=f"Network Vitals {nv.__version__} — peer {args.peer}")
+        _run_server(ctx, title=f"Network Vitals {nv.__version__} — "
+                    f"peer {args.peer}{public}")
     finally:
         if load_gen is not None and load_gen.running:
             load_gen.stop()
