@@ -560,12 +560,35 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
   up by the PoP detour while the private tile doesn't move. Tools → Load
   with *target: public endpoint* loads the breakout uplink without
   touching the fabric streams.
-- **Caveats:** the SSE must forward the probe ports (FWaaS rule for
-  non-web UDP/TCP — a web-only SSE shows *UDP silent on the public path*);
-  never move probes to TCP 443 (SWG interception expects TLS); the SSE
-  egress IP moves with the PoP (the responder logs refused addresses to
-  add to `--allow`); native transport only; cloud egress ≈ 4 GB/day per
-  branch at the defaults.
+- **Caveats:** single private peer only (not with `--peers`) and no jumbo
+  probes (≤ 1472 B: internet paths are 1500 B MTU); the SSE must forward
+  the probe ports (FWaaS rule for non-web UDP/TCP — a web-only SSE shows
+  *UDP silent on the public path*); never move probes to TCP 443 (SWG
+  interception expects TLS); the SSE egress IP moves with the PoP (the
+  responder logs refused addresses to add to `--allow`); native transport
+  only; cloud egress ≈ 4 GB/day per branch at the defaults.
+
+### T26. Route view — where the path goes and where the milliseconds go (3.2.0)
+
+- **Demonstrates:** the hop-level shape of each path and the NAT story:
+  the fabric collapsing the WAN into one overlay hop (EC → EC) vs a
+  breakout path's ISP hops vs SSE's tunnel-to-PoP detour — and whether
+  (and how) the source was translated on the way.
+- **Run:** dashboard → **Tools → Route** on the selected path (switch
+  paths in the path strip); console: `--route` (with `--public` for both).
+- **Traffic:** one small (64 B) TEST probe per TTL per second — UDP to the
+  probe port on Linux, ICMP echo on Windows — only while the panel is
+  open, only for the path on screen.
+- **Show:** the *Source → NAT verdict → Seen by far end* strip (green
+  `no NAT` on the fabric, amber `NAT`/`NAPT` on breakout/SSE); the latency
+  ribbon's widest block landing on the SSE PoP or the fabric crossing
+  when the policy flips; the NAT marker between the last private hop and
+  the first public one; *route changed* tags when the path moves.
+- **Caveats:** routers rate-limit TTL-expired replies (loss that doesn't
+  carry downstream is tagged *ICMP rate-limited?*); Windows traces with
+  ICMP, which follows the probes only when the policy matches the
+  destination IP; not on macOS yet; overlay tunnels hide the underlay
+  hops (by design — that is the point being shown).
 
 ## 2.4 Constraint summary (read before scripting a demo)
 
@@ -579,7 +602,8 @@ Each entry: what it demonstrates, how to run it, the traffic it generates
 | Privilege boundaries (2.0.0) | frag sniffer needs root/admin (raw capture); the sweep's ICMP verdict needs Linux (IP_RECVERR, no root); FEC verdict needs a drop-reporting counter source |
 | Version parity | both ends ≥ 1.5.0; VXLAN both-ends-or-neither, same VNI/port |
 | Burst test / Load | both directions carry the offered load (echoes are full-size); burst DF is opt-in via `--dont-fragment` |
-| Public endpoint (3.2.0) | needs a `--responder` you control on a public IP with `--allow` covering the post-NAT egress; native transport only; the SSE must forward the probe ports; Windows branches mark UDP DSCP toward the private peer only (qWAVE is per destination) |
+| Public endpoint (3.2.0) | one private peer (no `--peers` mesh) and probes ≤ 1472 B (no jumbo); needs a `--responder` you control on a public IP with `--allow` covering the post-NAT egress; native transport only; the SSE must forward the probe ports; Windows branches mark UDP DSCP toward the private peer only (qWAVE is per destination) |
+| Route view (3.2.0) | no admin: Linux traces UDP on the probe port (IP_RECVERR), Windows ICMP echo (IcmpSendEcho — steered by destination IP), macOS unavailable; ICMP rate limits read as hop loss (flagged) |
 
 ---
 

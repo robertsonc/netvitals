@@ -178,6 +178,10 @@ def _topology_payload(snap):
         where += f" (egress {', '.join(snap['egress'])})"
     summary = (f"{where}  ·  {snap['links_up']} streams up  ·  "
                f"Experience {snap['overall']:.0f} ({snap['overall_label']})")
+    if snap.get("seen_as"):
+        summary += (f"  ·  source {snap.get('source') or '?'} seen as "
+                    f"{', '.join(snap['seen_as'])}"
+                    + (f" ({snap['nat'].upper()})" if snap.get("nat") else ""))
     detail = (f"loss {t['loss_pct']:.2f}%  ·  fwd {t['fwd_pct']:.2f}%  ·  "
               f"rtn {t['rtn_pct']:.2f}%  ·  offered {snap['offered_mbps']:.2f} Mbps")
     return {"summary": summary, "detail": detail}
@@ -211,6 +215,48 @@ def _pair_snap(nv, engine, args, peer):
     out["anatomy"] = _anatomy_payload(nv, engine, args, snap)
     out["topology"] = _topology_payload(snap)
     return out
+
+
+def build_route_payload(nv, engine, peer):
+    """The Route panel for one path: the live trace (started/kept alive by
+    this call), the source identity and NAT verdict, and where on the hop
+    list the translation happens."""
+    tracer = engine.route(peer)
+    rs = tracer.snapshot()
+    summary = engine.path_summary(peer)
+    snap = engine.snapshot(peer)
+    hops = []
+    for h in rs["hops"]:
+        hh = dict(h)
+        hh["tags"] = [{"k": k, "t": t} for k, t in nv.hop_tags(h)]
+        hops.append(hh)
+    # NAT marker: on a translated path, between the last private hop and
+    # the first public one - where the source address changes.
+    nat_after = None
+    if snap.get("nat") in ("nat", "napt"):
+        for i, h in enumerate(hops):
+            if h["class"] == "public":
+                nat_after = hops[i - 1]["ttl"] if i else 0
+                break
+    rs["hops"] = hops
+    return _json_safe({
+        "role": snap["role"],
+        "peer": peer,
+        "route": rs,
+        "nat_after": nat_after,
+        "identity": {
+            "source": snap.get("source"),
+            "ports": [r["port"] for r in snap["rows"] if r["proto"] == "UDP"],
+            "seen_as": snap.get("seen_as") or [],
+            "nat": snap.get("nat"),
+            "nat_label": snap.get("nat_label"),
+            "egress": snap.get("egress") or [],
+        },
+        # Fallback for the destination node when the trace can't reach it
+        # (e.g. ICMP filtered in front of it): the probe streams' own RTT.
+        "stream_rtt": summary["rtt"],
+        "stream_up": summary["up"],
+    })
 
 
 def _paths_payload(engine):
@@ -388,6 +434,15 @@ def make_handler(ctx: _UiContext):
                             else ctx.engine.peer)
                     payload = build_dashboard_payload(
                         nv, ctx.engine, ctx.args, ctx.load_gen, peer=peer)
+                    self._send(200, json.dumps(payload).encode("utf-8"))
+                    return
+                if path == "/api/route" and ctx.engine is not None:
+                    qs = parse_qs(parsed.query or "")
+                    which = (qs.get("path") or ["private"])[0]
+                    peer = (ctx.engine.public
+                            if which == "public" and ctx.engine.public
+                            else ctx.engine.peer)
+                    payload = build_route_payload(nv, ctx.engine, peer)
                     self._send(200, json.dumps(payload).encode("utf-8"))
                     return
                 if path == "/api/mesh/snapshot" and ctx.engine is not None:

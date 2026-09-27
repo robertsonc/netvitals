@@ -13,7 +13,7 @@
   function collect() {
     return {
       peer: $("peer").value.trim(),
-      public: $("public").value.trim(),
+      public: $("public").disabled ? "" : $("public").value.trim(),
       size: $("size").value.trim(),
       pps: $("pps").value.trim(),
       mbps: $("mbps").value.trim(),
@@ -34,6 +34,20 @@
       no_gui: $("console").checked,
     };
   }
+
+  // The public endpoint is a second destination for ONE private peer over
+  // standard-MTU internet paths: no mesh peer lists, no jumbo probes.
+  const PUBLIC_MAX_PROBE = 1472;
+  function syncPublic() {
+    const mesh = $("peer").value.includes(",");
+    const jumbo = Number($("size").value) > PUBLIC_MAX_PROBE;
+    const off = mesh || jumbo;
+    $("public").disabled = off;
+    $("public").title = mesh ? "Not with a mesh peer list — single peer only"
+      : jumbo ? `Not with jumbo probes — size must be ≤ ${PUBLIC_MAX_PROBE} B` : "";
+  }
+  $("peer").addEventListener("input", syncPublic);
+  $("size").addEventListener("input", syncPublic);
 
   $("btnAdv").onclick = () => {
     adv = !adv;
@@ -101,6 +115,7 @@
       dl.appendChild(o);
     });
     if (s.advanced_open) $("btnAdv").click();
+    syncPublic();
   }).catch((e) => {
     $("err").style.display = "block";
     $("err").textContent = String(e.message || e);

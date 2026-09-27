@@ -66,6 +66,7 @@
       btn.onclick = () => {
         const name = btn.dataset.panel;
         setPanel(name, !state.panels[name]);
+        if (name === "route") tickRoute();
       };
     });
     document.querySelector('[data-action="fit"]').onclick = () => {
@@ -273,6 +274,172 @@
        <p style="color:var(--txt-dim)">${t.detail || ""}</p>`;
   }
 
+  // —— Route panel: source identity, latency ribbon, hop rail ——
+  function esc(v) {
+    return String(v == null ? "" : v).replace(/[&<>"]/g, (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+
+  function msTxt(v) { return v == null ? "—" : Number(v).toFixed(1); }
+
+  function hopState(h) {
+    if (h.rate_limited) return "muted";          // ICMP budget, not path loss
+    if (h.loss_pct >= 10) return "bad";
+    if (h.loss_pct > 1) return "warn";
+    return "";
+  }
+
+  const SPARK_N = 60;   // matches ROUTE_HISTORY server-side
+  function sparkline(hist, st) {
+    const w = 96, h = 22, pad = 3;
+    const vals = hist.filter((v) => v != null);
+    if (!vals.length) return `<svg class="spark" width="${w}" height="${h}"></svg>`;
+    let lo = Math.min(...vals), hi = Math.max(...vals);
+    if (hi - lo < 0.5) { const mid = (hi + lo) / 2; lo = mid - 0.25; hi = mid + 0.25; }
+    const step = w / (SPARK_N - 1);
+    const x0 = w - (hist.length - 1) * step;       // newest sample at the right edge
+    const y = (v) => pad + (h - 2 * pad) * (1 - (v - lo) / (hi - lo));
+    let d = "", ticks = "", pen = false;
+    hist.forEach((v, i) => {
+      const x = (x0 + i * step).toFixed(1);
+      if (v == null) {
+        pen = false;
+        ticks += `<line x1="${x}" x2="${x}" y1="${h - 4}" y2="${h}" style="stroke:var(--danger)" stroke-width="1.5"/>`;
+        return;
+      }
+      d += `${pen ? "L" : "M"}${x} ${y(v).toFixed(1)} `;
+      pen = true;
+    });
+    const col = st === "bad" ? "var(--danger)" : st === "warn" ? "var(--warn)"
+      : st === "muted" ? "var(--txt-faint)" : "var(--accent-hi)";
+    return `<svg class="spark" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">`
+      + `<path d="${d}" fill="none" style="stroke:${col}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>`
+      + ticks + "</svg>";
+  }
+
+  function identChip(label, value, cls) {
+    return `<div class="ident-chip ${cls || ""}"><span>${esc(label)}</span><b>${esc(value)}</b></div>`;
+  }
+
+  function renderIdentity(id) {
+    const src = id.source && id.source !== "0.0.0.0"
+      ? `${id.source}:${(id.ports || []).join("/")}` : "—";
+    const seen = id.seen_as && id.seen_as.length
+      ? id.seen_as.slice(0, 3).join("  ") + (id.seen_as.length > 3 ? " …" : "") : "waiting…";
+    const natTxt = { none: "no NAT", nat: "NAT", napt: "NAPT", pat: "PAT" }[id.nat];
+    const natCls = id.nat == null ? "wait" : id.nat === "none" ? "ok" : "nat";
+    $("routeIdent").innerHTML = identChip("Source", src)
+      + '<span class="ident-arrow">→</span>'
+      + identChip(id.nat_label ? id.nat_label.split(" - ")[1] || "translation" : "translation",
+        natTxt || "awaiting report", natCls)
+      + '<span class="ident-arrow">→</span>'
+      + identChip("Seen by far end", seen, id.nat === "none" ? "ok" : "");
+  }
+
+  function ribbonClass(h) {
+    if (h.kind === "dest") return "c-dest";
+    if (h.class === "public") return "c-public";
+    if (h.class === "cgnat") return "c-cgnat";
+    return "c-private";
+  }
+
+  function renderRibbon(route) {
+    const segs = route.hops.filter((h) => h.delta != null);
+    const wrap = $("routeRibbonWrap");
+    if (!segs.length) { wrap.hidden = true; return; }
+    wrap.hidden = false;
+    const total = route.total_ms || 0;
+    $("routeTotal").textContent = `${msTxt(total)} ms to hop ${segs[segs.length - 1].ttl} (best RTT)`;
+    $("routeRibbon").innerHTML = segs.map((h) => {
+      const share = total > 0 ? h.delta / total : 1 / segs.length;
+      const label = share >= 0.12 ? `+${msTxt(h.delta)} ms` : "";
+      const tip = `hop ${h.ttl} ${h.addr}${h.name ? " (" + h.name + ")" : ""}: +${msTxt(h.delta)} ms`;
+      return `<div class="ribbon-seg ${ribbonClass(h)}" style="flex-grow:${Math.max(share, 0.0001)}" title="${esc(tip)}">${label}</div>`;
+    }).join("");
+  }
+
+  function hopRow(h, last) {
+    const st = hopState(h);
+    const tr = document.createElement("tr");
+    if (last) tr.classList.add("last");
+    if (!h.recv) {
+      tr.classList.add("silent");
+      tr.innerHTML = `<td class="rail"><i class="node silent"></i></td><td class="hopnum">${h.ttl}</td>
+        <td class="host">* * *<span class="hop-name">no reply — silent router or ICMP filtered</span></td>
+        <td>${Number(h.loss_pct).toFixed(0)}</td><td>${h.sent}</td>
+        <td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>${sparkline(h.history, "muted")}</td><td>—</td>`;
+      return tr;
+    }
+    const node = `node${h.kind === "dest" ? " dest" : ""}${st ? " " + st : ""}`;
+    const tags = (h.tags || []).map((t) => `<span class="tag ${esc(t.k)}">${esc(t.t)}</span>`).join("");
+    const big = h.delta != null && h.delta >= 10;
+    tr.innerHTML = `<td class="rail"><i class="${node}"></i></td><td class="hopnum">${h.ttl}</td>
+      <td class="host"><span class="hop-ip">${esc(h.addr)}</span><span class="hop-tags">${tags}</span>
+        ${h.name ? `<span class="hop-name">${esc(h.name)}</span>` : ""}</td>
+      <td>${Number(h.loss_pct).toFixed(1)}</td><td>${h.sent}</td>
+      <td>${msTxt(h.last)}</td><td>${msTxt(h.avg)}</td><td>${msTxt(h.best)}</td>
+      <td>${msTxt(h.worst)}</td><td>${msTxt(h.jitter)}</td>
+      <td>${sparkline(h.history, st)}</td>
+      <td class="delta${big ? " big" : ""}">${h.delta == null ? "—" : "+" + msTxt(h.delta)}</td>`;
+    return tr;
+  }
+
+  function renderRoute(r) {
+    const route = r.route;
+    const hops = route.hops || [];
+    renderIdentity(r.identity || {});
+    const role = r.role === "public" ? "public path" : "private path";
+    $("routeHead").textContent = route.error ? `→ ${r.peer} · ${role}`
+      : `→ ${r.peer} · ${role} · ${hops.length} hop${hops.length === 1 ? "" : "s"}`
+        + `${route.reached ? "" : " · destination not reached yet"} · ${route.rounds} rounds`;
+    renderRibbon(route);
+    const tb = $("routeTable").querySelector("tbody");
+    tb.innerHTML = "";
+    const fallback = !route.reached && r.stream_up && !route.error && route.rounds > 2;
+    hops.forEach((h, i) => {
+      if (r.nat_after != null && r.nat_after === (i ? hops[i - 1].ttl : 0)) {
+        const nr = document.createElement("tr");
+        nr.className = "nat-row";
+        const seen = (r.identity.egress || []).join(", ");
+        nr.innerHTML = `<td class="rail"></td><td colspan="11">NAT${seen ? " · leaves as " + esc(seen) : ""}</td>`;
+        tb.appendChild(nr);
+      }
+      tb.appendChild(hopRow(h, i === hops.length - 1 && !route.silent_tail && !fallback));
+    });
+    if (route.silent_tail) {
+      const tr = document.createElement("tr");
+      tr.className = "silent" + (fallback ? "" : " last");
+      tr.innerHTML = `<td class="rail"><i class="node silent"></i></td><td class="hopnum">…</td>
+        <td class="host" colspan="10">${route.silent_tail} more TTL${route.silent_tail === 1 ? "" : "s"} silent</td>`;
+      tb.appendChild(tr);
+    }
+    if (fallback) {
+      const tr = document.createElement("tr");
+      tr.className = "last";
+      tr.innerHTML = `<td class="rail"><i class="node dest"></i></td><td class="hopnum">?</td>
+        <td class="host"><span class="hop-ip">${esc(r.peer)}</span><span class="hop-tags"><span class="tag dest">destination</span></span>
+        <span class="hop-name">RTT from the probe streams — the trace itself didn't reach it (ICMP filtered?)</span></td>
+        <td>—</td><td>—</td><td>—</td><td>${msTxt(r.stream_rtt)}</td><td>—</td><td>—</td><td>—</td><td></td><td>—</td>`;
+      tb.appendChild(tr);
+    }
+    const notes = [];
+    if (route.error) notes.push(`Route view unavailable: ${route.error}`);
+    if (route.method) notes.push(`Method: ${route.method}.`);
+    if (hops.some((h) => h.rate_limited)) {
+      notes.push("Loss at a hop that doesn't carry on to later hops is that router rate-limiting its ICMP replies — not loss on the path.");
+    }
+    notes.push("Traced only while this panel is open.");
+    $("routeNote").textContent = notes.join(" ");
+  }
+
+  async function tickRoute() {
+    if (!state.panels.route) return;
+    try {
+      const q = state.path === "public" ? "?path=public" : "";
+      renderRoute(await api("/api/route" + q));
+    } catch (e) { console.warn(e); }
+  }
+
   function ensureLegend(series) {
     const leg = $("legLat");
     if (leg.dataset.ready === "1") return;
@@ -332,6 +499,7 @@
         }
       }
       $("versionTag").textContent = "v" + (payload.version || "");
+      tickRoute();
     } catch (e) {
       console.warn(e);
     }

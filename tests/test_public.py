@@ -150,6 +150,16 @@ class TestPublicArgs(unittest.TestCase):
                           "--vxlan", "--no-gui"])
         self.assertEqual(rc, 2)
 
+    def test_main_rejects_public_with_mesh_or_jumbo(self):
+        for argv in (["--peers", "10.0.0.2,10.0.0.3", "--public", "1.2.3.4"],
+                     ["--peer", "10.0.0.2", "--public", "1.2.3.4",
+                      "--size", "8972"],
+                     ["--peer", "10.0.0.2", "--public", "1.2.3.4",
+                      "--profiles", "9000"]):
+            with mock.patch("sys.stderr"), \
+                    mock.patch.object(nq, "_alert_gui_error"):
+                self.assertEqual(nq.main(argv + ["--no-gui"]), 2, argv)
+
 
 class TestLauncherPublic(unittest.TestCase):
     def vals(self, **kw):
@@ -176,7 +186,9 @@ class TestLauncherPublic(unittest.TestCase):
         for kw in ({"public": "10.0.0.2"},
                    {"public": "1.1.1.1,2.2.2.2"},
                    {"public": "1.1.1.1", "vxlan": True},
-                   {"peer": "10.0.0.2,10.0.0.3", "public": "10.0.0.3"}):
+                   {"peer": "10.0.0.2,10.0.0.3", "public": "1.1.1.1"},
+                   {"public": "1.1.1.1", "size": "8972"},
+                   {"public": "1.1.1.1", "profiles": "voice,9000"}):
             with self.assertRaises(ValueError, msg=kw):
                 nq._launcher_argv(self.vals(**kw))
 
@@ -197,11 +209,27 @@ class TestEngineRoles(unittest.TestCase):
         self.assertIsNone(ps["score"])
         self.assertEqual(ps["stream_count"], len(nq.STREAMS))
 
-    def test_mesh_plus_public(self):
-        e = nq.Engine(peers=["10.0.0.2", "10.0.0.3"], public="1.2.3.4")
-        self.assertEqual(e.private_peers, ["10.0.0.2", "10.0.0.3"])
+    def test_public_is_single_peer_only(self):
+        # A second destination for ONE private peer - not a mesh extra.
+        with self.assertRaises(ValueError):
+            nq.Engine(peers=["10.0.0.2", "10.0.0.3"], public="1.2.3.4")
+        e = nq.Engine("10.0.0.2", public="1.2.3.4")
         self.assertEqual(nq.peer_label(e, "1.2.3.4"), "1.2.3.4  (public)")
         self.assertEqual(nq.peer_label(e, "10.0.0.2"), "10.0.0.2")
+
+    def test_public_refuses_jumbo_probes(self):
+        # Internet paths are 1500 B MTU: 1472 fits, 1473 and jumbo don't.
+        nq.Engine("10.0.0.2", size=nq.PUBLIC_MAX_PROBE, public="1.2.3.4")
+        for size in (nq.PUBLIC_MAX_PROBE + 1, 8972):
+            with self.assertRaises(ValueError) as cm:
+                nq.Engine("10.0.0.2", size=size, public="1.2.3.4")
+            self.assertIn("1500 B MTU", str(cm.exception))
+        # ...including a jumbo size hidden in a per-stream profile.
+        prof = nq.resolve_profiles([(9000, None)], len(nq.STREAMS), 200)
+        with self.assertRaises(ValueError):
+            nq.Engine("10.0.0.2", profiles=prof, public="1.2.3.4")
+        # Jumbo stays fine for the private peer alone.
+        nq.Engine("10.0.0.2", size=8972)
 
     def test_rejects_same_endpoint_and_vxlan(self):
         with self.assertRaises(ValueError):

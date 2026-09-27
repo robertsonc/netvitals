@@ -469,6 +469,8 @@ Bad below.
                    reset), drawn as stage markers on the charts
 --frag-sniffer     count IPv4 fragments to/from the peer at capture level
                    (needs root/admin; reports unavailable otherwise)
+--route            one-shot: trace the hops to the peer (and --public) and
+                   print an mtr-style report (see "Route view")
 --report BASE      write the demo report (BASE.json + BASE.html) on exit;
                    the ⭳ Report button / console 'w' key write on demand
 ```
@@ -777,7 +779,10 @@ Three ways to turn the Anatomy panel's *prediction* into *measurement*:
 - **PMTUD verdict in the sweep (2.0.0)**: on Linux the MTU sweep also
   listens for ICMP *fragmentation-needed* on the socket error queue (no
   raw socket, no root) and reports **"ICMP frag-needed received
-  (MTU=N)"** vs **"dropped silently → PMTUD black hole"**.
+  (MTU=N)"** vs **"dropped silently → PMTUD black hole"**. (Fixed in
+  3.2.0: CPython doesn't export `IP_RECVERR`, so through 3.1.0 the error
+  queue never switched on and the sweep always said the detection was
+  unavailable, even on Linux.)
 - **Fragment sniffer (2.0.0, `--frag-sniffer`)**: counts IPv4 fragments
   to/from the peer at capture level — distinguishing the fabric delivering
   whole packets from the kernel quietly reassembling mid-path fragments.
@@ -953,7 +958,8 @@ be sent back to the branch through that NAT:
   as the path's **egress IP**: the EdgeConnect WAN address means local
   breakout, an SSE-owned address means the SSE service carried it. More
   than one address means flows are breaking out different uplinks or
-  egress IPs.
+  egress IPs. (Regular peers now stamp the same report, so the private
+  path gets a source/NAT verdict too — see *Route view*.)
 
 ### Setup
 
@@ -980,8 +986,12 @@ be sent back to the branch through that NAT:
    python netquality.py --peer 10.0.0.2 --public 203.0.113.10
    ```
 
-   The private peer runs exactly as before (`--peer 10.0.0.1` on its side);
-   `--peers A,B --public C` works too (the mesh view adds a *public* row).
+   The private peer runs exactly as before (`--peer 10.0.0.1` on its side).
+   The public endpoint is a **second destination for one private peer**:
+   it is refused with a mesh peer list (`--peers`, fabric-only) and with
+   **jumbo probes** — internet paths are 1500 B MTU, so every probe size
+   (`--size` and profile sizes) must be ≤ 1472 B. The launcher greys the
+   field out in both cases.
 
 3. **EdgeConnect policy**: the public endpoint's **destination IP** is what
    classifies it. Match it (or the probe ports) in the Business Intent
@@ -1004,8 +1014,11 @@ be sent back to the branch through that NAT:
   responder running? `--allow` covers your egress? breakout/SSE policy and
   cloud firewall pass the probe ports?), and a public-specific **UDP
   silent** message — typical when an SSE firewall passes only web ports.
+- **Tools → Route** traces the selected path hop by hop — see *Route
+  view* below.
 - The console UI adds a `PUBLIC ...` line; the report adds a *Public path*
-  card; the legacy Tk UI (`NV_UI=tk`) shows the two paths as mesh rows.
+  card; the legacy Tk UI (`NV_UI=tk`) lists the two paths as two
+  selectable rows.
 
 ### Caveats
 
@@ -1034,6 +1047,59 @@ be sent back to the branch through that NAT:
   stages still target the private peer. The one-shot tools can be pointed
   at a responder directly (`--peer <responder> --burst-test`): it echoes
   their test probes.
+
+## Route view (Tools → Route, `--route`)
+
+A live, mtr-style **hop view** of whichever path is selected — private or
+public — built for the room rather than the terminal:
+
+- **Source identity**: *Source* (the address and ports this host sent
+  from) → the **NAT verdict** → *Seen by far end* (what the peer or
+  responder reported receiving). `no NAT` in green across the fabric;
+  `NAT` (address translated, ports preserved) or `NAPT` (ports
+  rewritten too) in amber on a breakout/SSE path. Both regular peers and
+  responders report what they saw, from UDP streams whose local port is
+  known.
+- **Where the latency is added**: a ribbon across the panel, one segment
+  per hop, **width = the milliseconds that hop adds** (by *best* RTT —
+  routers answer TTL-expired on a slow path, so averages exaggerate).
+  Colours mark private/LAN hops, carrier NAT (100.64/10), public internet
+  hops and the destination. The SSE PoP detour, the ISP handoff, the
+  fabric's WAN crossing — each is a visibly wide block.
+- **The hop rail**: every hop as a node on a line — green/amber/red by
+  loss, hollow-dashed when silent, a ring at the destination — with the
+  address, reverse-DNS name, tags (*gateway*, *RFC 1918*, *CGNAT*,
+  *destination*, *ECMP ×N*, *route changed hh:mm:ss*, *unreachable*
+  reasons), loss/sent, last/avg/best/worst/jitter, a **60-sample RTT
+  sparkline** (lost probes as red ticks) and the per-hop **+ms**
+  (≥ 10 ms highlighted). A **NAT marker** sits between the last private
+  hop and the first public one, labelled with the egress address.
+- **Honest loss**: a hop whose loss does not carry on to later hops is
+  tagged **ICMP rate-limited?** — routers commonly answer only ~1
+  TTL-expired per second per destination (and every host behind one NAT
+  shares that budget), which is not loss on the path.
+
+**How it traces, without admin rights** (the same rule as everything
+else in the app):
+
+| Platform | Method | Follows the probes? |
+|---|---|---|
+| Linux | UDP from one socket per TTL to the path's **own probe port**; TTL-expired / unreachable read from the socket error queue (`IP_RECVERR`) with the sender's address; the far end answers the last hop with a real echo | Yes — same destination IP and port as the UDP streams |
+| Windows | ICMP echo with a TTL via `IcmpSendEcho` (how `tracert` works) | When the overlay/breakout policy matches the **destination IP**; a port-only match can steer ICMP differently |
+| macOS | not available yet (said so in the panel) | — |
+
+One round per second, one probe per TTL, stopping at the destination (or
+5 TTLs past the last responder); only the path on screen is traced, and
+only while the panel is open. Like classic traceroute, each TTL keeps its
+own flow, so ECMP can show different branches at different hops (tagged
+where one TTL sees several responders). Where the trace can't reach the
+destination (ICMP filtered in front of it), the destination row falls
+back to the probe streams' own RTT.
+
+`--route` prints the same as an mtr `--report`-style table (10 rounds per
+path, the private path then the public one — traced one after the other
+so they don't share the first hop's ICMP budget) and exits; the demo
+report includes the last trace of each path that was viewed.
 
 ## Windows firewall
 
