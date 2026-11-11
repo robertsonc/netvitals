@@ -1,0 +1,8 @@
+#!/bin/sh
+# Start the Chaos Monkey controller from wherever this folder was unpacked.
+#   ./chaos-monkey            live: connect an Orchestrator or an Autopod lab in Settings
+#   ./chaos-monkey --demo     simulated lab and endpoints, nothing real is contacted
+set -eu
+cd "$(dirname "$0")"
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 (3.9 or newer) is required; nothing else is." >&2; exit 1; }
+exec python3 -m chaoslab "$@"

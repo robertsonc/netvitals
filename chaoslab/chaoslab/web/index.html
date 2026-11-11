@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chaos Monkey</title>
+<link rel="icon" href="img/favicon.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <img class="emblem" src="img/emblem.png" alt="">
+      <div><div class="w1">Chaos <span>Monkey</span></div><div class="w2">Break / observe / learn / repeat</div></div>
+    </div>
+    <nav class="nav" role="tablist" aria-label="Sections">
+      <button class="tab-btn" role="tab" data-tab="overview" aria-selected="true"><span>Overview</span></button>
+      <button class="tab-btn" role="tab" data-tab="trials"><span>Trials</span><span class="n" id="n-trials"></span></button>
+      <button class="tab-btn" role="tab" data-tab="flows"><span>Flows</span><span class="n" id="n-flows"></span></button>
+      <button class="tab-btn" role="tab" data-tab="endpoints"><span>Endpoints</span><span class="n" id="n-endpoints"></span></button>
+      <button class="tab-btn" role="tab" data-tab="targets"><span>Targets</span><span class="n" id="n-targets"></span></button>
+      <button class="tab-btn" role="tab" data-tab="evidence"><span>Evidence</span></button>
+      <button class="tab-btn" role="tab" data-tab="settings"><span>Settings</span></button>
+    </nav>
+    <div class="quote">Sometimes the best way to build a stronger network is to break it.</div>
+    <div class="side-foot"><span>SD-WAN lab chaos</span><span class="mono" id="foot-version"></span></div>
+  </aside>
+
+  <div class="content">
+    <header class="topbar">
+      <div class="engine"><span class="lbl">Chaos engine</span><span class="state" id="engine-state">Idle</span></div>
+      <div class="top-right">
+        <span class="pill" id="pill-mode" hidden></span>
+        <button class="pill" id="pill-held" data-goto="settings">0 held</button>
+        <button class="pill" id="pill-agents" data-goto="endpoints">0 endpoints</button>
+        <span class="pill" id="pill-live">Live</span>
+        <span class="clock mono" id="clock"></span>
+        <button class="pill" id="theme" title="Switch between light and dark">Theme</button>
+      </div>
+    </header>
+    <div class="banner demo" id="banner-demo" hidden><b>Simulated lab.</b><span>Targets, endpoints and every measurement on this page are invented. Nothing real is contacted or changed. Every control works exactly as it does live.</span></div>
+    <div class="banner off" id="banner-offline" hidden><b>Disconnected.</b><span>The dashboard cannot reach the controller. Retrying.</span></div>
+
+    <main>
+      <!-- ================= Overview ================= -->
+      <section class="tab active" id="tab-overview">
+        <div class="panel" id="todo-card" hidden>
+          <div class="ph"><h2>Get started</h2></div>
+          <div class="pb"><div class="todo" id="todo"></div></div>
+        </div>
+
+        <div class="panel" id="trial-card">
+          <div class="pb">
+            <div class="trial-head">
+              <div>
+                <div class="lbl" id="trial-eyebrow">No trial running</div>
+                <h1 class="trial-title" id="trial-title">Idle</h1>
+                <div class="tags" id="trial-tags"></div>
+              </div>
+              <div class="holdbox" id="holdbox" hidden><span class="lbl" id="hold-label">Holding the fault</span><span class="mono" id="hold-count">00:00</span></div>
+            </div>
+            <div class="steps" id="steps"></div>
+            <div class="actions">
+              <span class="msg" id="trial-line"></span>
+              <span style="flex:1"></span>
+              <button class="btn" id="btn-skip" hidden>Skip wait</button>
+              <button class="btn danger" id="btn-stop" hidden>Stop and restore</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="kpis">
+          <div class="panel kpi"><div class="lbl">Trials recovered</div><div class="v" id="k-rate">–</div><div class="s" id="k-rate-s">no trials yet</div></div>
+          <div class="panel kpi"><div class="lbl">Worst interruption</div><div class="v" id="k-worst">–</div><div class="s" id="k-worst-s">measured by endpoint flows</div></div>
+          <div class="panel kpi"><div class="lbl">Flow loss now</div><div class="v" id="k-loss">–</div><div class="s" id="k-loss-s">worst leg, last 5 s</div></div>
+          <div class="panel kpi"><div class="lbl">Round trip now</div><div class="v" id="k-rtt">–</div><div class="s" id="k-rtt-s">mean across legs</div></div>
+        </div>
+
+        <div class="panel">
+          <div class="ph"><h2>Endpoint flows <span>· last 5 minutes · fault windows shaded</span></h2>
+            <div class="tools"><button class="btn sm" data-goto="flows">Per-direction detail</button></div></div>
+          <div class="pb">
+            <div class="legend" id="ov-legend"></div>
+            <div class="chart-title"><b>Packet loss</b><span>percent of probes unanswered, per second</span></div>
+            <div class="chart" id="ov-loss"></div>
+            <div class="chart-title"><b>Round-trip time</b><span>milliseconds, mean per second, reflector dwell removed</span></div>
+            <div class="chart" id="ov-rtt"></div>
+            <div class="empty" id="ov-empty" hidden>No flow is reporting yet. Add endpoints, then create a flow.</div>
+          </div>
+          <div class="tbl-wrap"><table id="ov-legs"></table></div>
+        </div>
+
+        <div class="cols-2">
+          <div class="panel">
+            <div class="ph"><h2>Run control</h2><div class="tools"><span class="chip" id="scope-chip">scope: –</span></div></div>
+            <div class="pb">
+              <div class="form">
+                <div class="field"><label class="lbl" for="r-cycles">Cycles</label><input id="r-cycles" type="number" min="1" placeholder="until stopped"></div>
+                <div class="field"><label class="lbl" for="r-hold">Hold (s)</label><input id="r-hold" type="number" min="1"></div>
+                <div class="field"><label class="lbl" for="r-holdmax">Max hold (s)</label><input id="r-holdmax" type="number" min="1" placeholder="fixed"></div>
+                <div class="field"><label class="lbl" for="r-wait">Wait between (s)</label><input id="r-wait" type="number" min="0"></div>
+                <div class="field"><label class="lbl" for="r-baseline">Baseline (s)</label><input id="r-baseline" type="number" min="0"></div>
+                <div class="field"><label class="lbl" for="r-settle">Settle (s)</label><input id="r-settle" type="number" min="0"></div>
+                <div class="field"><label class="lbl" for="r-selection">Target order</label><select id="r-selection"><option value="random">Random</option><option value="sequential">Sequential</option></select></div>
+                <div class="field"><label class="lbl" for="r-seed">Seed</label><input id="r-seed" type="number" placeholder="none"></div>
+                <div class="wide"><span class="lbl">Break</span><div style="margin-top:7px" id="r-kinds">
+                  <label class="check"><input type="checkbox" value="wan" checked> WAN interfaces</label>
+                  <label class="check"><input type="checkbox" value="vrrp" checked> VRRP masters</label>
+                  <label class="check"><input type="checkbox" value="span" checked> Fabric spans</label></div></div>
+                <div class="wide"><span class="lbl">Span faults to choose from</span><div style="margin-top:7px" id="r-faults"></div></div>
+                <div class="wide"><span class="lbl">Span impairment direction</span><div style="margin-top:7px" id="r-dirs">
+                  <label class="check"><input type="checkbox" value="down" checked> toward the site</label>
+                  <label class="check"><input type="checkbox" value="up" checked> away from the site</label>
+                  <label class="check"><input type="checkbox" value="both" checked> both</label></div></div>
+              </div>
+              <div class="actions">
+                <button class="btn primary lg" id="btn-run">Start run</button>
+                <button class="btn" id="btn-discover">Discover targets</button>
+                <span class="msg" id="run-msg"></span>
+              </div>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="ph"><h2>Recent events</h2><div class="tools"><button class="btn sm" data-goto="evidence">Evidence</button></div></div>
+            <div class="pb"><div class="events" id="events"></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= Trials ================= -->
+      <section class="tab" id="tab-trials">
+        <div class="panel">
+          <div class="ph"><h2>Trials <span id="trials-sub"></span></h2>
+            <div class="tools"><a class="btn sm" href="api/export/trials.csv">CSV</a><a class="btn sm" href="api/export/trials.json">JSON</a></div></div>
+          <div class="pb" style="padding-left:0;padding-right:0;padding-bottom:0"><div class="tbl-wrap"><table id="trials-table"></table></div>
+            <div class="empty" id="trials-empty">No trials yet. Start a run from the Overview.</div></div>
+          <div class="detail pb" id="trial-detail" hidden></div>
+        </div>
+      </section>
+
+      <!-- ================= Flows ================= -->
+      <section class="tab" id="tab-flows">
+        <div class="panel">
+          <div class="ph"><h2>New flow</h2><div class="tools" id="flow-presets"></div></div>
+          <div class="pb">
+            <div class="form">
+              <div class="field"><label class="lbl" for="f-name">Name</label><input id="f-name" maxlength="60" placeholder="Voice dal to branches"></div>
+              <div class="field"><label class="lbl" for="f-topology">Shape</label><select id="f-topology">
+                <option value="ptp">Point to point</option><option value="ptmp">Point to multipoint</option><option value="mesh">Full mesh</option></select></div>
+              <div class="field"><label class="lbl" for="f-proto">Protocol</label><select id="f-proto"><option value="udp">UDP</option><option value="tcp">TCP</option></select></div>
+              <div class="field"><label class="lbl" for="f-src">Source endpoint</label><select id="f-src"></select></div>
+              <div class="field"><label class="lbl" for="f-dsts">Destination(s)</label><select id="f-dsts" multiple></select><div class="hint">Ctrl/Cmd-click for several</div></div>
+              <div class="field"><label class="lbl" for="f-size">Size (bytes)</label><input id="f-size" type="number" value="200"><div class="hint" id="f-rate-hint"></div></div>
+              <div class="field"><label class="lbl" for="f-pps">Rate (packets/s)</label><input id="f-pps" type="number" value="50" step="any"></div>
+              <div class="field"><label class="lbl" for="f-dscp">DSCP</label><input id="f-dscp" type="number" value="0" min="0" max="63"></div>
+              <div class="field"><label class="lbl" for="f-port">Port</label><input id="f-port" type="number" value="30200"></div>
+              <div class="field"><label class="lbl" for="f-timeout">Loss timeout (ms)</label><input id="f-timeout" type="number" value="1000"></div>
+              <div class="wide">
+                <label class="check"><input type="checkbox" id="f-minecho"> Small replies (header only: load in the forward direction only)</label>
+                <label class="check"><input type="checkbox" id="f-jumbo"> Allow jumbo UDP (above 1472 bytes)</label>
+              </div>
+            </div>
+            <div class="actions"><button class="btn primary" id="btn-flow">Create flow</button><span class="msg" id="flow-msg"></span></div>
+          </div>
+        </div>
+        <div id="flow-cards" class="tab active" style="display:grid"></div>
+        <div class="panel" id="flows-none"><div class="empty">No flows yet. A flow needs two enrolled endpoints: one sends, the other answers, and both report.</div></div>
+      </section>
+
+      <!-- ================= Endpoints ================= -->
+      <section class="tab" id="tab-endpoints">
+        <div class="panel">
+          <div class="ph"><h2>Add an endpoint</h2>
+            <div class="tools"><label class="lbl" for="ctl-addr" style="margin:0">Controller address</label><select class="in sm" id="ctl-addr"></select></div></div>
+          <div class="pb">
+            <p class="note">Run one command on each test host. It downloads the agent from this dashboard, enrols it with the join token below and starts it. No certificates, no keys to copy. The agent needs no privileges once installed.</p>
+            <div class="lbl" style="margin-top:14px">Linux (as root)</div>
+            <div class="cmd"><code id="cmd-linux"></code><button class="btn" data-copy="cmd-linux">Copy</button></div>
+            <div class="lbl">Linux without curl</div>
+            <div class="cmd"><code id="cmd-wget"></code><button class="btn" data-copy="cmd-wget">Copy</button></div>
+            <div class="lbl">Windows (PowerShell, run as administrator)</div>
+            <div class="cmd"><code id="cmd-win"></code><button class="btn" data-copy="cmd-win">Copy</button></div>
+            <p class="note" id="builds-note"></p>
+            <div class="actions"><span class="lbl">Join token</span><code class="mono" id="join-token"></code>
+              <button class="btn sm" id="btn-rotate" title="Enrolled endpoints keep working; old install commands stop working">Issue a new token</button>
+              <span class="msg" id="ep-msg"></span></div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="ph"><h2>Endpoints <span id="ep-sub"></span></h2></div>
+          <div class="tbl-wrap" style="padding-top:8px"><table id="ep-table"></table></div>
+          <div class="empty" id="ep-empty">No endpoint has enrolled yet.</div>
+        </div>
+      </section>
+
+      <!-- ================= Targets ================= -->
+      <section class="tab" id="tab-targets">
+        <div class="panel">
+          <div class="ph"><h2>Targets <span id="targets-sub"></span></h2>
+            <div class="tools">
+              <button class="btn sm" id="scope-all">All in scope</button><button class="btn sm" id="scope-none">None in scope</button>
+              <button class="btn sm" id="btn-discover2">Discover</button></div></div>
+          <div class="pb"><p class="note">Discovery is read-only. A target that is out of scope is never chosen by a run; scope changes only while idle and is enforced by the controller. <b>Test</b> runs one cycle against one target now.</p><span class="msg" id="targets-msg"></span></div>
+          <div class="tbl-wrap"><table id="targets-table"></table></div>
+          <div class="empty" id="targets-empty">Nothing discovered yet. Connect an Orchestrator or an Autopod lab in Settings, then Discover.</div>
+        </div>
+      </section>
+
+      <!-- ================= Evidence ================= -->
+      <section class="tab" id="tab-evidence">
+        <div class="panel">
+          <div class="ph"><h2>Audit trail <span>· every state-changing call and every verdict</span></h2>
+            <div class="tools"><a class="btn sm" href="api/export/audit.json">JSON</a></div></div>
+          <div class="tbl-wrap" style="padding-top:8px"><table id="audit-table"></table></div>
+        </div>
+      </section>
+
+      <!-- ================= Settings ================= -->
+      <section class="tab" id="tab-settings">
+        <div class="panel">
+          <div class="ph"><h2>Held right now</h2><div class="tools"><button class="btn sm danger" id="btn-restore">Restore everything now</button></div></div>
+          <div class="pb"><div id="held-list" class="note">Nothing is being held broken by this controller.</div><span class="msg" id="held-msg"></span></div>
+        </div>
+        <div class="cols-eq">
+          <div class="panel">
+            <div class="ph"><h2>EdgeConnect Orchestrator <span>· WAN interface and VRRP faults</span></h2><div class="tools"><span class="chip" id="orch-chip">not connected</span></div></div>
+            <div class="pb">
+              <div class="form">
+                <div class="field wide"><label class="lbl" for="o-url">URL</label><input id="o-url" placeholder="https://orchestrator.lab"></div>
+                <div class="field wide"><label class="lbl" for="o-token">API key</label><input id="o-token" type="password" autocomplete="off" placeholder="Orchestrator > Orchestrator Admin > API Keys"></div>
+                <div class="field"><label class="lbl" for="o-user">or user name</label><input id="o-user" autocomplete="off"></div>
+                <div class="field"><label class="lbl" for="o-pass">password</label><input id="o-pass" type="password" autocomplete="off"></div>
+                <div class="wide">
+                  <label class="check"><input type="checkbox" id="o-verify"> Verify the TLS certificate</label>
+                  <label class="check"><input type="checkbox" id="o-query"> Send the key as a query parameter</label>
+                </div>
+              </div>
+              <div class="actions"><button class="btn primary" id="btn-orch">Test and connect</button><button class="btn" id="btn-orch-off">Disconnect</button><span class="msg" id="orch-msg"></span></div>
+              <p class="note" style="margin-top:12px">Writes one thing: the admin flag of one interface at a time, as a full-state replace. Scope the API key to the appliances you are allowed to break.</p>
+            </div>
+          </div>
+          <div class="panel">
+            <div class="ph"><h2>Autopod Prime <span>· impairments on the ISP spans</span></h2><div class="tools"><span class="chip" id="prime-chip">not connected</span></div></div>
+            <div class="pb">
+              <div class="form">
+                <div class="field wide"><label class="lbl" for="p-url">Prime URL</label><input id="p-url" placeholder="http://10.127.3.110:8080"></div>
+                <div class="field"><label class="lbl" for="p-lab">Lab</label><input id="p-lab" placeholder="lab1"></div>
+                <div class="field"><label class="lbl" for="p-user">User (admin or eng)</label><input id="p-user" autocomplete="off"></div>
+                <div class="field"><label class="lbl" for="p-pass">Password</label><input id="p-pass" type="password" autocomplete="off"></div>
+                <div class="field wide"><label class="lbl" for="p-token">or service token with the chaos grant</label><input id="p-token" type="password" autocomplete="off"></div>
+              </div>
+              <div class="actions"><button class="btn primary" id="btn-prime">Test and connect</button><button class="btn" id="btn-prime-off">Disconnect</button><span class="msg" id="prime-msg"></span></div>
+              <p class="note" style="margin-top:12px">With the span API, Prime holds a dead-man timer on every fault: if this controller dies mid-trial, Prime clears the span by itself.</p>
+            </div>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="ph"><h2>About this controller</h2></div>
+          <div class="pb"><dl class="kv" id="about"></dl>
+            <p class="note" style="margin-top:12px">Credentials entered above travel to the controller over plain HTTP and are stored in its data directory, readable only by the account running it. They are never sent back to a browser. This tool is built for closed labs: do not expose it beyond one.</p></div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<dialog id="confirm">
+  <div class="ph"><h2>Confirm live disruption</h2></div>
+  <div class="pb">
+    <h3 id="confirm-title">Start this run?</h3>
+    <p class="note" id="confirm-text"></p>
+    <ul id="confirm-list"></ul>
+    <label class="check" style="margin-top:8px;white-space:normal"><input type="checkbox" id="confirm-ack"> I am authorised to disrupt these targets, and none of them carries traffic that must not drop.</label>
+    <div class="actions"><button class="btn primary" id="confirm-go" disabled>Break things</button><button class="btn" id="confirm-cancel">Cancel</button></div>
+  </div>
+</dialog>
+<dialog id="login">
+  <div class="ph"><h2>Sign in</h2></div>
+  <div class="pb"><div class="field"><label class="lbl" for="login-pass">Dashboard password</label><input id="login-pass" type="password"></div>
+    <div class="actions"><button class="btn primary" id="login-go">Sign in</button><span class="msg err" id="login-msg"></span></div></div>
+</dialog>
+<script src="app.js"></script>
+</body>
+</html>
