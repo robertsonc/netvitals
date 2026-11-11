@@ -1220,3 +1220,10 @@ to close that gap, roughly in order:
       node C degrading = C's site/link; only A-C degrading = that path;
    4. **hub/star mode** (spokes probe only the hub) to match EC hub
       topologies and keep probe count linear beyond demo scale.
+
+## Also in this repository: ChaosLab
+
+[`chaoslab/`](chaoslab/) is a separate, self-contained tool: the Chaos Monkey controller plus endpoint
+agents that generate host-to-host TCP/UDP traffic and measure what a deliberately injected fault did to
+it. It shares ideas with Network Vitals but no code, and nothing above depends on it. Start with
+[`chaoslab/README.md`](chaoslab/README.md).

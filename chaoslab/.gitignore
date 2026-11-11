@@ -1,0 +1,6 @@
+# Agent builds (make agents) and release bundles: produced, not tracked.
+dist/
+*.tar.gz
+# Controller state: history, settings, lab credentials, agent keys.
+data/
+__pycache__/
